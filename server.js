@@ -19,12 +19,12 @@ const clients = new Map();
 // Message history for late joiners
 const messageHistory = [];
 
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
 
 console.log(`[Claude Relay] Server starting on port ${PORT}...`);
 
 wss.on('listening', () => {
-  console.log(`[Claude Relay] Ready! Listening on ws://localhost:${PORT}`);
+  console.log(`[Claude Relay] Ready! Listening on ws://0.0.0.0:${PORT} (all interfaces)`);
 });
 
 wss.on('connection', (ws, req) => {
