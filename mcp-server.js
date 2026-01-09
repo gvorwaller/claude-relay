@@ -23,9 +23,11 @@ const args = process.argv.slice(2).reduce((acc, arg) => {
   return acc;
 }, {});
 
-const baseId = args['client-id'] || process.env.RELAY_CLIENT_ID || os.hostname().split('.')[0].toUpperCase();
-const suffix = process.pid.toString(36); // PID ensures uniqueness per process
-const CLIENT_ID = `${baseId}-${suffix}`;
+// If explicit client-id provided, use as-is; otherwise add PID suffix for uniqueness
+const explicitId = args['client-id'] || process.env.RELAY_CLIENT_ID;
+const baseId = explicitId || os.hostname().split('.')[0].toUpperCase();
+const suffix = process.pid.toString(36);
+const CLIENT_ID = explicitId ? baseId : `${baseId}-${suffix}`;
 const RELAY_URL = args['relay-url'] || process.env.RELAY_URL || 'ws://localhost:9999';
 
 // State
