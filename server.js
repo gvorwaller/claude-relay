@@ -39,7 +39,19 @@ wss.on('connection', (ws, req) => {
       switch (msg.type) {
         case 'register':
           // Client identifies itself (M1, M2, etc.)
-          clientId = msg.clientId || 'unknown';
+          const requestedClientId = msg.clientId || 'unknown';
+          const existingClient = clients.get(requestedClientId);
+          if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `Client ID ${requestedClientId} is already connected`
+            }));
+            console.log(`[Claude Relay] Rejected duplicate client ID: ${requestedClientId}`);
+            ws.close(1008, 'duplicate client ID');
+            return;
+          }
+
+          clientId = requestedClientId;
           clients.set(clientId, ws);
           console.log(`[Claude Relay] Client registered: ${clientId}`);
 
@@ -109,6 +121,17 @@ wss.on('connection', (ws, req) => {
           }));
           break;
 
+        case 'clear_history':
+          // Clear in-memory message history
+          const clearedCount = messageHistory.length;
+          messageHistory.length = 0;
+          ws.send(JSON.stringify({
+            type: 'history_cleared',
+            cleared: clearedCount
+          }));
+          console.log(`[Claude Relay] Cleared ${clearedCount} message(s) from history`);
+          break;
+
         case 'get_peers':
           // Return list of connected peers
           ws.send(JSON.stringify({
@@ -136,15 +159,20 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (clientId) {
-      clients.delete(clientId);
+      const wasLiveClient = clients.get(clientId) === ws;
+      if (clients.get(clientId) === ws) {
+        clients.delete(clientId);
+      }
       console.log(`[Claude Relay] Client disconnected: ${clientId}`);
 
-      // Notify others
-      broadcast({
-        type: 'peer_left',
-        clientId,
-        peers: Array.from(clients.keys())
-      });
+      if (wasLiveClient) {
+        // Notify others
+        broadcast({
+          type: 'peer_left',
+          clientId,
+          peers: Array.from(clients.keys())
+        });
+      }
     }
   });
 

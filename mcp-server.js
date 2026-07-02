@@ -30,12 +30,11 @@ const args = process.argv.slice(2).reduce((acc, arg) => {
   return acc;
 }, {});
 
-// Session ID priority: CLAUDE_RELAY_SESSION_ID > --client-id > RELAY_CLIENT_ID > hostname-pid
+// Session ID priority:
+// CLAUDE_RELAY_SESSION_ID > --client-id > matching registry ID > RELAY_CLIENT_ID > hostname-pid
 const sessionId = process.env.CLAUDE_RELAY_SESSION_ID;
-const explicitId = args['client-id'] || process.env.RELAY_CLIENT_ID;
-const baseId = sessionId || explicitId || os.hostname().split('.')[0].toUpperCase();
-const suffix = process.pid.toString(36);
-const CLIENT_ID = (sessionId || explicitId) ? baseId : `${baseId}-${suffix}`;
+const cliClientId = args['client-id'];
+const configuredClientId = process.env.RELAY_CLIENT_ID;
 const RELAY_URL = args['relay-url'] || process.env.RELAY_URL || 'ws://localhost:9999';
 
 // Session registry path
@@ -46,6 +45,96 @@ const REGISTRY_FILE = path.join(SESSIONS_DIR, 'registry.json');
 try {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 } catch {}
+
+/**
+ * Read all sessions from registry
+ */
+function readRegistry() {
+  try {
+    if (fs.existsSync(REGISTRY_FILE)) {
+      return JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
+
+function sameCwd(a, b) {
+  if (!a || !b) return false;
+  try {
+    return path.resolve(a) === path.resolve(b);
+  } catch {
+    return a === b;
+  }
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findRegisteredSessionId(baseId, cwd, registry = readRegistry()) {
+  if (!baseId) return null;
+
+  if (registry[baseId] && sameCwd(cwd, registry[baseId].cwd)) {
+    return { id: baseId, source: 'registry-exact' };
+  }
+
+  const numberedPattern = new RegExp(`^${escapeRegExp(baseId)}\\d+$`);
+  const matches = Object.entries(registry)
+    .filter(([id, info]) => numberedPattern.test(id) && sameCwd(cwd, info?.cwd))
+    .map(([id]) => id);
+
+  if (matches.length === 1) {
+    return { id: matches[0], source: 'registry-cwd' };
+  }
+
+  if (matches.length > 1) {
+    return {
+      id: null,
+      source: 'registry-ambiguous',
+      note: `Multiple ${baseId} registry sessions match ${cwd}: ${matches.join(', ')}`
+    };
+  }
+
+  return null;
+}
+
+function resolveClientIdentity() {
+  if (sessionId) {
+    return { id: sessionId, source: 'CLAUDE_RELAY_SESSION_ID' };
+  }
+
+  if (cliClientId) {
+    return { id: cliClientId, source: '--client-id' };
+  }
+
+  const registryMatch = findRegisteredSessionId(configuredClientId, process.cwd());
+  if (registryMatch?.id) {
+    return {
+      id: registryMatch.id,
+      source: registryMatch.source,
+      note: `Resolved ${registryMatch.id} from registry cwd ${process.cwd()}`
+    };
+  }
+
+  if (configuredClientId) {
+    return {
+      id: configuredClientId,
+      source: 'RELAY_CLIENT_ID',
+      note: registryMatch?.note
+    };
+  }
+
+  const baseId = os.hostname().split('.')[0].toUpperCase();
+  const suffix = process.pid.toString(36);
+  return { id: `${baseId}-${suffix}`, source: 'auto' };
+}
+
+const resolvedIdentity = resolveClientIdentity();
+const CLIENT_ID = resolvedIdentity.id;
+const CLIENT_ID_SOURCE = resolvedIdentity.source;
+if (resolvedIdentity.note) {
+  console.error(`[Claude Relay MCP] ${resolvedIdentity.note}`);
+}
 
 /**
  * Update the session registry with this client's info
@@ -63,8 +152,12 @@ function updateRegistry(action = 'connect') {
         started: new Date().toISOString(),
         cwd: process.cwd(),
         relayUrl: RELAY_URL,
-        source: sessionId ? 'CLAUDE_RELAY_SESSION_ID' : (explicitId ? 'explicit' : 'auto')
+        source: CLIENT_ID_SOURCE
       };
+    } else if (action === 'disconnect' && CLIENT_ID_SOURCE.startsWith('registry-')) {
+      if (registry[CLIENT_ID]) {
+        registry[CLIENT_ID].ended = new Date().toISOString();
+      }
     } else if (action === 'disconnect') {
       delete registry[CLIENT_ID];
     }
@@ -75,16 +168,28 @@ function updateRegistry(action = 'connect') {
   }
 }
 
-/**
- * Read all sessions from registry
- */
-function readRegistry() {
-  try {
-    if (fs.existsSync(REGISTRY_FILE)) {
-      return JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
-    }
-  } catch {}
-  return {};
+function baseSessionId(id) {
+  const match = String(id).match(/^([A-Z]+)\d+$/);
+  return match ? match[1] : null;
+}
+
+function identityWarnings(sessions) {
+  const warnings = [];
+  const online = new Set(peers);
+  online.add(CLIENT_ID);
+
+  for (const [id, info] of Object.entries(sessions)) {
+    if (online.has(id)) continue;
+    const base = baseSessionId(id);
+    if (!base || !online.has(base)) continue;
+    const baseInfo = sessions[base];
+    const cwdNote = baseInfo && sameCwd(info?.cwd, baseInfo.cwd) ? ` in ${info.cwd}` : '';
+    warnings.push(
+      `${id} is registered but not live; ${base} is live${cwdNote}. Start that MCP process as ${id}, not ${base}.`
+    );
+  }
+
+  return warnings;
 }
 
 // State
@@ -206,6 +311,14 @@ function handleMcpMessage(message) {
             {
               name: 'relay_sessions',
               description: 'List all registered Claude sessions from the local registry (includes offline sessions)',
+              inputSchema: {
+                type: 'object',
+                properties: {}
+              }
+            },
+            {
+              name: 'relay_clear_history',
+              description: 'Clear relay message history stored in relay server memory',
               inputSchema: {
                 type: 'object',
                 properties: {}
@@ -377,18 +490,27 @@ function handleToolCall(requestId, toolName, args) {
       const sessions = readRegistry();
       const sessionList = Object.entries(sessions);
       let sessionText = `=== Registered Claude Sessions ===\n`;
-      sessionText += `You are: ${CLIENT_ID}\n\n`;
+      sessionText += `You are: ${CLIENT_ID}\n`;
+      sessionText += `Live peers: ${peers.length > 0 ? peers.join(', ') : 'none'}\n\n`;
 
       if (sessionList.length === 0) {
         sessionText += 'No sessions registered.';
       } else {
         sessionList.forEach(([id, info]) => {
           const isMe = id === CLIENT_ID ? ' (this session)' : '';
-          const online = peers.includes(id) ? ' [ONLINE]' : '';
+          const online = peers.includes(id) || id === CLIENT_ID ? ' [ONLINE]' : '';
           sessionText += `${id}${isMe}${online}\n`;
           sessionText += `  PID: ${info.pid} | Started: ${new Date(info.started).toLocaleString()}\n`;
           sessionText += `  CWD: ${info.cwd}\n`;
           sessionText += `  Source: ${info.source}\n\n`;
+        });
+      }
+
+      const warnings = identityWarnings(sessions);
+      if (warnings.length) {
+        sessionText += '\nIdentity warnings:\n';
+        warnings.forEach(warning => {
+          sessionText += `  - ${warning}\n`;
         });
       }
 
@@ -402,6 +524,48 @@ function handleToolCall(requestId, toolName, args) {
           }]
         }
       });
+      break;
+
+    case 'relay_clear_history':
+      if (!connected) {
+        sendMcpResponse({
+          jsonrpc: '2.0',
+          id: requestId,
+          result: {
+            content: [{
+              type: 'text',
+              text: 'Not connected to relay server. Unable to clear message history.'
+            }]
+          }
+        });
+        return;
+      }
+
+      const clearHistoryRequestId = Date.now();
+      pendingMessages.push({
+        requestId,
+        type: 'clear_history',
+        id: clearHistoryRequestId
+      });
+
+      ws.send(JSON.stringify({ type: 'clear_history' }));
+
+      setTimeout(() => {
+        const idx = pendingMessages.findIndex(p => p.id === clearHistoryRequestId);
+        if (idx !== -1) {
+          pendingMessages.splice(idx, 1);
+          sendMcpResponse({
+            jsonrpc: '2.0',
+            id: requestId,
+            result: {
+              content: [{
+                type: 'text',
+                text: 'Timeout waiting for relay server to clear history'
+              }]
+            }
+          });
+        }
+      }, 3000);
       break;
 
     default:
@@ -477,6 +641,23 @@ function connectToRelay() {
                 content: [{
                   type: 'text',
                   text
+                }]
+              }
+            });
+          }
+          break;
+
+        case 'history_cleared':
+          const clearReq = pendingMessages.find(p => p.type === 'clear_history');
+          if (clearReq) {
+            pendingMessages = pendingMessages.filter(p => p !== clearReq);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: clearReq.requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: `Cleared ${msg.cleared || 0} message(s) from relay history`
                 }]
               }
             });

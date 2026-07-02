@@ -50,6 +50,7 @@ console.log('  send <message>     - Send message to all peers');
 console.log('  send:<id> <msg>    - Send to specific peer');
 console.log('  peers              - List connected peers');
 console.log('  history [n]        - Get last n messages');
+console.log('  clear              - Clear relay message history');
 console.log('  quit               - Exit\n');
 
 rl.on('line', (line) => {
@@ -69,6 +70,11 @@ rl.on('line', (line) => {
   if (input.startsWith('history')) {
     const count = parseInt(input.split(' ')[1]) || 10;
     ws.send(JSON.stringify({ type: 'get_history', count }));
+    return;
+  }
+
+  if (input === 'clear') {
+    ws.send(JSON.stringify({ type: 'clear_history' }));
     return;
   }
 

@@ -118,12 +118,21 @@ claude-sessions
 The MCP server determines client ID in this order:
 1. `CLAUDE_RELAY_SESSION_ID` - Shell alias sets this
 2. `--client-id` command line argument
-3. `RELAY_CLIENT_ID` environment variable
-4. Auto-generated: `hostname-pid`
+3. A single registry entry matching `RELAY_CLIENT_ID` plus the current cwd, such as `CODEX3` for base `CODEX`
+4. `RELAY_CLIENT_ID` environment variable
+5. Auto-generated: `hostname-pid`
 
 ### Session Registry
 
 Sessions are tracked in `~/claude-relay/sessions/registry.json` so all AI instances can see each other.
+
+### Registry identity vs live peers
+
+`relay_sessions` reads the registry, while direct message delivery uses the live WebSocket peer list. A session is healthy only when the same ID appears in both places.
+
+The registry key, MCP `CLIENT_ID`, WebSocket `clientId`, and message `from`/`to` ID must be exactly the same. For example, a Codex window registered as `CODEX3` must connect to the relay as `CODEX3`, not `CODEX`. If `RELAY_CLIENT_ID=CODEX` is configured and exactly one `CODEXn` registry entry matches the current cwd, the MCP server uses that exact registry ID. If a numbered registry ID is shadowed by a generic live peer, `relay_sessions` reports an identity warning instead of aliasing or rewriting delivery.
+
+The relay server rejects duplicate live client IDs. Multiple Codex windows should therefore register distinct IDs (`CODEX2`, `CODEX3`, etc.) instead of sharing `CODEX`.
 
 ---
 
@@ -138,6 +147,7 @@ Once configured, Claude Code will have these tools:
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
 | `relay_sessions` | List all registered sessions (including offline) |
+| `relay_clear_history` | Clear relay message history from server memory |
 
 ### Example Usage
 
@@ -159,6 +169,11 @@ Use relay_peers to list connected instances
 **View all registered sessions:**
 ```
 Use relay_sessions to see all Claude sessions, online and offline
+```
+
+**Clear relay message history:**
+```
+Use relay_clear_history to clear in-memory relay message history
 ```
 
 ---
