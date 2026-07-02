@@ -16,6 +16,10 @@ const MAX_HISTORY = 100;
 
 // Connected clients: Map<clientId, WebSocket>
 const clients = new Map();
+// Per-client metadata reported at register time: Map<clientId, meta>
+// Lets any peer discover the full cluster (cwd/host/started) via get_sessions,
+// not just the local machine's registry.json file.
+const clientMeta = new Map();
 // Message history for late joiners
 const messageHistory = [];
 
@@ -53,6 +57,14 @@ wss.on('connection', (ws, req) => {
 
           clientId = requestedClientId;
           clients.set(clientId, ws);
+          // Remember whatever metadata the client reported (cwd, host, started,
+          // pid, source). Older clients omit msg.meta — store an empty object so
+          // they still appear (ID-only) in the cluster session list.
+          clientMeta.set(clientId, {
+            ...(msg.meta && typeof msg.meta === 'object' ? msg.meta : {}),
+            remoteAddress: req.socket.remoteAddress,
+            connectedAt: new Date().toISOString()
+          });
           console.log(`[Claude Relay] Client registered: ${clientId}`);
 
           // Send registration confirmation
@@ -141,6 +153,20 @@ wss.on('connection', (ws, req) => {
           }));
           break;
 
+        case 'get_sessions':
+          // Return every currently-connected session with its metadata, so any
+          // peer can render the whole cluster (not just its local registry.json).
+          const sessions = {};
+          for (const id of clients.keys()) {
+            sessions[id] = clientMeta.get(id) || {};
+          }
+          ws.send(JSON.stringify({
+            type: 'sessions',
+            sessions,
+            self: clientId
+          }));
+          break;
+
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;
@@ -162,6 +188,7 @@ wss.on('connection', (ws, req) => {
       const wasLiveClient = clients.get(clientId) === ws;
       if (clients.get(clientId) === ws) {
         clients.delete(clientId);
+        clientMeta.delete(clientId);
       }
       console.log(`[Claude Relay] Client disconnected: ${clientId}`);
 

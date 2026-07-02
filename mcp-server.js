@@ -132,6 +132,10 @@ function resolveClientIdentity() {
 const resolvedIdentity = resolveClientIdentity();
 const CLIENT_ID = resolvedIdentity.id;
 const CLIENT_ID_SOURCE = resolvedIdentity.source;
+// Stable start time for this process, reported to the relay server so peers can
+// see it in the cluster-wide session list. Captured once so it survives reconnects.
+const STARTED_AT = new Date().toISOString();
+const HOST = os.hostname().split('.')[0];
 if (resolvedIdentity.note) {
   console.error(`[Claude Relay MCP] ${resolvedIdentity.note}`);
 }
@@ -190,6 +194,78 @@ function identityWarnings(sessions) {
   }
 
   return warnings;
+}
+
+/**
+ * Render the cluster-wide session list from the relay server's authoritative
+ * view (all live sessions across every machine), merging in any offline
+ * sessions that only the local registry.json still remembers.
+ */
+function renderClusterSessions(serverSessions = {}, self = CLIENT_ID) {
+  const local = readRegistry();
+  const liveIds = Object.keys(serverSessions);
+  let text = `=== Claude Relay Sessions (cluster-wide) ===\n`;
+  text += `You are: ${CLIENT_ID}\n`;
+  text += `Live sessions: ${liveIds.length ? liveIds.join(', ') : 'none'}\n\n`;
+
+  if (liveIds.length === 0) {
+    text += 'No live sessions.\n';
+  }
+  for (const [id, info] of Object.entries(serverSessions)) {
+    const isMe = id === CLIENT_ID ? ' (this session)' : '';
+    text += `${id}${isMe} [ONLINE]\n`;
+    const host = info.host ? ` @ ${info.host}` : '';
+    if (info.pid || host) text += `  PID: ${info.pid ?? '?'}${host}\n`;
+    if (info.started) text += `  Started: ${new Date(info.started).toLocaleString()}\n`;
+    if (info.cwd) text += `  CWD: ${info.cwd}\n`;
+    if (info.source) text += `  Source: ${info.source}\n`;
+    text += `\n`;
+  }
+
+  // Offline sessions known only from this machine's local registry.
+  const offline = Object.entries(local).filter(([id]) => !serverSessions[id]);
+  if (offline.length) {
+    text += `--- Offline (local registry only) ---\n`;
+    for (const [id, info] of offline) {
+      text += `${id} [OFFLINE]\n`;
+      if (info.cwd) text += `  CWD: ${info.cwd}\n`;
+    }
+    text += `\n`;
+  }
+
+  const warnings = identityWarnings({ ...local, ...serverSessions });
+  if (warnings.length) {
+    text += 'Identity warnings:\n';
+    warnings.forEach(w => { text += `  - ${w}\n`; });
+  }
+  return text;
+}
+
+/**
+ * Fallback used when the relay server is unreachable: show only what this
+ * machine's local registry.json knows (the pre-cluster behavior).
+ */
+function renderLocalSessions(note) {
+  const sessions = readRegistry();
+  const sessionList = Object.entries(sessions);
+  let text = `=== Registered Claude Sessions (local registry) ===\n`;
+  if (note) text += `${note}\n`;
+  text += `You are: ${CLIENT_ID}\n`;
+  text += `Live peers: ${peers.length > 0 ? peers.join(', ') : 'none'}\n\n`;
+
+  if (sessionList.length === 0) {
+    text += 'No sessions registered.';
+  } else {
+    sessionList.forEach(([id, info]) => {
+      const isMe = id === CLIENT_ID ? ' (this session)' : '';
+      const online = peers.includes(id) || id === CLIENT_ID ? ' [ONLINE]' : '';
+      text += `${id}${isMe}${online}\n`;
+      text += `  PID: ${info.pid} | Started: ${new Date(info.started).toLocaleString()}\n`;
+      text += `  CWD: ${info.cwd}\n`;
+      text += `  Source: ${info.source}\n\n`;
+    });
+  }
+  return text;
 }
 
 // State
@@ -310,7 +386,7 @@ function handleMcpMessage(message) {
             },
             {
               name: 'relay_sessions',
-              description: 'List all registered Claude sessions from the local registry (includes offline sessions)',
+              description: 'List all Claude sessions across the cluster (live sessions from the relay server on every machine, plus offline sessions from the local registry). Falls back to the local registry if the relay server is unreachable.',
               inputSchema: {
                 type: 'object',
                 properties: {}
@@ -487,43 +563,47 @@ function handleToolCall(requestId, toolName, args) {
       break;
 
     case 'relay_sessions':
-      const sessions = readRegistry();
-      const sessionList = Object.entries(sessions);
-      let sessionText = `=== Registered Claude Sessions ===\n`;
-      sessionText += `You are: ${CLIENT_ID}\n`;
-      sessionText += `Live peers: ${peers.length > 0 ? peers.join(', ') : 'none'}\n\n`;
-
-      if (sessionList.length === 0) {
-        sessionText += 'No sessions registered.';
-      } else {
-        sessionList.forEach(([id, info]) => {
-          const isMe = id === CLIENT_ID ? ' (this session)' : '';
-          const online = peers.includes(id) || id === CLIENT_ID ? ' [ONLINE]' : '';
-          sessionText += `${id}${isMe}${online}\n`;
-          sessionText += `  PID: ${info.pid} | Started: ${new Date(info.started).toLocaleString()}\n`;
-          sessionText += `  CWD: ${info.cwd}\n`;
-          sessionText += `  Source: ${info.source}\n\n`;
+      // Ask the relay server for the whole cluster's live sessions. Fall back to
+      // the local registry if we're not connected.
+      if (!connected) {
+        sendMcpResponse({
+          jsonrpc: '2.0',
+          id: requestId,
+          result: {
+            content: [{
+              type: 'text',
+              text: renderLocalSessions('(relay server unreachable — showing local registry only)')
+            }]
+          }
         });
+        return;
       }
 
-      const warnings = identityWarnings(sessions);
-      if (warnings.length) {
-        sessionText += '\nIdentity warnings:\n';
-        warnings.forEach(warning => {
-          sessionText += `  - ${warning}\n`;
-        });
-      }
-
-      sendMcpResponse({
-        jsonrpc: '2.0',
-        id: requestId,
-        result: {
-          content: [{
-            type: 'text',
-            text: sessionText
-          }]
-        }
+      const sessionsRequestId = Date.now();
+      pendingMessages.push({
+        requestId,
+        type: 'sessions',
+        id: sessionsRequestId
       });
+
+      ws.send(JSON.stringify({ type: 'get_sessions' }));
+
+      setTimeout(() => {
+        const idx = pendingMessages.findIndex(p => p.id === sessionsRequestId);
+        if (idx !== -1) {
+          pendingMessages.splice(idx, 1);
+          sendMcpResponse({
+            jsonrpc: '2.0',
+            id: requestId,
+            result: {
+              content: [{
+                type: 'text',
+                text: renderLocalSessions('(timed out waiting for relay server — showing local registry only)')
+              }]
+            }
+          });
+        }
+      }, 3000);
       break;
 
     case 'relay_clear_history':
@@ -589,10 +669,19 @@ function connectToRelay() {
 
   ws.on('open', () => {
     connected = true;
-    // Register with relay
+    // Register with relay, reporting metadata so peers on other machines can see
+    // this session in the cluster-wide list (get_sessions), not just locally.
     ws.send(JSON.stringify({
       type: 'register',
-      clientId: CLIENT_ID
+      clientId: CLIENT_ID,
+      meta: {
+        pid: process.pid,
+        started: STARTED_AT,
+        cwd: process.cwd(),
+        host: HOST,
+        source: CLIENT_ID_SOURCE,
+        relayUrl: RELAY_URL
+      }
     }));
     // Update local session registry
     updateRegistry('connect');
@@ -620,6 +709,23 @@ function connectToRelay() {
                 content: [{
                   type: 'text',
                   text: `You are: ${msg.self}\nConnected peers: ${peers.filter(p => p !== msg.self).join(', ') || 'none'}`
+                }]
+              }
+            });
+          }
+          break;
+
+        case 'sessions':
+          const sessReq = pendingMessages.find(p => p.type === 'sessions');
+          if (sessReq) {
+            pendingMessages = pendingMessages.filter(p => p !== sessReq);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: sessReq.requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: renderClusterSessions(msg.sessions || {}, msg.self)
                 }]
               }
             });
