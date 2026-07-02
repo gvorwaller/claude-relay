@@ -166,7 +166,9 @@ function updateRegistry(action = 'connect') {
       delete registry[CLIENT_ID];
     }
 
-    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
+    const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(registry, null, 2));
+    fs.renameSync(tmpFile, REGISTRY_FILE);
   } catch (err) {
     // Non-fatal: don't interrupt MCP operation for registry issues
   }

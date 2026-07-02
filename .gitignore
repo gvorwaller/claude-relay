@@ -4,8 +4,9 @@ logs/
 .DS_Store
 *.swp
 
-# Local session data
-sessions/
+# Local session data (scripts in sessions/ are tracked; runtime data is not)
+sessions/registry.json
+sessions/backups/
 .todos/
 .sidecar/
 .sidecar-agent
