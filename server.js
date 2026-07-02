@@ -33,6 +33,8 @@ wss.on('listening', () => {
 
 wss.on('connection', (ws, req) => {
   let clientId = null;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   console.log(`[Claude Relay] New connection from ${req.socket.remoteAddress}`);
 
@@ -56,6 +58,7 @@ wss.on('connection', (ws, req) => {
           }
 
           clientId = requestedClientId;
+          ws.clientId = clientId;
           clients.set(clientId, ws);
           // Remember whatever metadata the client reported (cwd, host, started,
           // pid, source). Older clients omit msg.meta — store an empty object so
@@ -207,6 +210,24 @@ wss.on('connection', (ws, req) => {
     console.error(`[Claude Relay] WebSocket error for ${clientId}:`, err.message);
   });
 });
+
+// Detect connections whose underlying socket died without a clean close
+// (crash, network drop, sleep/wake) -- otherwise a stale entry lingers in
+// `clients` forever, permanently rejecting the real client's reconnects as
+// "duplicate client ID".
+const HEARTBEAT_INTERVAL_MS = 30000;
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log(`[Claude Relay] Terminating unresponsive connection${ws.clientId ? ` for ${ws.clientId}` : ''}`);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
 
 function broadcast(message, excludeClient = null) {
   const data = JSON.stringify(message);

@@ -98,6 +98,20 @@ function findRegisteredSessionId(baseId, cwd, registry = readRegistry()) {
   return null;
 }
 
+// Pick the next unused `${baseId}N` suffix, treating a bare baseId entry as
+// implicitly "1". Used when baseId is already claimed by a different cwd, so
+// a shared/global RELAY_CLIENT_ID (e.g. Codex Desktop's fixed "CODEX") can't
+// collide with a session already registered under that name.
+function nextAvailableNumberedId(baseId, registry) {
+  const numberedPattern = new RegExp(`^${escapeRegExp(baseId)}(\\d+)$`);
+  let maxN = 1;
+  for (const id of Object.keys(registry)) {
+    const match = id.match(numberedPattern);
+    if (match) maxN = Math.max(maxN, parseInt(match[1], 10));
+  }
+  return `${baseId}${maxN + 1}`;
+}
+
 function resolveClientIdentity() {
   if (sessionId) {
     return { id: sessionId, source: 'CLAUDE_RELAY_SESSION_ID' };
@@ -107,7 +121,8 @@ function resolveClientIdentity() {
     return { id: cliClientId, source: '--client-id' };
   }
 
-  const registryMatch = findRegisteredSessionId(configuredClientId, process.cwd());
+  const registry = readRegistry();
+  const registryMatch = findRegisteredSessionId(configuredClientId, process.cwd(), registry);
   if (registryMatch?.id) {
     return {
       id: registryMatch.id,
@@ -117,6 +132,17 @@ function resolveClientIdentity() {
   }
 
   if (configuredClientId) {
+    if (registry[configuredClientId]) {
+      // Base ID is already claimed by a different cwd (we'd have matched
+      // above otherwise) -- mint a fresh numbered variant instead of
+      // colliding with whatever's already registered as configuredClientId.
+      const newId = nextAvailableNumberedId(configuredClientId, registry);
+      return {
+        id: newId,
+        source: 'auto-numbered',
+        note: `Base ID "${configuredClientId}" already registered for cwd ${registry[configuredClientId].cwd}; auto-assigned ${newId} for this cwd (${process.cwd()})`
+      };
+    }
     return {
       id: configuredClientId,
       source: 'RELAY_CLIENT_ID',
