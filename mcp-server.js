@@ -22,6 +22,7 @@ const readline = require('readline');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { RelayWaiter } = require('./relay-waiter');
 
 // Configuration from args or env
 const args = process.argv.slice(2).reduce((acc, arg) => {
@@ -302,6 +303,25 @@ let connected = false;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
+let reconnectTimer = null;
+let shuttingDown = false;
+
+function sendToolText(requestId, text) {
+  sendMcpResponse({
+    jsonrpc: '2.0',
+    id: requestId,
+    result: { content: [{ type: 'text', text }] }
+  });
+}
+
+const relayWaiter = new RelayWaiter({
+  respond: sendToolText,
+  log: fields => console.error(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event: 'relay_wait_completed',
+    ...fields
+  }))
+});
 
 // MCP protocol handler
 const rl = readline.createInterface({
@@ -405,6 +425,23 @@ function handleMcpMessage(message) {
               }
             },
             {
+              name: 'relay_wait',
+              description: 'Wait for the next authorized relay message without polling the relay server',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  from: { type: 'string', description: 'Only return messages from this exact peer ID' },
+                  after: { type: 'string', description: 'Return messages after this durable message ID or ISO timestamp' },
+                  timeoutSeconds: {
+                    type: 'number',
+                    minimum: 1,
+                    maximum: 300,
+                    default: 240
+                  }
+                }
+              }
+            },
+            {
               name: 'relay_peers',
               description: 'List currently connected peer Claude Code instances',
               inputSchema: {
@@ -498,6 +535,36 @@ function handleToolCall(requestId, toolName, args) {
           }]
         }
       });
+      break;
+
+    case 'relay_wait':
+      if (!connected) {
+        sendToolText(requestId, `Relay is disconnected. No cursor was advanced.\nCursor: ${args.after || 'none'}`);
+        return;
+      }
+      if (!relayWaiter.start({
+        requestId,
+        from: args.from,
+        after: args.after,
+        timeoutSeconds: args.timeoutSeconds
+      })) {
+        sendMcpResponse({
+          jsonrpc: '2.0',
+          id: requestId,
+          error: { code: -32000, message: 'A relay_wait call is already active in this MCP process' }
+        });
+        return;
+      }
+
+      // Register the waiter before asking for history. Push and history then
+      // race through RelayWaiter.finish(), whose first settlement wins.
+      pendingMessages.push({ requestId, type: 'wait_history' });
+      ws.send(JSON.stringify({
+        type: 'get_history',
+        count: 100,
+        from: args.from,
+        after: args.after
+      }));
       break;
 
     case 'relay_receive':
@@ -805,10 +872,21 @@ function connectToRelay() {
           break;
 
         case 'history':
-          const histReq = pendingMessages.find(p => p.type === 'history');
+          const histReq = pendingMessages.find(p => p.type === 'history' || p.type === 'wait_history');
           if (histReq) {
             pendingMessages = pendingMessages.filter(p => p !== histReq);
             const messages = msg.messages || [];
+            if (histReq.type === 'wait_history') {
+              // This may be the losing half of a push/history race. In that
+              // case it is deliberately consumed without a second response.
+              console.error(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                event: 'relay_wait_history_received',
+                messageCount: messages.length
+              }));
+              relayWaiter.deliverHistory(messages);
+              break;
+            }
             let text = messages.length > 0
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
@@ -880,12 +958,17 @@ function connectToRelay() {
           break;
 
         case 'message':
-          // Incoming message from peer - queue it
+          // Keep nonmatching messages available to relay_receive. A matching
+          // active waiter is settled directly by the pushed durable envelope.
           messageQueue.push({
+            type: 'message',
+            id: msg.id,
             from: msg.from,
+            to: msg.to,
             content: msg.content,
             timestamp: msg.timestamp
           });
+          relayWaiter.deliver(msg, 'push');
           break;
 
         case 'error':
@@ -908,8 +991,12 @@ function connectToRelay() {
   ws.on('close', () => {
     connected = false;
     peers = [];
+    relayWaiter.finish('disconnect');
+    // Any in-flight history response belonged to this closed socket and can
+    // never arrive. Do not let its tombstone consume a post-reconnect reply.
+    pendingMessages = pendingMessages.filter(p => p.type !== 'wait_history');
     // Attempt reconnect after delay
-    setTimeout(connectToRelay, 5000);
+    if (!shuttingDown) reconnectTimer = setTimeout(connectToRelay, 5000);
   });
 
   ws.on('error', () => {
@@ -917,22 +1004,34 @@ function connectToRelay() {
   });
 }
 
-// Handle shutdown
-process.on('SIGINT', () => {
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  relayWaiter.finish('cancel');
+  if (reconnectTimer) clearTimeout(reconnectTimer);
   updateRegistry('disconnect');
   if (ws) ws.close();
+}
+
+// Handle shutdown
+process.on('SIGINT', () => {
+  shutdown();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  updateRegistry('disconnect');
-  if (ws) ws.close();
+  shutdown();
+  process.exit(0);
+});
+
+rl.on('close', () => {
+  shutdown();
   process.exit(0);
 });
 
 // Also clean up on normal exit
 process.on('exit', () => {
-  updateRegistry('disconnect');
+  shutdown();
 });
 
 /**
@@ -949,8 +1048,7 @@ function checkParentAlive() {
     process.kill(PARENT_PID, 0);
   } catch (err) {
     // Parent process is gone - we're orphaned
-    updateRegistry('disconnect');
-    if (ws) ws.close();
+    shutdown();
     process.exit(0);
   }
 }

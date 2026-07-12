@@ -144,6 +144,7 @@ Once configured, Claude Code will have these tools:
 |------|-------------|
 | `relay_send` | Send a message to peer Claude Code instance(s) |
 | `relay_receive` | Get recent messages from peers |
+| `relay_wait` | Block for the next matching pushed message, with durable catch-up |
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
 | `relay_sessions` | List all registered sessions (including offline) |
@@ -165,6 +166,24 @@ Use relay_receive to see if there are any messages from peers
 `relay_receive` accepts optional `from`, `to`, and `after` filters. `after` may
 be a returned message cursor or an ISO timestamp. Direct-message history is
 visible only to its sender and recipient; broadcasts are visible to all peers.
+
+**Coordinate continuously with a peer:**
+```
+Use the relay-coordinate skill to coordinate with CC2 until it sends RELAY_DONE
+```
+
+`relay_wait` accepts an exact optional `from` peer ID, an optional `after`
+cursor (message UUID or ISO timestamp), and `timeoutSeconds` from 1 through 300
+(default 240). It first requests authorized durable history, then waits on the
+existing WebSocket push path without polling the relay server. A returned
+message includes its UUID cursor; pass that cursor as `after` on the next call.
+Timeout and disconnect results do not advance the cursor.
+
+The portable [`relay-coordinate`](skills/relay-coordinate/SKILL.md) skill loops
+after normal timeouts, processes one peer request at a time, replies to the
+exact peer, and stops on the exact `RELAY_DONE` token. Coordination remains an
+intentionally active agent turn: it never interrupts running work and cannot
+wake Claude Code or Codex after the session has returned control to the user.
 
 **See who's online:**
 ```
