@@ -147,7 +147,8 @@ Once configured, Claude Code will have these tools:
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
 | `relay_sessions` | List all registered sessions (including offline) |
-| `relay_clear_history` | Clear relay message history from server memory |
+| `relay_clear_history` | Clear the bounded memory cache; the durable journal remains intact |
+| `relay_purge_history` | Delete durable history; restricted by `RELAY_ADMIN_CLIENT_IDS` |
 
 ### Example Usage
 
@@ -161,6 +162,10 @@ Use relay_send to tell CC-2: "Found the bug - it's in auth.js line 42"
 Use relay_receive to see if there are any messages from peers
 ```
 
+`relay_receive` accepts optional `from`, `to`, and `after` filters. `after` may
+be a returned message cursor or an ISO timestamp. Direct-message history is
+visible only to its sender and recipient; broadcasts are visible to all peers.
+
 **See who's online:**
 ```
 Use relay_peers to list connected instances
@@ -173,8 +178,44 @@ Use relay_sessions to see all Claude sessions, online and offline
 
 **Clear relay message history:**
 ```
-Use relay_clear_history to clear in-memory relay message history
+Use relay_clear_history to clear the in-memory cache while preserving the durable journal
 ```
+
+To enable durable-history deletion, set a comma-separated admin allowlist in
+the relay server environment, for example
+`RELAY_ADMIN_CLIENT_IDS=CODEX2,CC2`, then use `relay_purge_history` from one of
+those exact live client IDs. Without an allowlist, durable purge is disabled.
+
+---
+
+## Message Retention and Logs
+
+The relay appends every message to `data/messages/YYYY-MM-DD.jsonl` before it
+routes the message. Files and their directory are owner-only (`0600`/`0700`).
+The journal retains seven UTC days by default and is also capped at 100 MB;
+the oldest files are removed first. On startup, the relay reloads a bounded
+cache containing at most 500 messages or 10 MB.
+
+Operational events are written as structured JSONL to
+`logs/operations-YYYY-MM-DD.jsonl`. These records contain message IDs,
+sender/recipient IDs, byte counts, and delivery status, but never message
+content. Logs retain seven days, segment at 10 MB, and are capped at 50 MB.
+Duplicate-client rejection records are rate-limited to one per client ID per
+minute. The LaunchAgent sends stdout to `/dev/null`; stderr remains available
+for failures that occur before structured logging initializes.
+
+Defaults can be changed with:
+
+| Variable | Default |
+|----------|---------|
+| `RELAY_MESSAGE_RETENTION_DAYS` | `7` |
+| `RELAY_MESSAGE_MAX_DISK_MB` | `100` |
+| `RELAY_CACHE_MAX_MESSAGES` | `500` |
+| `RELAY_CACHE_MAX_MB` | `10` |
+| `RELAY_LOG_RETENTION_DAYS` | `7` |
+| `RELAY_LOG_MAX_TOTAL_MB` | `50` |
+| `RELAY_LOG_MAX_FILE_MB` | `10` |
+| `RELAY_ADMIN_CLIENT_IDS` | empty; purge disabled |
 
 ---
 
@@ -269,6 +310,8 @@ node mcp-server.js --client-id=LAPTOP --relay-url=ws://192.168.1.100:9999
 claude-relay/
 ├── server.js                 # WebSocket relay server
 ├── mcp-server.js             # MCP protocol server for Claude Code
+├── message-store.js          # Seven-day JSONL journal and bounded cache
+├── operational-logger.js     # Rotated structured operational logs
 ├── test-client.js            # Interactive test client
 ├── package.json              # Node.js dependencies
 ├── sessions/
@@ -276,8 +319,10 @@ claude-relay/
 │   ├── list.sh               # Shell script to list sessions
 │   └── registry.json         # Session registry (auto-generated)
 ├── logs/
-│   ├── relay.log             # Relay server logs
-│   └── relay-error.log       # Relay server errors
+│   ├── operations-*.jsonl    # Rotated structured relay events
+│   └── relay-error.log       # Early startup/runtime stderr
+├── data/messages/
+│   └── YYYY-MM-DD.jsonl      # Owner-only durable message journal
 ├── com.claude-relay.plist    # macOS LaunchAgent for relay server
 └── com.claude-relay-tunnel.plist  # macOS LaunchAgent for SSH tunnel
 ```

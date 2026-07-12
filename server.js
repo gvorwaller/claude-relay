@@ -10,9 +10,32 @@
  */
 
 const { WebSocketServer } = require('ws');
+const { MessageStore } = require('./message-store');
+const { OperationalLogger } = require('./operational-logger');
 
 const PORT = parseInt(process.argv[2] || process.env.RELAY_PORT || '9999', 10);
-const MAX_HISTORY = 100;
+const MESSAGE_RETENTION_DAYS = parseInt(process.env.RELAY_MESSAGE_RETENTION_DAYS || '7', 10);
+const MESSAGE_MAX_DISK_MB = parseInt(process.env.RELAY_MESSAGE_MAX_DISK_MB || '100', 10);
+const CACHE_MAX_MESSAGES = parseInt(process.env.RELAY_CACHE_MAX_MESSAGES || '500', 10);
+const CACHE_MAX_MB = parseInt(process.env.RELAY_CACHE_MAX_MB || '10', 10);
+const ADMIN_CLIENT_IDS = new Set(
+  (process.env.RELAY_ADMIN_CLIENT_IDS || '').split(',').map(value => value.trim()).filter(Boolean)
+);
+
+const messageStore = new MessageStore({
+  dataDir: process.env.RELAY_MESSAGE_DIR,
+  retentionDays: MESSAGE_RETENTION_DAYS,
+  maxDiskBytes: MESSAGE_MAX_DISK_MB * 1024 * 1024,
+  maxCacheMessages: CACHE_MAX_MESSAGES,
+  maxCacheBytes: CACHE_MAX_MB * 1024 * 1024
+});
+messageStore.initialize();
+const logger = new OperationalLogger({
+  logDir: process.env.RELAY_LOG_DIR,
+  retentionDays: parseInt(process.env.RELAY_LOG_RETENTION_DAYS || '7', 10),
+  maxTotalBytes: parseInt(process.env.RELAY_LOG_MAX_TOTAL_MB || '50', 10) * 1024 * 1024,
+  maxFileBytes: parseInt(process.env.RELAY_LOG_MAX_FILE_MB || '10', 10) * 1024 * 1024
+});
 
 // Connected clients: Map<clientId, WebSocket>
 const clients = new Map();
@@ -20,15 +43,14 @@ const clients = new Map();
 // Lets any peer discover the full cluster (cwd/host/started) via get_sessions,
 // not just the local machine's registry.json file.
 const clientMeta = new Map();
-// Message history for late joiners
-const messageHistory = [];
+const duplicateLogTimes = new Map();
 
 const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
 
-console.log(`[Claude Relay] Server starting on port ${PORT}...`);
+logger.info('server_starting', { port: PORT });
 
 wss.on('listening', () => {
-  console.log(`[Claude Relay] Ready! Listening on ws://0.0.0.0:${PORT} (all interfaces)`);
+  logger.info('server_listening', { port: PORT, host: '0.0.0.0' });
 });
 
 wss.on('connection', (ws, req) => {
@@ -36,7 +58,7 @@ wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  console.log(`[Claude Relay] New connection from ${req.socket.remoteAddress}`);
+  logger.info('connection_opened', { remoteAddress: req.socket.remoteAddress });
 
   ws.on('message', (data) => {
     try {
@@ -52,7 +74,11 @@ wss.on('connection', (ws, req) => {
               type: 'error',
               message: `Client ID ${requestedClientId} is already connected`
             }));
-            console.log(`[Claude Relay] Rejected duplicate client ID: ${requestedClientId}`);
+            const now = Date.now();
+            if (now - (duplicateLogTimes.get(requestedClientId) || 0) >= 60000) {
+              logger.warn('duplicate_client_rejected', { clientId: requestedClientId });
+              duplicateLogTimes.set(requestedClientId, now);
+            }
             ws.close(1008, 'duplicate client ID');
             return;
           }
@@ -68,7 +94,7 @@ wss.on('connection', (ws, req) => {
             remoteAddress: req.socket.remoteAddress,
             connectedAt: new Date().toISOString()
           });
-          console.log(`[Claude Relay] Client registered: ${clientId}`);
+          logger.info('client_registered', { clientId, remoteAddress: req.socket.remoteAddress });
 
           // Send registration confirmation
           ws.send(JSON.stringify({
@@ -86,27 +112,31 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'message':
-          // Relay message to target(s)
-          const envelope = {
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before sending messages' }));
+            return;
+          }
+          if (typeof msg.content !== 'string') {
+            ws.send(JSON.stringify({ type: 'error', message: 'Message content must be a string' }));
+            return;
+          }
+          const to = msg.to || 'all';
+          const target = to === 'all' ? null : clients.get(to);
+          const delivered = to === 'all'
+            ? Array.from(clients.entries()).some(([id, peer]) => id !== clientId && peer.readyState === 1)
+            : Boolean(target && target.readyState === 1);
+          const envelope = messageStore.append({
             type: 'message',
             from: clientId,
-            to: msg.to || 'all',
+            to,
             content: msg.content,
-            timestamp: new Date().toISOString()
-          };
-
-          // Store in history
-          messageHistory.push(envelope);
-          if (messageHistory.length > MAX_HISTORY) {
-            messageHistory.shift();
-          }
+            delivered
+          });
 
           if (msg.to && msg.to !== 'all') {
             // Direct message to specific client
-            const target = clients.get(msg.to);
             if (target && target.readyState === 1) {
               target.send(JSON.stringify(envelope));
-              console.log(`[Claude Relay] ${clientId} -> ${msg.to}: ${msg.content.substring(0, 50)}...`);
             } else {
               ws.send(JSON.stringify({
                 type: 'error',
@@ -116,35 +146,54 @@ wss.on('connection', (ws, req) => {
           } else {
             // Broadcast to all except sender
             broadcast(envelope, clientId);
-            console.log(`[Claude Relay] ${clientId} -> all: ${msg.content.substring(0, 50)}...`);
           }
+          logger.info('message_recorded', {
+            messageId: envelope.id,
+            from: clientId,
+            to,
+            bytes: Buffer.byteLength(msg.content, 'utf8'),
+            delivered
+          });
           break;
 
         case 'get_history':
-          // Return recent message history
-          const count = Math.min(msg.count || 10, MAX_HISTORY);
-          const from = msg.from; // Optional filter
-          let history = messageHistory.slice(-count);
-
-          if (from) {
-            history = history.filter(m => m.from === from);
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before reading history' }));
+            return;
           }
-
+          const result = messageStore.query({
+            requester: clientId,
+            count: msg.count,
+            from: msg.from,
+            to: msg.to,
+            after: msg.after
+          });
           ws.send(JSON.stringify({
             type: 'history',
-            messages: history
+            messages: result.messages,
+            cursor: result.cursor
           }));
           break;
 
         case 'clear_history':
-          // Clear in-memory message history
-          const clearedCount = messageHistory.length;
-          messageHistory.length = 0;
+          const clearedCount = messageStore.clearCache();
           ws.send(JSON.stringify({
             type: 'history_cleared',
-            cleared: clearedCount
+            cleared: clearedCount,
+            durableHistoryPreserved: true
           }));
-          console.log(`[Claude Relay] Cleared ${clearedCount} message(s) from history`);
+          logger.info('history_cache_cleared', { clientId, cleared: clearedCount });
+          break;
+
+        case 'purge_history':
+          if (!clientId || !ADMIN_CLIENT_IDS.has(clientId)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Durable history purge is not authorized' }));
+            logger.warn('history_purge_rejected', { clientId: clientId || 'unregistered' });
+            return;
+          }
+          const purgeResult = messageStore.purge();
+          ws.send(JSON.stringify({ type: 'history_purged', ...purgeResult }));
+          logger.warn('history_purged', { clientId, ...purgeResult });
           break;
 
         case 'get_peers':
@@ -175,10 +224,10 @@ wss.on('connection', (ws, req) => {
           break;
 
         default:
-          console.log(`[Claude Relay] Unknown message type: ${msg.type}`);
+          logger.warn('unknown_message_type', { clientId, messageType: msg.type });
       }
     } catch (err) {
-      console.error(`[Claude Relay] Error processing message:`, err.message);
+      logger.error('message_processing_failed', { clientId, error: err.message });
       ws.send(JSON.stringify({
         type: 'error',
         message: err.message
@@ -193,7 +242,7 @@ wss.on('connection', (ws, req) => {
         clients.delete(clientId);
         clientMeta.delete(clientId);
       }
-      console.log(`[Claude Relay] Client disconnected: ${clientId}`);
+      logger.info('client_disconnected', { clientId });
 
       if (wasLiveClient) {
         // Notify others
@@ -207,7 +256,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('error', (err) => {
-    console.error(`[Claude Relay] WebSocket error for ${clientId}:`, err.message);
+    logger.error('websocket_error', { clientId, error: err.message });
   });
 });
 
@@ -219,7 +268,7 @@ const HEARTBEAT_INTERVAL_MS = 30000;
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
-      console.log(`[Claude Relay] Terminating unresponsive connection${ws.clientId ? ` for ${ws.clientId}` : ''}`);
+      logger.warn('unresponsive_connection_terminated', { clientId: ws.clientId || null });
       return ws.terminate();
     }
     ws.isAlive = false;
@@ -228,6 +277,11 @@ const heartbeatInterval = setInterval(() => {
 }, HEARTBEAT_INTERVAL_MS);
 
 wss.on('close', () => clearInterval(heartbeatInterval));
+const retentionInterval = setInterval(() => {
+  messageStore.prune();
+  logger.prune();
+}, 60 * 60 * 1000);
+wss.on('close', () => clearInterval(retentionInterval));
 
 function broadcast(message, excludeClient = null) {
   const data = JSON.stringify(message);
@@ -240,13 +294,13 @@ function broadcast(message, excludeClient = null) {
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\n[Claude Relay] Shutting down...');
+  logger.info('server_stopping', { signal: 'SIGINT' });
   wss.close(() => {
-    console.log('[Claude Relay] Server closed');
     process.exit(0);
   });
 });
 
 process.on('SIGTERM', () => {
+  logger.info('server_stopping', { signal: 'SIGTERM' });
   wss.close(() => process.exit(0));
 });

@@ -392,6 +392,14 @@ function handleMcpMessage(message) {
                   from: {
                     type: 'string',
                     description: 'Filter messages by sender ID (optional)'
+                  },
+                  to: {
+                    type: 'string',
+                    description: 'Filter messages by recipient ID (optional)'
+                  },
+                  after: {
+                    type: 'string',
+                    description: 'Return messages after this message ID or ISO timestamp (optional)'
                   }
                 }
               }
@@ -422,7 +430,15 @@ function handleMcpMessage(message) {
             },
             {
               name: 'relay_clear_history',
-              description: 'Clear relay message history stored in relay server memory',
+              description: 'Clear the relay server memory cache while preserving the durable seven-day journal',
+              inputSchema: {
+                type: 'object',
+                properties: {}
+              }
+            },
+            {
+              name: 'relay_purge_history',
+              description: 'Delete durable relay message history (restricted to configured admin client IDs)',
               inputSchema: {
                 type: 'object',
                 properties: {}
@@ -510,7 +526,9 @@ function handleToolCall(requestId, toolName, args) {
       ws.send(JSON.stringify({
         type: 'get_history',
         count: args.count || 10,
-        from: args.from
+        from: args.from,
+        to: args.to,
+        after: args.after
       }));
 
       // Set timeout for response
@@ -570,6 +588,32 @@ function handleToolCall(requestId, toolName, args) {
                 text: `Connected peers (cached): ${peers.length > 0 ? peers.join(', ') : 'none'}`
               }]
             }
+          });
+        }
+      }, 3000);
+      break;
+
+    case 'relay_purge_history':
+      if (!connected) {
+        sendMcpResponse({
+          jsonrpc: '2.0',
+          id: requestId,
+          result: { content: [{ type: 'text', text: 'Not connected to relay server. Unable to purge message history.' }] }
+        });
+        return;
+      }
+
+      const purgeHistoryRequestId = Date.now();
+      pendingMessages.push({ requestId, type: 'purge_history', id: purgeHistoryRequestId });
+      ws.send(JSON.stringify({ type: 'purge_history' }));
+      setTimeout(() => {
+        const idx = pendingMessages.findIndex(p => p.id === purgeHistoryRequestId);
+        if (idx !== -1) {
+          pendingMessages.splice(idx, 1);
+          sendMcpResponse({
+            jsonrpc: '2.0',
+            id: requestId,
+            result: { content: [{ type: 'text', text: 'Timeout waiting for relay server to purge history' }] }
           });
         }
       }, 3000);
@@ -768,6 +812,7 @@ function connectToRelay() {
             let text = messages.length > 0
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
+            if (msg.cursor) text += `\n\nCursor: ${msg.cursor}`;
             sendMcpResponse({
               jsonrpc: '2.0',
               id: histReq.requestId,
@@ -791,7 +836,24 @@ function connectToRelay() {
               result: {
                 content: [{
                   type: 'text',
-                  text: `Cleared ${msg.cleared || 0} message(s) from relay history`
+                  text: `Cleared ${msg.cleared || 0} message(s) from the memory cache; durable history was preserved`
+                }]
+              }
+            });
+          }
+          break;
+
+        case 'history_purged':
+          const purgeReq = pendingMessages.find(p => p.type === 'purge_history');
+          if (purgeReq) {
+            pendingMessages = pendingMessages.filter(p => p !== purgeReq);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: purgeReq.requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: `Purged ${msg.filesDeleted || 0} durable history file(s) and ${msg.cacheCleared || 0} cached message(s)`
                 }]
               }
             });
@@ -827,7 +889,15 @@ function connectToRelay() {
           break;
 
         case 'error':
-          // Log errors but don't interrupt
+          const pendingPurge = pendingMessages.find(p => p.type === 'purge_history');
+          if (pendingPurge) {
+            pendingMessages = pendingMessages.filter(p => p !== pendingPurge);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: pendingPurge.requestId,
+              result: { content: [{ type: 'text', text: `Error: ${msg.message}` }] }
+            });
+          }
           break;
       }
     } catch {

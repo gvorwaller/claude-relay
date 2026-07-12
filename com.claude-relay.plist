@@ -14,7 +14,7 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/gaylonvorwaller/claude-relay/logs/relay.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>/Users/gaylonvorwaller/claude-relay/logs/relay-error.log</string>
     <key>WorkingDirectory</key>
@@ -23,6 +23,22 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>RELAY_MESSAGE_RETENTION_DAYS</key>
+        <string>7</string>
+        <key>RELAY_MESSAGE_MAX_DISK_MB</key>
+        <string>100</string>
+        <key>RELAY_CACHE_MAX_MESSAGES</key>
+        <string>500</string>
+        <key>RELAY_CACHE_MAX_MB</key>
+        <string>10</string>
+        <key>RELAY_LOG_RETENTION_DAYS</key>
+        <string>7</string>
+        <key>RELAY_LOG_MAX_TOTAL_MB</key>
+        <string>50</string>
+        <key>RELAY_LOG_MAX_FILE_MB</key>
+        <string>10</string>
+        <key>RELAY_ADMIN_CLIENT_IDS</key>
+        <string>CODEX2,CC2</string>
     </dict>
 </dict>
 </plist>

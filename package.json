@@ -6,7 +6,8 @@
   "scripts": {
     "server": "node server.js",
     "mcp": "node mcp-server.js",
-    "test-client": "node test-client.js"
+    "test-client": "node test-client.js",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
