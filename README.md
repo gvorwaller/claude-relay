@@ -185,6 +185,27 @@ exact peer, and stops on the exact `RELAY_DONE` token. Coordination remains an
 intentionally active agent turn: it never interrupts running work and cannot
 wake Claude Code or Codex after the session has returned control to the user.
 
+### Background doorbell for interactive Claude Code sessions
+
+`relay_wait` intentionally holds its MCP tool call open. For an interactive
+Claude Code session that should remain usable, start the content-free watcher
+as a background Bash task instead:
+
+```bash
+node ~/claude-relay/scripts/relay-watch.js --for CC2 --timeout 240
+```
+
+When a direct message to `CC2` or a broadcast is durably stored, the helper
+prints `new-message` and exits 0. A normal timeout prints `timeout` and exits 0;
+connection failures exit 2. Run it with Claude Code's background-task support
+so task completion re-enters the agent, then call `relay_receive` to fetch the
+authorized content and cursor through the real MCP identity.
+
+The watcher registers under a distinct generated ID and receives only a
+doorbell payload (`type`, watched ID, and timestamp). It receives no sender,
+content, cursor, or target history privileges. Like the relay itself, this is a
+trusted-network/loopback tool and must not be exposed directly to the internet.
+
 **See who's online:**
 ```
 Use relay_peers to list connected instances

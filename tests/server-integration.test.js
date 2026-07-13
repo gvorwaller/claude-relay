@@ -67,11 +67,40 @@ test('server persists authorized history, preserves it on cache clear, and gates
   const recipient = await connect(port, 'B');
   const outsider = await connect(port, 'C');
   const admin = await connect(port, 'ADMIN');
-  t.after(() => [sender, recipient, outsider, admin].forEach(ws => ws.close()));
+  const watcher = await connect(port, 'B-watch-test');
+  t.after(() => [sender, recipient, outsider, admin, watcher].forEach(ws => ws.close()));
+
+  const watching = nextMessage(watcher, 'watching');
+  watcher.send(JSON.stringify({ type: 'watch', for: 'B' }));
+  assert.equal((await watching).for, 'B');
 
   const delivered = nextMessage(recipient, 'message');
+  const doorbell = nextMessage(watcher, 'new_message');
   sender.send(JSON.stringify({ type: 'message', to: 'B', content: 'private review' }));
   assert.equal((await delivered).content, 'private review');
+  const ping = await doorbell;
+  assert.deepEqual(Object.keys(ping).sort(), ['at', 'for', 'type']);
+  assert.equal(ping.for, 'B');
+
+  const helperJoined = waitForMessage(sender, message =>
+    message.type === 'peer_joined' && message.clientId.startsWith('C-watch-'));
+  const helper = spawn(process.execPath, [
+    path.join(__dirname, '..', 'scripts', 'relay-watch.js'),
+    '--for', 'C', '--timeout', '2', '--relay-url', `ws://127.0.0.1:${port}`
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => helper.kill('SIGTERM'));
+  await helperJoined;
+  // Registration precedes the watch request on one ordered WebSocket. Yield
+  // once so the server can acknowledge the subscription before the message.
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const helperOutput = new Promise((resolve, reject) => {
+    let stdout = '';
+    helper.stdout.on('data', chunk => { stdout += chunk; });
+    helper.once('error', reject);
+    helper.once('exit', code => resolve({ code, stdout: stdout.trim() }));
+  });
+  sender.send(JSON.stringify({ type: 'message', to: 'C', content: 'wake up' }));
+  assert.deepEqual(await helperOutput, { code: 0, stdout: 'new-message' });
 
   recipient.send(JSON.stringify({ type: 'get_history', count: 10, from: 'A' }));
   const visible = await nextMessage(recipient, 'history');
@@ -79,7 +108,9 @@ test('server persists authorized history, preserves it on cache clear, and gates
   assert.ok(visible.cursor);
 
   outsider.send(JSON.stringify({ type: 'get_history', count: 10, from: 'A' }));
-  assert.equal((await nextMessage(outsider, 'history')).messages.length, 0);
+  const outsiderHistory = await nextMessage(outsider, 'history');
+  assert.deepEqual(outsiderHistory.messages.map(message => message.content), ['wake up']);
+  assert.equal(outsiderHistory.messages.some(message => message.content === 'private review'), false);
 
   outsider.send(JSON.stringify({ type: 'purge_history' }));
   assert.equal((await nextMessage(outsider, 'error')).message, 'Durable history purge is not authorized');

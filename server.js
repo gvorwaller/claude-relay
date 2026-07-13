@@ -44,6 +44,10 @@ const clients = new Map();
 // not just the local machine's registry.json file.
 const clientMeta = new Map();
 const duplicateLogTimes = new Map();
+// Content-free background watchers. Map<targetClientId, Set<WebSocket>>.
+// Watchers receive only an existence ping; they never inherit target history
+// visibility or message content.
+const watchers = new Map();
 
 const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
 
@@ -154,6 +158,24 @@ wss.on('connection', (ws, req) => {
             bytes: Buffer.byteLength(msg.content, 'utf8'),
             delivered
           });
+          notifyWatchers(to, envelope.timestamp);
+          break;
+
+        case 'watch':
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before watching' }));
+            return;
+          }
+          if (typeof msg.for !== 'string' || !msg.for.trim()) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Watch target must be a client ID' }));
+            return;
+          }
+          removeWatcher(ws);
+          ws.watchTarget = msg.for.trim();
+          if (!watchers.has(ws.watchTarget)) watchers.set(ws.watchTarget, new Set());
+          watchers.get(ws.watchTarget).add(ws);
+          ws.send(JSON.stringify({ type: 'watching', for: ws.watchTarget }));
+          logger.info('watch_started', { clientId, for: ws.watchTarget });
           break;
 
         case 'get_history':
@@ -236,6 +258,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    removeWatcher(ws);
     if (clientId) {
       const wasLiveClient = clients.get(clientId) === ws;
       if (clients.get(clientId) === ws) {
@@ -290,6 +313,28 @@ function broadcast(message, excludeClient = null) {
       ws.send(data);
     }
   });
+}
+
+function notifyWatchers(to, at) {
+  const targets = to === 'all' ? Array.from(watchers.keys()) : [to];
+  for (const target of targets) {
+    const subscribers = watchers.get(target);
+    if (!subscribers) continue;
+    const ping = JSON.stringify({ type: 'new_message', for: target, at });
+    for (const watcher of subscribers) {
+      if (watcher.readyState === 1) watcher.send(ping);
+    }
+  }
+}
+
+function removeWatcher(ws) {
+  if (!ws.watchTarget) return;
+  const subscribers = watchers.get(ws.watchTarget);
+  if (subscribers) {
+    subscribers.delete(ws);
+    if (subscribers.size === 0) watchers.delete(ws.watchTarget);
+  }
+  ws.watchTarget = null;
 }
 
 // Graceful shutdown
