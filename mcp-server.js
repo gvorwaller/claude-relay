@@ -201,6 +201,50 @@ function updateRegistry(action = 'connect') {
   }
 }
 
+/**
+ * Clear the local session registry, keeping only sessions that are currently
+ * online (this session plus live peers). Backs up the registry first.
+ * Purely local: registry.json only exists on this machine, so no relay
+ * server round-trip is needed and this works while disconnected.
+ */
+function clearRegistrySessions() {
+  const registry = readRegistry();
+  const online = new Set(peers);
+  online.add(CLIENT_ID);
+
+  const removed = [];
+  const kept = {};
+  for (const [id, info] of Object.entries(registry)) {
+    if (online.has(id)) {
+      kept[id] = info;
+    } else {
+      removed.push(id);
+    }
+  }
+
+  if (removed.length === 0) {
+    return { removed, kept: Object.keys(kept), backup: null };
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = path.join(SESSIONS_DIR, 'backups');
+  const backupFile = path.join(backupDir, `registry-${stamp}.json`);
+  let backup = null;
+  try {
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.copyFileSync(REGISTRY_FILE, backupFile);
+    backup = backupFile;
+  } catch {
+    // Backup is best-effort; still proceed with the clear
+  }
+
+  const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(kept, null, 2));
+  fs.renameSync(tmpFile, REGISTRY_FILE);
+
+  return { removed, kept: Object.keys(kept), backup };
+}
+
 function baseSessionId(id) {
   const match = String(id).match(/^([A-Z]+)\d+$/);
   return match ? match[1] : null;
@@ -460,6 +504,14 @@ function handleMcpMessage(message) {
             {
               name: 'relay_sessions',
               description: 'List all Claude sessions across the cluster (live sessions from the relay server on every machine, plus offline sessions from the local registry). Falls back to the local registry if the relay server is unreachable.',
+              inputSchema: {
+                type: 'object',
+                properties: {}
+              }
+            },
+            {
+              name: 'relay_clear_sessions',
+              description: 'Clear the local session registry (registry.json), removing all offline sessions. Currently online sessions (this one and live peers) are preserved. The registry is backed up first. Typical use: after a reboot or when a session host died.',
               inputSchema: {
                 type: 'object',
                 properties: {}
@@ -744,6 +796,26 @@ function handleToolCall(requestId, toolName, args) {
         }
       }, 3000);
       break;
+
+    case 'relay_clear_sessions': {
+      let text;
+      try {
+        const { removed, kept, backup } = clearRegistrySessions();
+        if (removed.length === 0 && kept.length === 0) {
+          text = 'Session registry is already empty.';
+        } else if (removed.length === 0) {
+          text = `Nothing to clear: all ${kept.length} registered session(s) are currently online (${kept.join(', ')}).`;
+        } else {
+          text = `Cleared ${removed.length} offline session(s): ${removed.join(', ')}\n`;
+          text += `Kept (online): ${kept.length ? kept.join(', ') : 'none'}\n`;
+          text += backup ? `Backup: ${backup}` : 'Backup failed (registry cleared anyway)';
+        }
+      } catch (err) {
+        text = `Failed to clear session registry: ${err.message}`;
+      }
+      sendToolText(requestId, text);
+      break;
+    }
 
     case 'relay_clear_history':
       if (!connected) {

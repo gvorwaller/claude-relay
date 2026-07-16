@@ -148,6 +148,7 @@ Once configured, Claude Code will have these tools:
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
 | `relay_sessions` | List all registered sessions (including offline) |
+| `relay_clear_sessions` | Remove all offline sessions from the local registry (online sessions kept; registry backed up first) |
 | `relay_clear_history` | Clear the bounded memory cache; the durable journal remains intact |
 | `relay_purge_history` | Delete durable history; restricted by `RELAY_ADMIN_CLIENT_IDS` |
 
@@ -215,6 +216,13 @@ Use relay_peers to list connected instances
 ```
 Use relay_sessions to see all Claude sessions, online and offline
 ```
+
+**Clear stale sessions (e.g., after a reboot):**
+```
+Use relay_clear_sessions to remove all offline sessions from the local registry
+```
+Online sessions are never removed, and the registry is backed up to
+`sessions/backups/` before each clear.
 
 **Clear relay message history:**
 ```
