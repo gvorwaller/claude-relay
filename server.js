@@ -74,17 +74,31 @@ wss.on('connection', (ws, req) => {
           const requestedClientId = msg.clientId || 'unknown';
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: `Client ID ${requestedClientId} is already connected`
-            }));
+            // Newest-wins takeover (2026-07-17). Reject-duplicate looked safe but
+            // locked out every legitimate reconnect: a stale-but-alive holder
+            // (an MCP bridge whose Claude Code session was replaced, a Codex CLI
+            // that respawned) passes the ws heartbeat forever, so the REAL
+            // client could never reclaim its ID (CC2 and CODEX2 both hit this).
+            // The newest registration is the one a human is actually using.
+            // The displaced socket is told why and terminated, so its owner
+            // fails loudly instead of consuming messages nobody reads.
             const now = Date.now();
             if (now - (duplicateLogTimes.get(requestedClientId) || 0) >= 60000) {
-              logger.warn('duplicate_client_rejected', { clientId: requestedClientId });
+              logger.warn('duplicate_client_takeover', {
+                clientId: requestedClientId,
+                displacedRemoteAddress: existingClient._socket?.remoteAddress || null,
+                newRemoteAddress: req.socket.remoteAddress
+              });
               duplicateLogTimes.set(requestedClientId, now);
             }
-            ws.close(1008, 'duplicate client ID');
-            return;
+            try {
+              existingClient.send(JSON.stringify({
+                type: 'error',
+                message: `Client ID ${requestedClientId} was re-registered by a newer connection; this connection is being closed`
+              }));
+            } catch (_) { /* displaced socket may already be unwritable */ }
+            existingClient.displacedByTakeover = true;
+            existingClient.terminate();
           }
 
           clientId = requestedClientId;
