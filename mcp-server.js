@@ -157,8 +157,10 @@ function resolveClientIdentity() {
 }
 
 const resolvedIdentity = resolveClientIdentity();
-const CLIENT_ID = resolvedIdentity.id;
-const CLIENT_ID_SOURCE = resolvedIdentity.source;
+// Mutable: relay_rename lets a live session correct its identity at runtime
+// (no restart, no env vars) when startup resolution picked the wrong ID.
+let CLIENT_ID = resolvedIdentity.id;
+let CLIENT_ID_SOURCE = resolvedIdentity.source;
 // Stable start time for this process, reported to the relay server so peers can
 // see it in the cluster-wide session list. Captured once so it survives reconnects.
 const STARTED_AT = new Date().toISOString();
@@ -502,6 +504,20 @@ function handleMcpMessage(message) {
               }
             },
             {
+              name: 'relay_rename',
+              description: 'Rename this session\'s relay identity at runtime — no restart or environment variables needed. Re-registers with the relay server under the new ID (the old ID is released immediately) and updates the local session registry. Use when this session connected under the wrong ID (e.g. as "CODEX" when it should be "CODEX1").',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  to: {
+                    type: 'string',
+                    description: 'New session ID to register as (e.g. "CODEX1"). Letters, digits, "-" and "_" only, must start with a letter.'
+                  }
+                },
+                required: ['to']
+              }
+            },
+            {
               name: 'relay_sessions',
               description: 'List all Claude sessions across the cluster (live sessions from the relay server on every machine, plus offline sessions from the local registry). Falls back to the local registry if the relay server is unreachable.',
               inputSchema: {
@@ -753,6 +769,37 @@ function handleToolCall(requestId, toolName, args) {
       });
       break;
 
+    case 'relay_rename': {
+      const newId = String(args.to || '').trim();
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(newId)) {
+        sendToolText(requestId, `Error: invalid session ID "${newId}". Use letters, digits, "-" or "_", starting with a letter (max 64 chars).`);
+        return;
+      }
+      if (newId === CLIENT_ID) {
+        sendToolText(requestId, `Already registered as "${CLIENT_ID}" — nothing to do.`);
+        return;
+      }
+      const oldId = CLIENT_ID;
+      // Release the old identity's registry entry with the same semantics as a
+      // disconnect (registry-sourced IDs are marked ended, others removed),
+      // then claim the new identity locally and on the server.
+      updateRegistry('disconnect');
+      CLIENT_ID = newId;
+      CLIENT_ID_SOURCE = 'rename';
+      updateRegistry('connect');
+
+      let renameText = `Renamed relay identity: ${oldId} → ${CLIENT_ID}.`;
+      if (registerWithServer()) {
+        renameText += ' Re-registered with the relay server; the old ID was released immediately.';
+      } else {
+        renameText += ' Relay server unreachable right now; the new ID will be announced automatically on the next (re)connect.';
+      }
+      renameText += `\nIf "${CLIENT_ID}" was live on another connection, that connection has been displaced (newest registration wins). Peers should message ${CLIENT_ID} from now on.`;
+      renameText += `\nNote: tool descriptions cached by this client may still show "${oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
+      sendToolText(requestId, renameText);
+      break;
+    }
+
     case 'relay_sessions':
       // Ask the relay server for the whole cluster's live sessions. Fall back to
       // the local registry if we're not connected.
@@ -871,6 +918,28 @@ function handleToolCall(requestId, toolName, args) {
   }
 }
 
+/**
+ * (Re-)announce this client's identity and metadata to the relay server.
+ * Used on socket open and by relay_rename (the server treats a register from
+ * an already-registered socket as a rename and drops the old identity).
+ */
+function registerWithServer() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify({
+    type: 'register',
+    clientId: CLIENT_ID,
+    meta: {
+      pid: process.pid,
+      started: STARTED_AT,
+      cwd: process.cwd(),
+      host: HOST,
+      source: CLIENT_ID_SOURCE,
+      relayUrl: RELAY_URL
+    }
+  }));
+  return true;
+}
+
 function connectToRelay() {
   if (ws) {
     ws.close();
@@ -882,18 +951,7 @@ function connectToRelay() {
     connected = true;
     // Register with relay, reporting metadata so peers on other machines can see
     // this session in the cluster-wide list (get_sessions), not just locally.
-    ws.send(JSON.stringify({
-      type: 'register',
-      clientId: CLIENT_ID,
-      meta: {
-        pid: process.pid,
-        started: STARTED_AT,
-        cwd: process.cwd(),
-        host: HOST,
-        source: CLIENT_ID_SOURCE,
-        relayUrl: RELAY_URL
-      }
-    }));
+    registerWithServer();
     // Update local session registry
     updateRegistry('connect');
   });

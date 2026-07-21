@@ -72,6 +72,25 @@ wss.on('connection', (ws, req) => {
         case 'register':
           // Client identifies itself (M1, M2, etc.)
           const requestedClientId = msg.clientId || 'unknown';
+
+          // Same-socket rename: this connection is already registered under a
+          // different ID (relay_rename). Drop the old identity completely so it
+          // can't linger as a zombie entry that shows online forever and
+          // swallows messages addressed to the old name.
+          const renamedFrom =
+            clientId && clientId !== requestedClientId && clients.get(clientId) === ws
+              ? clientId
+              : null;
+          if (renamedFrom) {
+            clients.delete(renamedFrom);
+            clientMeta.delete(renamedFrom);
+            logger.info('client_renamed', {
+              from: renamedFrom,
+              to: requestedClientId,
+              remoteAddress: req.socket.remoteAddress
+            });
+          }
+
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
             // Newest-wins takeover (2026-07-17). Reject-duplicate looked safe but
@@ -121,7 +140,15 @@ wss.on('connection', (ws, req) => {
             peers: Array.from(clients.keys()).filter(id => id !== clientId)
           }));
 
-          // Broadcast peer update to others
+          // Broadcast peer update to others. On a rename, first announce the
+          // old identity leaving so every peer's cached list converges.
+          if (renamedFrom) {
+            broadcast({
+              type: 'peer_left',
+              clientId: renamedFrom,
+              peers: Array.from(clients.keys())
+            }, clientId);
+          }
           broadcast({
             type: 'peer_joined',
             clientId,

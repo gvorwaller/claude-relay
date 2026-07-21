@@ -134,6 +134,8 @@ The registry key, MCP `CLIENT_ID`, WebSocket `clientId`, and message `from`/`to`
 
 The relay server rejects duplicate live client IDs. Multiple Codex windows should therefore register distinct IDs (`CODEX2`, `CODEX3`, etc.) instead of sharing `CODEX`.
 
+**Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry. If the target ID is live on another connection, the newest registration wins and the stale holder is displaced.
+
 ---
 
 ## MCP Tools
@@ -147,6 +149,7 @@ Once configured, Claude Code will have these tools:
 | `relay_wait` | Block for the next matching pushed message, with durable catch-up |
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
+| `relay_rename` | Rename this session's live relay identity at runtime — no restart or env vars; the old ID is released immediately |
 | `relay_sessions` | List all registered sessions (including offline) |
 | `relay_clear_sessions` | Remove all offline sessions from the local registry (online sessions kept; registry backed up first) |
 | `relay_clear_history` | Clear the bounded memory cache; the durable journal remains intact |
