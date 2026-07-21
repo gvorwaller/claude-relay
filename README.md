@@ -136,6 +136,10 @@ The relay server rejects duplicate live client IDs. Multiple Codex windows shoul
 
 **Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry. If the target ID is live on another connection, the newest registration wins and the stale holder is displaced.
 
+**Displacement backoff.** When a newer connection takes over this client's ID, the displaced client does **not** auto-reconnect — reconnecting under a taken-over ID guarantees an endless 5-second takeover ping-pong between the two holders (observed as thousands of `duplicate_client_takeover` events per day). It goes quiet instead; `relay_status` reports the DISPLACED state and the remedy: `relay_rename` to a new ID, or to the *same* ID to deliberately reclaim it.
+
+**Background forks don't inherit identity.** Forked or background Claude sessions (`--fork-session` subagents, `--bg-pty-host` daemon resumes, scheduled runs) inherit `CLAUDE_RELAY_SESSION_ID`/`RELAY_CLIENT_ID` from the original session's environment. The MCP client detects that ancestry (or an explicit `RELAY_BACKGROUND_FORK=1`) and registers as `<ID>-bg<pid36>` instead of seizing the live session's identity. An explicit `--client-id` argument still wins — that's a deliberate choice by the spawner.
+
 ---
 
 ## MCP Tools

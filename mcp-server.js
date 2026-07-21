@@ -156,7 +156,49 @@ function resolveClientIdentity() {
   return { id: `${baseId}-${suffix}`, source: 'auto' };
 }
 
+function psField(pid, field) {
+  try {
+    return require('child_process')
+      .execSync(`ps -o ${field}= -p ${pid}`, { encoding: 'utf8', timeout: 2000 })
+      .trim();
+  } catch {
+    return '';
+  }
+}
+
+// Background forks of a Claude session (subagent forks, background-daemon
+// resumes, scheduled runs) inherit CLAUDE_RELAY_SESSION_ID / RELAY_CLIENT_ID
+// from the original session and would otherwise register under the SAME
+// identity, seizing it from the real session in an endless takeover fight
+// (observed 2026-07-21: a --fork-session orphan and a --bg-pty-host daemon
+// resume both stole "CC2" from the live terminal session). Detect that
+// context and refuse to claim the inherited ID verbatim.
+function detectBackgroundFork() {
+  if (process.env.RELAY_BACKGROUND_FORK === '1') return 'RELAY_BACKGROUND_FORK=1';
+  const parentArgs = psField(process.ppid, 'args');
+  if (/--fork-session\b/.test(parentArgs)) return 'parent has --fork-session';
+  const grandparentPid = psField(process.ppid, 'ppid');
+  if (grandparentPid && /--bg-pty-host\b/.test(psField(grandparentPid, 'args'))) {
+    return 'grandparent is --bg-pty-host daemon';
+  }
+  return null;
+}
+
 const resolvedIdentity = resolveClientIdentity();
+// An explicit --client-id is deliberate even in a fork; every other source is
+// (potentially) inherited environment, so a background fork gets a derived,
+// collision-free identity instead.
+if (resolvedIdentity.source !== '--client-id') {
+  const forkReason = detectBackgroundFork();
+  if (forkReason) {
+    const baseId = resolvedIdentity.id;
+    resolvedIdentity.id = `${baseId}-bg${process.pid.toString(36)}`;
+    resolvedIdentity.source = 'background-fork';
+    resolvedIdentity.note =
+      `Background fork detected (${forkReason}); registering as ${resolvedIdentity.id} ` +
+      `instead of seizing "${baseId}" from the live session that owns it.`;
+  }
+}
 // Mutable: relay_rename lets a live session correct its identity at runtime
 // (no restart, no env vars) when startup resolution picked the wrong ID.
 let CLIENT_ID = resolvedIdentity.id;
@@ -346,6 +388,13 @@ function renderLocalSessions(note) {
 // State
 let ws = null;
 let connected = false;
+// Set when the server tells us a newer connection re-registered our ID
+// (newest-wins takeover). A displaced client must NOT auto-reconnect under
+// the same ID — that guarantees an eternal 5-second takeover ping-pong with
+// the new holder. It goes quiet instead; relay_status explains, and
+// relay_rename (to a new ID, or the same ID to deliberately reclaim it)
+// re-establishes the connection.
+let displaced = false;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
@@ -505,7 +554,7 @@ function handleMcpMessage(message) {
             },
             {
               name: 'relay_rename',
-              description: 'Rename this session\'s relay identity at runtime — no restart or environment variables needed. Re-registers with the relay server under the new ID (the old ID is released immediately) and updates the local session registry. Use when this session connected under the wrong ID (e.g. as "CODEX" when it should be "CODEX1").',
+              description: 'Rename this session\'s relay identity at runtime — no restart or environment variables needed. Re-registers with the relay server under the new ID (the old ID is released immediately) and updates the local session registry. Use when this session connected under the wrong ID (e.g. as "CODEX" when it should be "CODEX1"), or — if relay_status reports this session was DISPLACED — pass the current ID to deliberately reclaim it.',
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -763,7 +812,9 @@ function handleToolCall(requestId, toolName, args) {
             type: 'text',
             text: connected
               ? `Connected to ${RELAY_URL} as "${CLIENT_ID}". Peers online: ${peers.length > 0 ? peers.filter(p => p !== CLIENT_ID).join(', ') || 'none' : 'checking...'}`
-              : `Disconnected from relay server. Attempting to connect to ${RELAY_URL}...`
+              : displaced
+                ? `DISPLACED: a newer connection re-registered "${CLIENT_ID}", so this session disconnected and is NOT auto-reconnecting (that would start a takeover fight). If this session should own "${CLIENT_ID}", call relay_rename with to="${CLIENT_ID}" to deliberately reclaim it; otherwise call relay_rename with a different ID.`
+                : `Disconnected from relay server. Attempting to connect to ${RELAY_URL}...`
           }]
         }
       });
@@ -775,22 +826,32 @@ function handleToolCall(requestId, toolName, args) {
         sendToolText(requestId, `Error: invalid session ID "${newId}". Use letters, digits, "-" or "_", starting with a letter (max 64 chars).`);
         return;
       }
-      if (newId === CLIENT_ID) {
+      if (newId === CLIENT_ID && !displaced) {
         sendToolText(requestId, `Already registered as "${CLIENT_ID}" — nothing to do.`);
         return;
       }
       const oldId = CLIENT_ID;
+      const reclaiming = newId === CLIENT_ID;
       // Release the old identity's registry entry with the same semantics as a
       // disconnect (registry-sourced IDs are marked ended, others removed),
-      // then claim the new identity locally and on the server.
-      updateRegistry('disconnect');
-      CLIENT_ID = newId;
-      CLIENT_ID_SOURCE = 'rename';
-      updateRegistry('connect');
+      // then claim the new identity locally and on the server. A same-ID call
+      // while displaced is a deliberate reclaim (newest registration wins).
+      if (!reclaiming) {
+        updateRegistry('disconnect');
+        CLIENT_ID = newId;
+        CLIENT_ID_SOURCE = 'rename';
+        updateRegistry('connect');
+      }
+      displaced = false;
 
-      let renameText = `Renamed relay identity: ${oldId} → ${CLIENT_ID}.`;
+      let renameText = reclaiming
+        ? `Reclaiming relay identity "${CLIENT_ID}".`
+        : `Renamed relay identity: ${oldId} → ${CLIENT_ID}.`;
       if (registerWithServer()) {
         renameText += ' Re-registered with the relay server; the old ID was released immediately.';
+      } else if (!reconnectTimer) {
+        connectToRelay();
+        renameText += ` Reconnecting to the relay server; "${CLIENT_ID}" will be announced as soon as the connection is up.`;
       } else {
         renameText += ' Relay server unreachable right now; the new ID will be announced automatically on the next (re)connect.';
       }
@@ -1102,6 +1163,16 @@ function connectToRelay() {
           break;
 
         case 'error':
+          if (/re-registered by a newer connection/.test(msg.message || '')) {
+            displaced = true;
+            console.error(JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: 'relay_identity_displaced',
+              clientId: CLIENT_ID,
+              action: 'suspending reconnect; use relay_rename to reclaim or take a new ID'
+            }));
+            break;
+          }
           const pendingPurge = pendingMessages.find(p => p.type === 'purge_history');
           if (pendingPurge) {
             pendingMessages = pendingMessages.filter(p => p !== pendingPurge);
@@ -1125,8 +1196,14 @@ function connectToRelay() {
     // Any in-flight history response belonged to this closed socket and can
     // never arrive. Do not let its tombstone consume a post-reconnect reply.
     pendingMessages = pendingMessages.filter(p => p.type !== 'wait_history');
-    // Attempt reconnect after delay
-    if (!shuttingDown) reconnectTimer = setTimeout(connectToRelay, 5000);
+    // Attempt reconnect after delay — unless displaced: reconnecting under a
+    // taken-over ID just re-seizes it and starts an endless takeover fight.
+    if (!shuttingDown && !displaced) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectToRelay();
+      }, 5000);
+    }
   });
 
   ws.on('error', () => {

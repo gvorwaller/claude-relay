@@ -186,3 +186,87 @@ test('relay_rename corrects a live MCP session identity without restart', async 
   const waited = await next(msg => msg.id === 5);
   assert.match(waited.result.content[0].text, /OBSERVER: review request/);
 });
+
+test('displaced client backs off instead of takeover ping-pong, and can reclaim', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-displace-'));
+  const port = startServer(t, root);
+
+  const observer = await connectWithRetry(port, 'WATCHER');
+  t.after(() => observer.close());
+
+  const joined = waitForMessage(observer, msg => msg.type === 'peer_joined' && msg.clientId === 'DISPTEST');
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    '--client-id=DISPTEST', `--relay-url=ws://127.0.0.1:${port}`], {
+    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  const next = mcpLines(mcp.stdout);
+  const send = value => mcp.stdin.write(`${JSON.stringify(value)}\n`);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await next(msg => msg.id === 1);
+  await joined;
+
+  // A newer connection seizes the ID; the MCP client is displaced.
+  const usurper = await connect(port, 'DISPTEST');
+  t.after(() => usurper.close());
+
+  // The old behavior reconnected after 5s and seized the ID back, closing the
+  // usurper's socket. With backoff, the usurper must still hold the ID well
+  // past the 5s reconnect window.
+  const usurperClosed = new Promise(resolve => usurper.once('close', () => resolve('usurper displaced')));
+  const stayedQuiet = new Promise(resolve => setTimeout(() => resolve('no ping-pong'), 7000));
+  assert.equal(await Promise.race([usurperClosed, stayedQuiet]), 'no ping-pong');
+
+  // relay_status explains the displaced state.
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
+  const status = await next(msg => msg.id === 2);
+  assert.match(status.result.content[0].text, /DISPLACED/);
+  assert.match(status.result.content[0].text, /relay_rename/);
+
+  // Same-ID rename while displaced is a deliberate reclaim: the usurper is
+  // displaced and the MCP client comes back online as DISPTEST.
+  const reclaimed = waitForMessage(observer, msg => msg.type === 'peer_joined' && msg.clientId === 'DISPTEST', 10000);
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+    name: 'relay_rename', arguments: { to: 'DISPTEST' }
+  }});
+  const reclaim = await next(msg => msg.id === 3);
+  assert.match(reclaim.result.content[0].text, /Reclaiming relay identity "DISPTEST"/);
+  await reclaimed;
+  await usurperClosed;
+
+  send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
+  const after = await next(msg => msg.id === 4);
+  assert.match(after.result.content[0].text, /Connected .* as "DISPTEST"/);
+});
+
+test('background fork registers a derived identity instead of seizing the inherited one', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-fork-'));
+  const port = startServer(t, root);
+
+  const observer = await connectWithRetry(port, 'WATCHER');
+  t.after(() => observer.close());
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && /^CC9-bg[0-9a-z]+$/.test(msg.clientId));
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'), `--relay-url=ws://127.0.0.1:${port}`], {
+    env: {
+      ...process.env,
+      HOME: root,
+      CLAUDE_RELAY_SESSION_ID: 'CC9',
+      RELAY_CLIENT_ID: '',
+      RELAY_BACKGROUND_FORK: '1'
+    },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  const next = mcpLines(mcp.stdout);
+  mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+  await next(msg => msg.id === 1);
+  const forkJoin = await joined;
+  assert.notEqual(forkJoin.clientId, 'CC9', 'inherited identity must not be seized');
+
+  // The plain CC9 identity is still free for the real session to register.
+  const real = await connect(port, 'CC9');
+  t.after(() => real.close());
+});
