@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wake-on-Message: the interaction, visualized</title>
+<style>
+  :root {
+    --bg: #F6F8FA;
+    --panel: #FFFFFF;
+    --panel2: #EEF2F5;
+    --ink: #1C2733;
+    --muted: #5B6B7A;
+    --line: #DCE3EA;
+    --wire: #C3CDD6;
+    --accent: #0F766E;
+    --accent-soft: rgba(15, 118, 110, 0.10);
+    --warn: #B45309;
+    --warn-soft: rgba(180, 83, 9, 0.10);
+    --bad: #B3261E;
+    --bad-soft: rgba(179, 38, 30, 0.08);
+    --good: #15803D;
+    --good-soft: rgba(21, 128, 61, 0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161D;
+      --panel: #171F28;
+      --panel2: #1E2833;
+      --ink: #E6EDF3;
+      --muted: #93A4B4;
+      --line: #2A3642;
+      --wire: #374553;
+      --accent: #2DD4BF;
+      --accent-soft: rgba(45, 212, 191, 0.12);
+      --warn: #FBBF24;
+      --warn-soft: rgba(251, 191, 36, 0.12);
+      --bad: #F87171;
+      --bad-soft: rgba(248, 113, 113, 0.10);
+      --good: #4ADE80;
+      --good-soft: rgba(74, 222, 128, 0.12);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #F6F8FA; --panel: #FFFFFF; --panel2: #EEF2F5; --ink: #1C2733;
+    --muted: #5B6B7A; --line: #DCE3EA; --wire: #C3CDD6;
+    --accent: #0F766E; --accent-soft: rgba(15, 118, 110, 0.10);
+    --warn: #B45309; --warn-soft: rgba(180, 83, 9, 0.10);
+    --bad: #B3261E; --bad-soft: rgba(179, 38, 30, 0.08);
+    --good: #15803D; --good-soft: rgba(21, 128, 61, 0.10);
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161D; --panel: #171F28; --panel2: #1E2833; --ink: #E6EDF3;
+    --muted: #93A4B4; --line: #2A3642; --wire: #374553;
+    --accent: #2DD4BF; --accent-soft: rgba(45, 212, 191, 0.12);
+    --warn: #FBBF24; --warn-soft: rgba(251, 191, 36, 0.12);
+    --bad: #F87171; --bad-soft: rgba(248, 113, 113, 0.10);
+    --good: #4ADE80; --good-soft: rgba(74, 222, 128, 0.12);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Avenir Next", Avenir, "Helvetica Neue", Helvetica, system-ui, sans-serif;
+    line-height: 1.55;
+    margin: 0;
+    padding: 40px 20px 72px;
+  }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+  }
+  code {
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  main { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+
+  header h1 {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 10px;
+    text-wrap: balance;
+  }
+  header p { max-width: 62ch; color: var(--muted); margin: 0; }
+
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 6px;
+  }
+  section h2 {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    margin: 0 0 8px;
+    text-wrap: balance;
+  }
+  section > p { max-width: 66ch; color: var(--muted); margin: 0 0 16px; }
+  section > p strong { color: var(--ink); font-weight: 600; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .scroll { overflow-x: auto; }
+  .scroll .seq { min-width: 640px; }
+
+  /* ---- cast ---- */
+  .cast { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .cast .card { padding: 14px 16px; }
+  .cast .who {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .cast .what { font-size: 13px; color: var(--muted); }
+
+  /* ---- sequence diagrams ---- */
+  .seq { position: relative; padding-top: 8px; }
+  .actors { position: relative; height: 40px; }
+  .actor {
+    position: absolute;
+    left: var(--x);
+    transform: translateX(-50%);
+    top: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    font-weight: 600;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 10px;
+    white-space: nowrap;
+    z-index: 2;
+  }
+  .lanes { position: relative; padding: 6px 0 4px; }
+  .life {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: var(--x);
+    width: 0;
+    border-left: 2px dashed var(--wire);
+    transform: translateX(-1px);
+  }
+  .row { position: relative; height: 56px; }
+  .row.tall { height: 66px; }
+
+  .arrow {
+    position: absolute;
+    left: var(--l);
+    width: var(--w);
+    top: 0;
+    bottom: 0;
+    --c: var(--accent);
+  }
+  .arrow::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 6px;
+    bottom: 12px;
+    border-top: 2px solid var(--c);
+  }
+  .arrow.dash::after { border-top-style: dashed; }
+  .arrow::before {
+    content: "";
+    position: absolute;
+    bottom: 8px;
+    right: 0;
+    border: 5px solid transparent;
+    border-left: 8px solid var(--c);
+  }
+  .arrow.r2l::after { left: 6px; right: 0; }
+  .arrow.r2l::before {
+    right: auto;
+    left: 0;
+    border-left: 5px solid transparent;
+    border-right: 8px solid var(--c);
+  }
+  .arrow.warn { --c: var(--warn); }
+  .arrow.good { --c: var(--good); }
+  .arrow.mut  { --c: var(--muted); }
+
+  .lbl {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 20px;
+    text-align: center;
+    white-space: nowrap;
+    font-size: 13px;
+    line-height: 1.3;
+  }
+  .lbl .sub { display: block; font-size: 11.5px; color: var(--muted); }
+
+  .num {
+    display: inline-block;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10.5px;
+    font-weight: 700;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-radius: 99px;
+    padding: 0 6px;
+    margin-right: 4px;
+    vertical-align: 1px;
+  }
+  .arrow.warn .num, .selfnote.warn .num { background: var(--warn-soft); color: var(--warn); }
+  .arrow.good .num, .selfnote.good .num { background: var(--good-soft); color: var(--good); }
+  .arrow.bad .num,  .selfnote.bad .num  { background: var(--bad-soft);  color: var(--bad); }
+
+  .selfnote {
+    position: absolute;
+    left: var(--x);
+    transform: translateX(-50%);
+    top: 50%;
+    translate: 0 -50%;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 7px 12px;
+    font-size: 12.5px;
+    line-height: 1.35;
+    text-align: center;
+    white-space: nowrap;
+    z-index: 1;
+  }
+  .selfnote .sub { display: block; font-size: 11px; color: var(--muted); }
+  .selfnote.bad  { border-color: var(--bad);  background: var(--bad-soft); }
+  .selfnote.good { border-color: var(--good); background: var(--good-soft); }
+
+  .gapband {
+    position: absolute;
+    left: 4%;
+    right: 4%;
+    top: 8px;
+    bottom: 8px;
+    background: var(--bad-soft);
+    border: 1px dashed var(--bad);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    font-size: 13px;
+    z-index: 1;
+  }
+  .gapband .sub { font-size: 11.5px; color: var(--muted); }
+
+  .caption {
+    margin: 10px 4px 0;
+    font-size: 13px;
+    color: var(--muted);
+    max-width: 70ch;
+  }
+  .caption strong { color: var(--ink); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .key { display: inline-block; width: 26px; border-top: 2px solid var(--accent); }
+  .key.dashk { border-top-style: dashed; }
+  .key.warnk { border-color: var(--warn); }
+  .key.goodk { border-color: var(--good); }
+
+  /* ---- two layers panel ---- */
+  .layers { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 640px) { .layers { grid-template-columns: 1fr; } }
+  .layers .card h3 { font-size: 15px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  .pill {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 99px;
+    padding: 2px 9px;
+  }
+  .pill.built { background: var(--good-soft); color: var(--good); }
+  .pill.missing { background: var(--warn-soft); color: var(--warn); }
+  .layers p { font-size: 13.5px; color: var(--muted); margin: 0 0 10px; }
+  .bridges { display: flex; flex-direction: column; gap: 6px; }
+  .bridge {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 13px;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 7px 10px;
+  }
+  .bridge .t { font-weight: 600; white-space: nowrap; }
+  .bridge .d { color: var(--muted); font-size: 12.5px; }
+
+  /* ---- blind window timeline ---- */
+  .timeline { min-width: 560px; }
+  .tl-bar { display: flex; height: 30px; border-radius: 6px; overflow: hidden; margin-top: 46px; }
+  .tl-seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+  .tl-watch { flex: 5; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+  .tl-watch:first-child { border-radius: 6px 0 0 6px; }
+  .tl-gap { flex: 1.2; background: var(--bad-soft); color: var(--bad); border-top: 1px dashed var(--bad); border-bottom: 1px dashed var(--bad); }
+  .tl-watch:last-child { border-radius: 0 6px 6px 0; }
+  .tl-drop {
+    position: relative;
+    height: 0;
+  }
+  .tl-mail {
+    position: absolute;
+    left: 44.6%;
+    transform: translateX(-50%);
+    top: -46px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--bad);
+    white-space: nowrap;
+  }
+  .tl-mail::after {
+    content: "";
+    display: block;
+    margin: 2px auto 0;
+    width: 0;
+    border: 5px solid transparent;
+    border-top: 8px solid var(--bad);
+  }
+  .tl-labels { display: flex; margin-top: 6px; font-size: 11.5px; color: var(--muted); }
+  .tl-labels span { text-align: center; }
+  .tl-labels .a { flex: 5; }
+  .tl-labels .b { flex: 1.2; color: var(--bad); }
+  .fixline {
+    margin-top: 16px;
+    padding: 10px 14px;
+    border-left: 3px solid var(--good);
+    background: var(--good-soft);
+    border-radius: 0 7px 7px 0;
+    font-size: 13.5px;
+  }
+
+  /* ---- rollout ---- */
+  ol.rollout { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; max-width: 70ch; }
+  ol.rollout li::marker { font-weight: 700; color: var(--accent); }
+  ol.rollout .why { color: var(--muted); font-size: 13px; }
+
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<main>
+  <header>
+    <p class="eyebrow">claude-relay · wake-on-message design</p>
+    <h1>How a sleeping agent gets woken</h1>
+    <p>The relay already <em>delivers</em> every message durably. The problem is <em>attention</em>: a
+    turn-based agent only reads the relay when something makes it take a turn. These diagrams show
+    what happened in the 2026-08-02 incident, and the proposed fix — read them top to bottom;
+    time flows downward.</p>
+  </header>
+
+  <section>
+    <p class="eyebrow">The cast</p>
+    <div class="cast">
+      <div class="card">
+        <div class="who">Sender</div>
+        <div class="what">Any agent session that just sent a message (CC5 in the incident) and wants the target to act on it.</div>
+      </div>
+      <div class="card">
+        <div class="who">Relay server</div>
+        <div class="what"><span class="mono">server.js</span> — stores every message durably, replays it whenever the target next reads. Never loses mail.</div>
+      </div>
+      <div class="card">
+        <div class="who">Watcher</div>
+        <div class="what"><span class="mono">relay-watch.js</span> — a tiny plain OS process (not an agent, zero tokens) that subscribes to “mail exists for X” pings. Already built.</div>
+      </div>
+      <div class="card">
+        <div class="who">Idle target</div>
+        <div class="what">The agent that should react — a Claude Code, Codex, or Grok session sitting between turns, reading nothing.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Diagram A · today</p>
+    <h2>The incident: delivery worked, attention failed</h2>
+    <div class="card scroll">
+      <div class="seq">
+        <div class="actors">
+          <div class="actor" style="--x:12.5%">CC5 (sender)</div>
+          <div class="actor" style="--x:37.5%">Relay</div>
+          <div class="actor" style="--x:62.5%">CODEX (idle)</div>
+          <div class="actor" style="--x:87.5%">Human</div>
+        </div>
+        <div class="lanes">
+          <div class="life" style="--x:12.5%"></div>
+          <div class="life" style="--x:37.5%"></div>
+          <div class="life" style="--x:62.5%"></div>
+          <div class="life" style="--x:87.5%"></div>
+
+          <div class="row tall">
+            <div class="arrow" style="--l:12.5%; --w:25%">
+              <div class="lbl"><span class="num">1</span>relay_send — QA handoff
+                <span class="sub">stored durably ✓</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow mut" style="--l:37.5%; --w:25%">
+              <div class="lbl"><span class="num">2</span>pushed to CODEX’s live socket
+                <span class="sub">but no turn is running — nobody reads it</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="selfnote bad" style="--x:12.5%"><span class="num">3</span>relay_wait 300 s … × 14
+              <span class="sub">nothing ever comes back</span></div>
+          </div>
+          <div class="row tall">
+            <div class="gapband">≈ 2 hours pass
+              <span class="sub">“mid-run on my handoff” and “never saw it” look identical from outside</span>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow warn r2l" style="--l:62.5%; --w:25%">
+              <div class="lbl"><span class="num">4</span>human notices, pokes CODEX
+                <span class="sub">“check the relay”</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow good r2l" style="--l:37.5%; --w:25%">
+              <div class="lbl"><span class="num">5</span>relay_receive — handoff intact
+                <span class="sub">QA runs normally; the mail was fine all along</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><span class="key"></span> message with content</span>
+        <span><span class="key dashk"></span> content-free signal</span>
+        <span><span class="key warnk"></span> human action</span>
+        <span><span class="key goodk"></span> the goal: target reads &amp; acts</span>
+      </div>
+    </div>
+    <p class="caption"><strong>The whole design exists to replace step 4</strong> — the human poke —
+    with something automatic that fires seconds after step 1.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">The key idea</p>
+    <h2>Two layers: sensing is built, waking is the missing bridge</h2>
+    <div class="layers">
+      <div class="card">
+        <h3>Sensing <span class="pill built">already built</span></h3>
+        <p>The relay’s <em>watch protocol</em>: any tiny process can subscribe to “new mail exists
+        for X” pings. Pings carry no content — just “something arrived.”
+        <span class="mono">relay-watch.js</span> does exactly this and exits when a ping lands.</p>
+      </div>
+      <div class="card">
+        <h3>Waking <span class="pill missing">the gap</span></h3>
+        <p>Something must convert that ping into the target <em>taking a turn</em>. That bridge is
+        different for each harness:</p>
+        <div class="bridges">
+          <div class="bridge"><span class="t">Claude Code</span><span class="d">background task exits → harness wakes the model (Diagram B)</span></div>
+          <div class="bridge"><span class="t">Codex</span><span class="d">server hook runs <span class="mono">codex exec resume --last</span> (Diagram C)</span></div>
+          <div class="bridge"><span class="t">Grok / other</span><span class="d">macOS banner → human pokes, until a headless CLI exists (Diagram D)</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Diagram B · claude code target</p>
+    <h2>Wake via background watcher — §3, needs one new script</h2>
+    <p>Before going idle, the Claude Code session launches the watcher loop as a background
+    process (one Bash call, <span class="mono">run_in_background</span>). Then it sleeps at
+    <strong>zero token cost</strong> until real mail arrives.</p>
+    <div class="card scroll">
+      <div class="seq">
+        <div class="actors">
+          <div class="actor" style="--x:12.5%">Idle CC session</div>
+          <div class="actor" style="--x:37.5%">Watcher loop</div>
+          <div class="actor" style="--x:62.5%">Relay</div>
+          <div class="actor" style="--x:87.5%">Sender</div>
+        </div>
+        <div class="lanes">
+          <div class="life" style="--x:12.5%"></div>
+          <div class="life" style="--x:37.5%"></div>
+          <div class="life" style="--x:62.5%"></div>
+          <div class="life" style="--x:87.5%"></div>
+
+          <div class="row tall">
+            <div class="arrow mut" style="--l:12.5%; --w:25%">
+              <div class="lbl"><span class="num">1</span>arms <span class="mono">relay-watch-loop.sh</span>
+                <span class="sub">once, before going idle — then 0 tokens</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow dash" style="--l:37.5%; --w:25%">
+              <div class="lbl"><span class="num">2</span>watch for “CC5”
+                <span class="sub">content-free subscription, re-armed every 300 s</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow r2l" style="--l:62.5%; --w:25%">
+              <div class="lbl"><span class="num">3</span>relay_send to CC5
+                <span class="sub">stored durably, as always</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow dash r2l" style="--l:37.5%; --w:25%">
+              <div class="lbl"><span class="num">4</span>ping: “new mail for CC5”
+                <span class="sub">still no content — just the signal</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="selfnote good" style="--x:37.5%"><span class="num">5</span>loop exits <span class="mono">new-message</span>
+              <span class="sub">→ harness task-notification wakes the idle model</span></div>
+          </div>
+          <div class="row tall">
+            <div class="arrow good" style="--l:12.5%; --w:50%">
+              <div class="lbl"><span class="num">6</span>relay_receive → full message → acts
+                <span class="sub">seconds after step 3, not hours</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><span class="key"></span> message with content</span>
+        <span><span class="key dashk"></span> content-free signal</span>
+        <span><span class="key goodk"></span> target reads &amp; acts</span>
+      </div>
+    </div>
+    <p class="caption">This is the incident’s subagent-waiter pattern minus the token burn: the
+    listening is done by a throwaway OS process, and the model only spends tokens when there is
+    actually mail.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">Diagram C · codex target</p>
+    <h2>Wake via server hook + <span class="mono">codex exec resume</span></h2>
+    <p>Codex has no background-task hook, so the bridge moves server-side: when mail for CODEX is
+    stored, the relay consults <span class="mono">data/notify.json</span> and runs a local command.
+    The design doc assumed no programmatic Codex trigger exists — <strong>it does</strong>: the
+    installed CLI resumes the most recent session headlessly, context intact.</p>
+    <div class="card scroll">
+      <div class="seq">
+        <div class="actors">
+          <div class="actor" style="--x:12.5%">Sender</div>
+          <div class="actor" style="--x:37.5%">Relay</div>
+          <div class="actor" style="--x:62.5%">notify hook</div>
+          <div class="actor" style="--x:87.5%">Codex session</div>
+        </div>
+        <div class="lanes">
+          <div class="life" style="--x:12.5%"></div>
+          <div class="life" style="--x:37.5%"></div>
+          <div class="life" style="--x:62.5%"></div>
+          <div class="life" style="--x:87.5%"></div>
+
+          <div class="row tall">
+            <div class="arrow" style="--l:12.5%; --w:25%">
+              <div class="lbl"><span class="num">1</span>relay_send to CODEX
+                <span class="sub">stored durably</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow dash" style="--l:37.5%; --w:25%">
+              <div class="lbl"><span class="num">2</span>match in <span class="mono">notify.json</span> → run hook
+                <span class="sub">debounced, so a burst = one wake</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow warn" style="--l:62.5%; --w:25%">
+              <div class="lbl"><span class="num">3</span><span class="mono">codex exec resume --last "…"</span>
+                <span class="sub">“unread relay mail — run relay_receive and act”</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow good r2l" style="--l:37.5%; --w:50%">
+              <div class="lbl"><span class="num">4</span>resumed session reads mail, acts
+                <span class="sub">same session, same context — no human poke</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><span class="key"></span> message with content</span>
+        <span><span class="key dashk"></span> content-free signal</span>
+        <span><span class="key warnk"></span> hook command (server host, local config only)</span>
+        <span><span class="key goodk"></span> target reads &amp; acts</span>
+      </div>
+    </div>
+    <p class="caption">To verify before shipping: pin the resume to the right session (not just
+    <span class="mono">--last</span>) when several Codex projects run, and test what resuming does
+    to a turn already mid-flight.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">Diagram D · grok / anything else</p>
+    <h2>Fallback: push the <em>human</em> instead of polling</h2>
+    <div class="card scroll">
+      <div class="seq" style="min-width:560px">
+        <div class="actors">
+          <div class="actor" style="--x:16.7%">Sender</div>
+          <div class="actor" style="--x:50%">Relay</div>
+          <div class="actor" style="--x:83.3%">Human</div>
+        </div>
+        <div class="lanes">
+          <div class="life" style="--x:16.7%"></div>
+          <div class="life" style="--x:50%"></div>
+          <div class="life" style="--x:83.3%"></div>
+
+          <div class="row tall">
+            <div class="arrow" style="--l:16.7%; --w:33.3%">
+              <div class="lbl"><span class="num">1</span>relay_send to GROK
+                <span class="sub">stored durably</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="arrow dash warn" style="--l:50%; --w:33.3%">
+              <div class="lbl"><span class="num">2</span>macOS banner: “relay · 1 new for GROK”
+                <span class="sub">content-free, instant</span></div>
+            </div>
+          </div>
+          <div class="row tall">
+            <div class="selfnote warn" style="--x:83.3%"><span class="num">3</span>human pokes the Grok session
+              <span class="sub">still a poke — but pushed to you in seconds, not discovered hours later</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="caption">The moment Grok (or anything else) grows a headless CLI, it moves from this
+    diagram to Diagram C by adding one line to <span class="mono">notify.json</span> — no server
+    change.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">One race to close</p>
+    <h2>The blind window between watcher re-arms</h2>
+    <p>The watcher times out and reconnects every 300 s. Mail landing in the tiny gap between
+    “watcher #1 exits” and “watcher #2 subscribes” produces <strong>no ping</strong> — it sits
+    stored but silent, which is the incident in miniature.</p>
+    <div class="card scroll">
+      <div class="timeline">
+        <div class="tl-drop">
+          <div class="tl-mail">✉ message lands here → no ping</div>
+        </div>
+        <div class="tl-bar">
+          <div class="tl-seg tl-watch">watch #1 · 0–300 s</div>
+          <div class="tl-seg tl-gap">gap</div>
+          <div class="tl-seg tl-watch">watch #2 · re-armed</div>
+        </div>
+        <div class="tl-labels">
+          <span class="a">subscribed — pings flow</span>
+          <span class="b">deaf</span>
+          <span class="a">subscribed — but never told about the gap mail</span>
+        </div>
+        <div class="fixline"><strong>Fix (~10 lines in server.js):</strong> the
+        <span class="mono">watch</span> subscription accepts <span class="mono">since: &lt;last message id&gt;</span>.
+        On subscribe, the server checks the store — if newer mail for the target already exists, it
+        pings immediately. Watch #2 then catches the gap mail the instant it arms.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Build order</p>
+    <h2>Smallest honest path to “instant”</h2>
+    <ol class="rollout">
+      <li><strong>Queued-not-error fix</strong> (<span class="mono">server.js</span>) —
+        <span class="why">senders currently see an “error” for mail that was in fact stored; stop the lie.</span></li>
+      <li><strong>Diagram B</strong>: <span class="mono">relay-watch-loop.sh</span> + the
+        <span class="mono">since</span> param — <span class="why">makes Claude Code targets instant and closes the blind window.</span></li>
+      <li><strong>Diagram C</strong>: exec hooks in <span class="mono">notify.json</span> —
+        <span class="why">makes Codex instant; banner entries (Diagram D) cover everything else.</span></li>
+      <li><strong>Read cursors / unread counts</strong> —
+        <span class="why">the verification layer: lets any sender <em>see</em> that a wake worked instead of guessing.</span></li>
+    </ol>
+  </section>
+</main>
+
+</html>
