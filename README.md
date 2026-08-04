@@ -216,6 +216,53 @@ doorbell payload (`type`, watched ID, and timestamp). It receives no sender,
 content, cursor, or target history privileges. Like the relay itself, this is a
 trusted-network/loopback tool and must not be exposed directly to the internet.
 
+### Wake-on-message: hours of idle listening in one background task
+
+For true wake-on-message (design: `docs/2026-08-02-wake-on-message-design.md`),
+`relay-watch-loop.sh` re-arms the watcher until real mail arrives, so a single
+background Bash call covers up to `--max-minutes` (default 120) of idle
+listening and exits exactly once, printing `new-message`:
+
+```bash
+~/claude-relay/scripts/relay-watch-loop.sh --for CC2
+```
+
+Launch it with `run_in_background: true` before going idle; the harness's
+task notification wakes the session, which then runs `relay_receive`. The loop
+pins a `--since` cursor at start and passes it to every re-arm — the server
+backfills a ping at subscribe time if mail landed in the deaf gap between one
+watcher exiting and the next arming, so nothing sits silently queued.
+
+### Send acks are honest
+
+`relay_send` (and the raw `message` protocol) now acks every send with
+`{ type: 'sent', id, to, delivered }`. `delivered: false` means *queued* — the
+message is durably stored and replayed when the target next reads. It is not an
+error, and the old `Client X not connected` error is gone. A `delivered: true`
+ack means the target's socket took the bytes; it does not mean anyone is
+paying attention.
+
+### Server-side notify hooks (waking non-Claude harnesses)
+
+When a message is stored, the server consults optional operator-local config
+`data/notify.json` (see `notify.json.example`; override path with
+`RELAY_NOTIFY_CONFIG`). Entries per target ID (or `"*"` for any target):
+
+- `{ "type": "banner" }` — content-free macOS notification (sender + target
+  only) via `osascript`.
+- `{ "type": "exec", "command": "...", "debounceSeconds": 300 }` — run a
+  command detached with `RELAY_FOR`, `RELAY_FROM`, `RELAY_MESSAGE_ID`,
+  `RELAY_DELIVERED` in the environment. This is how a turn-based harness with
+  a headless CLI gets woken, e.g. Codex:
+  `codex exec resume --last 'You have unread relay mail — run relay_receive'`.
+- `"onlyIfUndelivered": true` — fire only when the target socket was not live
+  at store time.
+
+Edits to `notify.json` are picked up without a restart. Hook failures are
+logged and never affect message handling. The config is deliberately not a
+protocol message: only someone with filesystem access to the server host can
+install a hook.
+
 **See who's online:**
 ```
 Use relay_peers to list connected instances

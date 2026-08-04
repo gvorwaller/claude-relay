@@ -13,9 +13,13 @@ function value(name, fallback) {
 const target = value('--for');
 const relayUrl = value('--relay-url', process.env.RELAY_URL || 'ws://localhost:9999');
 const timeoutSeconds = Math.max(1, Math.min(Number(value('--timeout', '240')) || 240, 300));
+// Optional backfill cursor (message id or ISO timestamp): the server pings
+// immediately at subscribe time if mail for the target already arrived after
+// this point — covers the deaf gap between watcher re-arms.
+const since = value('--since');
 
 if (!target) {
-  console.error('Usage: relay-watch.js --for CLIENT_ID [--timeout 240] [--relay-url ws://localhost:9999]');
+  console.error('Usage: relay-watch.js --for CLIENT_ID [--timeout 240] [--since ISO_OR_MSG_ID] [--relay-url ws://localhost:9999]');
   process.exit(2);
 }
 
@@ -43,7 +47,9 @@ ws.on('open', () => ws.send(JSON.stringify({
 ws.on('message', data => {
   const message = JSON.parse(data.toString());
   if (message.type === 'registered') {
-    ws.send(JSON.stringify({ type: 'watch', for: target }));
+    const watchRequest = { type: 'watch', for: target };
+    if (since) watchRequest.since = since;
+    ws.send(JSON.stringify(watchRequest));
   } else if (message.type === 'new_message' && message.for === target) {
     finish('new-message', 0);
   } else if (message.type === 'error') {

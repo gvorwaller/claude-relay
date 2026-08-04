@@ -1,0 +1,12 @@
+{
+  "CODEX3": [
+    {
+      "type": "exec",
+      "command": "codex exec resume --last 'You have unread claude-relay mail addressed to you. Run relay_receive and act on what it says.' >/dev/null 2>&1",
+      "debounceSeconds": 300
+    }
+  ],
+  "*": [
+    { "type": "banner", "onlyIfUndelivered": true }
+  ]
+}

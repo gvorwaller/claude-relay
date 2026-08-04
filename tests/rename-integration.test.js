@@ -117,10 +117,11 @@ test('server treats same-socket re-register as a rename and drops the old identi
   peer.send(JSON.stringify({ type: 'message', to: 'RIGHT1', content: 'hello new name' }));
   await delivered;
 
-  // ...and the old identity is gone, not a zombie that eats messages.
-  const rejected = waitForMessage(peer, msg => msg.type === 'error' && /WRONG not connected/.test(msg.message));
+  // ...and the old identity is gone, not a zombie that eats messages: mail to
+  // it is acknowledged as queued (stored, undelivered), not delivered live.
+  const queued = waitForMessage(peer, msg => msg.type === 'sent' && msg.to === 'WRONG');
   peer.send(JSON.stringify({ type: 'message', to: 'WRONG', content: 'nobody home' }));
-  await rejected;
+  assert.equal((await queued).delivered, false);
 });
 
 test('relay_rename corrects a live MCP session identity without restart', async t => {

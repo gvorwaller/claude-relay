@@ -636,22 +636,27 @@ function handleToolCall(requestId, toolName, args) {
         return;
       }
 
+      // Respond from the server's ack so the sender learns the truth:
+      // delivered live vs queued for an offline peer. The fallback timer keeps
+      // the tool call from hanging if the ack never arrives (old server).
+      const preview = `"${args.message.substring(0, 100)}${args.message.length > 100 ? '...' : ''}"`;
+      const sendAck = {
+        requestId,
+        type: 'send_ack',
+        to: args.to || 'all',
+        preview
+      };
+      sendAck.timer = setTimeout(() => {
+        pendingMessages = pendingMessages.filter(p => p !== sendAck);
+        sendToolText(requestId, `Message sent to ${sendAck.to === 'all' ? 'all peers' : sendAck.to}: ${preview}`);
+      }, 3000);
+      pendingMessages.push(sendAck);
+
       ws.send(JSON.stringify({
         type: 'message',
         to: args.to || 'all',
         content: args.message
       }));
-
-      sendMcpResponse({
-        jsonrpc: '2.0',
-        id: requestId,
-        result: {
-          content: [{
-            type: 'text',
-            text: `Message sent to ${args.to || 'all peers'}: "${args.message.substring(0, 100)}${args.message.length > 100 ? '...' : ''}"`
-          }]
-        }
-      });
       break;
 
     case 'relay_wait':
@@ -1160,6 +1165,22 @@ function connectToRelay() {
             timestamp: msg.timestamp
           });
           relayWaiter.deliver(msg, 'push');
+          break;
+
+        case 'sent':
+          // Server ack for relay_send: delivered live vs durably queued.
+          const sendReq = pendingMessages.find(p => p.type === 'send_ack');
+          if (sendReq) {
+            pendingMessages = pendingMessages.filter(p => p !== sendReq);
+            clearTimeout(sendReq.timer);
+            const label = sendReq.to === 'all' ? 'all peers' : sendReq.to;
+            const text = msg.delivered
+              ? (sendReq.to === 'all'
+                ? `Broadcast to ${label} (at least one peer connected): ${sendReq.preview}`
+                : `Sent to ${label} (connection live — delivered; note a live socket doesn't guarantee attention): ${sendReq.preview}`)
+              : `Queued for ${label} (offline — stored durably, replayed when they next read): ${sendReq.preview}`;
+            sendToolText(sendReq.requestId, text);
+          }
           break;
 
         case 'error':

@@ -9,9 +9,11 @@
  * Default port: 9999
  */
 
+const path = require('path');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
+const { NotifyHooks } = require('./notify-hooks');
 
 const PORT = parseInt(process.argv[2] || process.env.RELAY_PORT || '9999', 10);
 const MESSAGE_RETENTION_DAYS = parseInt(process.env.RELAY_MESSAGE_RETENTION_DAYS || '7', 10);
@@ -35,6 +37,10 @@ const logger = new OperationalLogger({
   retentionDays: parseInt(process.env.RELAY_LOG_RETENTION_DAYS || '7', 10),
   maxTotalBytes: parseInt(process.env.RELAY_LOG_MAX_TOTAL_MB || '50', 10) * 1024 * 1024,
   maxFileBytes: parseInt(process.env.RELAY_LOG_MAX_FILE_MB || '10', 10) * 1024 * 1024
+});
+const notifyHooks = new NotifyHooks({
+  configPath: process.env.RELAY_NOTIFY_CONFIG || path.join(__dirname, 'data', 'notify.json'),
+  logger
 });
 
 // Connected clients: Map<clientId, WebSocket>
@@ -182,16 +188,21 @@ wss.on('connection', (ws, req) => {
             // Direct message to specific client
             if (target && target.readyState === 1) {
               target.send(JSON.stringify(envelope));
-            } else {
-              ws.send(JSON.stringify({
-                type: 'error',
-                message: `Client ${msg.to} not connected`
-              }));
             }
           } else {
             // Broadcast to all except sender
             broadcast(envelope, clientId);
           }
+          // Always acknowledge honestly. An offline target used to get an
+          // 'error' reply even though the message WAS durably stored and will
+          // be replayed — that lie caused real triage confusion (2026-08-02
+          // incident). delivered=false now means "queued", never "lost".
+          ws.send(JSON.stringify({
+            type: 'sent',
+            id: envelope.id,
+            to,
+            delivered
+          }));
           logger.info('message_recorded', {
             messageId: envelope.id,
             from: clientId,
@@ -199,7 +210,13 @@ wss.on('connection', (ws, req) => {
             bytes: Buffer.byteLength(msg.content, 'utf8'),
             delivered
           });
-          notifyWatchers(to, envelope.timestamp);
+          notifyWatchers(to, envelope.timestamp, clientId);
+          notifyHooks.fire({
+            to,
+            from: clientId,
+            messageId: envelope.id,
+            delivered
+          });
           break;
 
         case 'watch':
@@ -217,6 +234,32 @@ wss.on('connection', (ws, req) => {
           watchers.get(ws.watchTarget).add(ws);
           ws.send(JSON.stringify({ type: 'watching', for: ws.watchTarget }));
           logger.info('watch_started', { clientId, for: ws.watchTarget });
+          // Closing the re-arm blind window: a watcher re-subscribing every
+          // ~300s is deaf between exits. With `since` (message id or ISO
+          // timestamp) the server checks the store at subscribe time and pings
+          // immediately if mail already arrived, so gap mail wakes the next
+          // watcher the instant it arms instead of sitting silent.
+          if (typeof msg.since === 'string' && msg.since.trim()) {
+            const pending = messageStore.query({
+              requester: ws.watchTarget,
+              after: msg.since.trim(),
+              count: 50
+            }).messages.filter(m =>
+              m.from !== ws.watchTarget && (m.to === ws.watchTarget || m.to === 'all'));
+            if (pending.length > 0) {
+              ws.send(JSON.stringify({
+                type: 'new_message',
+                for: ws.watchTarget,
+                at: pending[pending.length - 1].timestamp,
+                pending: pending.length
+              }));
+              logger.info('watch_backfill_ping', {
+                clientId,
+                for: ws.watchTarget,
+                pending: pending.length
+              });
+            }
+          }
           break;
 
         case 'get_history':
@@ -356,9 +399,12 @@ function broadcast(message, excludeClient = null) {
   });
 }
 
-function notifyWatchers(to, at) {
+function notifyWatchers(to, at, from) {
   const targets = to === 'all' ? Array.from(watchers.keys()) : [to];
   for (const target of targets) {
+    // A broadcast must not wake the sender's own watcher — an agent pinging
+    // itself awake over its own outbound mail would loop forever.
+    if (from && target === from) continue;
     const subscribers = watchers.get(target);
     if (!subscribers) continue;
     const ping = JSON.stringify({ type: 'new_message', for: target, at });
