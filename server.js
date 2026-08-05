@@ -55,6 +55,12 @@ const duplicateLogTimes = new Map();
 // visibility or message content.
 const watchers = new Map();
 
+// One strict grammar for every client-supplied identity and target (review
+// finding #1: unvalidated labels flowed into shell/AppleScript sinks). `~` is
+// deliberately excluded: it is reserved for server-minted delegate IDs, so a
+// client can never register a name that impersonates one.
+const CLIENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
 const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
 
 logger.info('server_starting', { port: PORT });
@@ -77,7 +83,18 @@ wss.on('connection', (ws, req) => {
       switch (msg.type) {
         case 'register':
           // Client identifies itself (M1, M2, etc.)
-          const requestedClientId = msg.clientId || 'unknown';
+          // No silent "unknown" fallback: every nameless client used to land
+          // on that one shared label and displace the others. A client must
+          // name itself, validly.
+          const requestedClientId = typeof msg.clientId === 'string' ? msg.clientId : '';
+          if (!CLIENT_ID_PATTERN.test(requestedClientId)) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Invalid client ID: use letters, digits, "-" or "_", starting with a letter (max 64 chars)'
+            }));
+            logger.warn('register_invalid_client_id', { remoteAddress: req.socket.remoteAddress });
+            return;
+          }
 
           // Delegate registration: a helper the server's own wake hook spawned
           // (e.g. a resumed headless Codex run) that must read and answer mail
@@ -265,6 +282,18 @@ wss.on('connection', (ws, req) => {
             return;
           }
           const to = msg.to || 'all';
+          // Targets pass the same grammar as registrations; a currently
+          // connected exact ID (e.g. a server-minted delegate) is also
+          // addressable. Everything else is refused BEFORE it can reach
+          // notify hooks or shell/AppleScript sinks.
+          if (to !== 'all' && !CLIENT_ID_PATTERN.test(to) && !clients.has(to)) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Invalid message target: use a valid client ID or "all"'
+            }));
+            logger.warn('message_invalid_target', { clientId });
+            return;
+          }
           // A delegate speaks AS its base label: its mail is stored from the
           // base so peers see one consistent identity and the base session
           // keeps visibility of the conversation.
@@ -333,8 +362,8 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'error', message: 'Register before watching' }));
             return;
           }
-          if (typeof msg.for !== 'string' || !msg.for.trim()) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Watch target must be a client ID' }));
+          if (typeof msg.for !== 'string' || !CLIENT_ID_PATTERN.test(msg.for.trim())) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Watch target must be a valid client ID' }));
             return;
           }
           removeWatcher(ws);

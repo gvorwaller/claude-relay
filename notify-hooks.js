@@ -150,11 +150,15 @@ class NotifyHooks {
 
   defaultRunner(entry, { target, from, messageId, delivered }) {
     if (entry.type === 'banner') {
-      const title = `${entry.titlePrefix || 'relay'}: ${target}`;
-      const body = `New message from ${from}`;
+      // Values arrive as argv (`on run argv`), never interpolated into the
+      // script source: a hostile target/sender name cannot become AppleScript
+      // (review finding #1). The script text below is a fixed constant.
       spawn('osascript', [
-        '-e',
-        `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`
+        '-e', 'on run argv',
+        '-e', 'display notification (item 2 of argv) with title (item 1 of argv)',
+        '-e', 'end run',
+        `${entry.titlePrefix || 'relay'}: ${target}`,
+        `New message from ${from}`
       ], { detached: true, stdio: 'ignore' }).unref();
     } else if (entry.type === 'exec' && typeof entry.command === 'string' && entry.command.trim()) {
       const child = spawn(entry.command, {

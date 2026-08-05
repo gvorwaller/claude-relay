@@ -131,8 +131,14 @@ if [[ -z "$SESSION_ID" ]]; then
   echo "error: no codex session found for $FOR (pid=$PEER_PID cwd=$PEER_CWD)"
   # Automation cannot reach this peer (e.g. an app conversation with no
   # CLI-resumable rollout) — fall back to telling the human, content-free.
+  # FOR is passed as argv, never interpolated into AppleScript source
+  # (review finding #1); the script text is a fixed constant.
   if [[ "$DRY_RUN" == "0" ]]; then
-    osascript -e "display notification \"$FOR has unread relay mail but no auto-wakeable session - poke it manually\" with title \"relay: $FOR\"" 2>/dev/null
+    osascript \
+      -e 'on run argv' \
+      -e 'display notification ("" & (item 1 of argv) & " has unread relay mail but no auto-wakeable session - poke it manually") with title ("relay: " & (item 1 of argv))' \
+      -e 'end run' \
+      "$FOR" 2>/dev/null
   fi
   exit 1
 fi

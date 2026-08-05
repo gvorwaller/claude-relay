@@ -398,3 +398,57 @@ test('identity mode cannot be switched on a live socket (primary<->delegate)', a
   delegate.send(JSON.stringify({ type: 'register', clientId: 'MODEB', meta: { pid: 222 } }));
   await delegateRefused;
 });
+
+test('hostile client IDs and message targets are refused at the boundary', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-grammar-'));
+  const port = startServer(t, root);
+
+  const good = await connectWithRetry(port, 'GRAMOK', { pid: process.pid });
+  t.after(() => good.close());
+
+  // Registration: shell/AppleScript metacharacters, path traversal, spaces,
+  // and the reserved delegate separator are all rejected.
+  const hostileIds = [
+    'CODEX3"; do shell script "touch /tmp/pwned"; --',
+    'CODEX$(whoami)',
+    'CODEX`id`',
+    '../../etc/passwd',
+    'CODEX 3',
+    'CODEX3~wake-1',
+    '',
+    'x'.repeat(65)
+  ];
+  for (const hostile of hostileIds) {
+    const ws = await open(port);
+    const refused = waitForMessage(ws, msg => msg.type === 'error' && /Invalid client ID/.test(msg.message));
+    ws.send(JSON.stringify({ type: 'register', clientId: hostile, meta: { pid: process.pid } }));
+    await refused;
+    ws.close();
+  }
+
+  // Message targets: same grammar, refused before reaching notify hooks.
+  const refusedTarget = waitForMessage(good, msg =>
+    msg.type === 'error' && /Invalid message target/.test(msg.message));
+  good.send(JSON.stringify({
+    type: 'message',
+    to: 'CODEX3"; do shell script "touch /tmp/pwned"; --',
+    content: 'injection attempt'
+  }));
+  await refusedTarget;
+
+  // Watch targets too.
+  const refusedWatch = waitForMessage(good, msg =>
+    msg.type === 'error' && /Watch target must be a valid client ID/.test(msg.message));
+  good.send(JSON.stringify({ type: 'watch', for: 'CODEX$(id)' }));
+  await refusedWatch;
+
+  // A live server-minted delegate ID stays addressable despite containing '~'.
+  const delegate = await open(port);
+  t.after(() => delegate.close());
+  const delegateReg = waitForMessage(delegate, msg => msg.type === 'registered');
+  delegate.send(JSON.stringify({ type: 'register', clientId: 'GRAMOK', delegate: true, meta: { pid: 9911 } }));
+  const delegateId = (await delegateReg).clientId;
+  const delegateGot = waitForMessage(delegate, msg => msg.type === 'message');
+  good.send(JSON.stringify({ type: 'message', to: delegateId, content: 'direct to delegate' }));
+  assert.equal((await delegateGot).content, 'direct to delegate');
+});
