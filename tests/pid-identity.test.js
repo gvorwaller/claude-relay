@@ -179,6 +179,39 @@ test('delegate reads and speaks as its base label without ever owning it', async
   assert.equal((await baseGotThird).content, 'still owned');
 });
 
+test('bridge spawned under codex exec self-selects delegate mode (ancestry fallback)', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
+  const port = startServer(t, root);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  // Fake `codex` whose argv looks like a headless run; it launches the bridge
+  // as a child (no exec, so the parent's args stay "codex exec resume ...").
+  const fakeCodex = path.join(root, 'codex');
+  fs.writeFileSync(fakeCodex, [
+    '#!/bin/bash',
+    `node ${JSON.stringify(path.join(__dirname, '..', 'mcp-server.js'))} "--relay-url=ws://127.0.0.1:${port}"`,
+    ''
+  ].join('\n'), { mode: 0o755 });
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && /^CODEXW~wake-\d+$/.test(msg.clientId), 10000);
+  const wrapper = spawn(fakeCodex, ['exec', 'resume', 'fake-session-id'], {
+    env: {
+      ...process.env,
+      HOME: root,
+      CLAUDE_RELAY_SESSION_ID: '',
+      RELAY_DELEGATE_FOR: '',
+      RELAY_CLIENT_ID: 'CODEXW'
+    },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => wrapper.kill('SIGTERM'));
+  wrapper.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+  await joined;
+});
+
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
   const port = startServer(t, root);

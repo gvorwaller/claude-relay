@@ -86,5 +86,10 @@ fi
 # Delegate mode: the resumed run's relay bridge reads and answers mail AS the
 # peer without owning its label, so the interactive session that holds the
 # label is never displaced. The relay shows it transparently as <FOR>~wake-<pid>.
+# Codex gives MCP servers a curated env (plain exports never arrive), so the
+# flag is injected via config override; the bridge also detects codex-exec
+# ancestry as a fallback and self-selects delegate mode.
 export RELAY_DELEGATE_FOR="$FOR"
-exec codex exec resume "$SESSION_ID" "$PROMPT"
+exec codex exec \
+  -c "mcp_servers.claude-relay.env.RELAY_DELEGATE_FOR=$FOR" \
+  resume "$SESSION_ID" "$PROMPT"

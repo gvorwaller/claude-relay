@@ -188,9 +188,29 @@ function detectBackgroundFork() {
 // (set by the server's wake hook via wake-codex.sh) without ever owning it.
 // The server assigns the actual visible ID (`<base>~wake-<pid>`); labels stay
 // pid-anchored to the interactive session that owns them.
-const DELEGATE_FOR = (process.env.RELAY_DELEGATE_FOR || '').trim() || null;
+let DELEGATE_FOR = (process.env.RELAY_DELEGATE_FOR || '').trim() || null;
+
+// Codex spawns MCP servers with a curated environment (config.toml env only),
+// so RELAY_DELEGATE_FOR set by wake-codex.sh never arrives. Detect the
+// situation from process ancestry instead: a bridge whose parent is a
+// `codex exec ...` headless run IS a wake/one-off and must act as a delegate
+// of whatever label it would have resolved — never own it.
+function detectCodexHeadless() {
+  const parentArgs = psField(process.ppid, 'args');
+  if (/(^|\/)codex\S*\s+(-\S+\s+)*exec\b/.test(parentArgs)) {
+    return `parent is codex exec: ${parentArgs.slice(0, 100)}`;
+  }
+  return null;
+}
 
 const resolvedIdentity = resolveClientIdentity();
+if (!DELEGATE_FOR) {
+  const headlessReason = detectCodexHeadless();
+  if (headlessReason) {
+    DELEGATE_FOR = resolvedIdentity.id;
+    console.error(`[Claude Relay MCP] Headless codex run detected (${headlessReason}); acting as delegate of "${DELEGATE_FOR}".`);
+  }
+}
 // An explicit --client-id is deliberate even in a fork; every other source is
 // (potentially) inherited environment, so a background fork gets a derived,
 // collision-free identity instead.
