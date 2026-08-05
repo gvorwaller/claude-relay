@@ -80,4 +80,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
+# Delegate mode: the resumed run's relay bridge reads and answers mail AS the
+# peer without owning its label, so the interactive session that holds the
+# label is never displaced. The relay shows it transparently as <FOR>~wake-<pid>.
+export RELAY_DELEGATE_FOR="$FOR"
 exec codex exec resume "$SESSION_ID" "$PROMPT"

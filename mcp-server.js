@@ -184,11 +184,17 @@ function detectBackgroundFork() {
   return null;
 }
 
+// Delegate mode: this bridge reads and answers mail FOR an existing label
+// (set by the server's wake hook via wake-codex.sh) without ever owning it.
+// The server assigns the actual visible ID (`<base>~wake-<pid>`); labels stay
+// pid-anchored to the interactive session that owns them.
+const DELEGATE_FOR = (process.env.RELAY_DELEGATE_FOR || '').trim() || null;
+
 const resolvedIdentity = resolveClientIdentity();
 // An explicit --client-id is deliberate even in a fork; every other source is
 // (potentially) inherited environment, so a background fork gets a derived,
 // collision-free identity instead.
-if (resolvedIdentity.source !== '--client-id') {
+if (resolvedIdentity.source !== '--client-id' && !DELEGATE_FOR) {
   const forkReason = detectBackgroundFork();
   if (forkReason) {
     const baseId = resolvedIdentity.id;
@@ -198,6 +204,13 @@ if (resolvedIdentity.source !== '--client-id') {
       `Background fork detected (${forkReason}); registering as ${resolvedIdentity.id} ` +
       `instead of seizing "${baseId}" from the live session that owns it.`;
   }
+}
+if (DELEGATE_FOR) {
+  resolvedIdentity.id = `${DELEGATE_FOR}~wake-${process.pid}`;
+  resolvedIdentity.source = 'delegate';
+  resolvedIdentity.note =
+    `Delegate mode (RELAY_DELEGATE_FOR): reading and answering mail for "${DELEGATE_FOR}" ` +
+    `without owning that label; the server assigns this bridge a derived ID.`;
 }
 // Mutable: relay_rename lets a live session correct its identity at runtime
 // (no restart, no env vars) when startup resolution picked the wrong ID.
@@ -215,6 +228,9 @@ if (resolvedIdentity.note) {
  * Update the session registry with this client's info
  */
 function updateRegistry(action = 'connect') {
+  // Delegates are transient helpers acting for a label someone else owns;
+  // they must never write the label->pid registry.
+  if (DELEGATE_FOR) return;
   try {
     let registry = {};
     if (fs.existsSync(REGISTRY_FILE)) {
@@ -395,6 +411,11 @@ let connected = false;
 // relay_rename (to a new ID, or the same ID to deliberately reclaim it)
 // re-establishes the connection.
 let displaced = false;
+// Set when the server refuses our label because a verified-live local process
+// owns it (pid-anchored ownership). Like displacement, auto-reconnect is
+// suspended: retrying the same register would be refused forever. relay_rename
+// picks a new ID (or retries this one once the owner is gone).
+let rejectedReason = null;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
@@ -816,10 +837,12 @@ function handleToolCall(requestId, toolName, args) {
           content: [{
             type: 'text',
             text: connected
-              ? `Connected to ${RELAY_URL} as "${CLIENT_ID}". Peers online: ${peers.length > 0 ? peers.filter(p => p !== CLIENT_ID).join(', ') || 'none' : 'checking...'}`
-              : displaced
-                ? `DISPLACED: a newer connection re-registered "${CLIENT_ID}", so this session disconnected and is NOT auto-reconnecting (that would start a takeover fight). If this session should own "${CLIENT_ID}", call relay_rename with to="${CLIENT_ID}" to deliberately reclaim it; otherwise call relay_rename with a different ID.`
-                : `Disconnected from relay server. Attempting to connect to ${RELAY_URL}...`
+              ? `Connected to ${RELAY_URL} as "${CLIENT_ID}"${DELEGATE_FOR ? ` (delegate of ${DELEGATE_FOR}: reads and sends its mail, does not own the label)` : ''}. Peers online: ${peers.length > 0 ? peers.filter(p => p !== CLIENT_ID).join(', ') || 'none' : 'checking...'}`
+              : rejectedReason
+                ? `REJECTED: ${rejectedReason} This session is NOT auto-reconnecting (the owner would refuse it again). Call relay_rename with a different ID, or stop the owning process and relay_rename back to "${CLIENT_ID}".`
+                : displaced
+                  ? `DISPLACED: a newer connection re-registered "${CLIENT_ID}", so this session disconnected and is NOT auto-reconnecting (that would start a takeover fight). If this session should own "${CLIENT_ID}", call relay_rename with to="${CLIENT_ID}" to deliberately reclaim it; otherwise call relay_rename with a different ID.`
+                  : `Disconnected from relay server. Attempting to connect to ${RELAY_URL}...`
           }]
         }
       });
@@ -831,7 +854,7 @@ function handleToolCall(requestId, toolName, args) {
         sendToolText(requestId, `Error: invalid session ID "${newId}". Use letters, digits, "-" or "_", starting with a letter (max 64 chars).`);
         return;
       }
-      if (newId === CLIENT_ID && !displaced) {
+      if (newId === CLIENT_ID && !displaced && !rejectedReason) {
         sendToolText(requestId, `Already registered as "${CLIENT_ID}" — nothing to do.`);
         return;
       }
@@ -848,6 +871,7 @@ function handleToolCall(requestId, toolName, args) {
         updateRegistry('connect');
       }
       displaced = false;
+      rejectedReason = null;
 
       let renameText = reclaiming
         ? `Reclaiming relay identity "${CLIENT_ID}".`
@@ -860,7 +884,7 @@ function handleToolCall(requestId, toolName, args) {
       } else {
         renameText += ' Relay server unreachable right now; the new ID will be announced automatically on the next (re)connect.';
       }
-      renameText += `\nIf "${CLIENT_ID}" was live on another connection, that connection has been displaced (newest registration wins). Peers should message ${CLIENT_ID} from now on.`;
+      renameText += `\nIf "${CLIENT_ID}" is held by another connection whose process is verifiably alive on the relay host, this registration will be rejected (labels are pid-anchored) — check relay_status. Unverifiable or dead holders are displaced. Peers should message ${CLIENT_ID} once relay_status confirms the identity.`;
       renameText += `\nNote: tool descriptions cached by this client may still show "${oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
       sendToolText(requestId, renameText);
       break;
@@ -991,9 +1015,9 @@ function handleToolCall(requestId, toolName, args) {
  */
 function registerWithServer() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify({
+  const registration = {
     type: 'register',
-    clientId: CLIENT_ID,
+    clientId: DELEGATE_FOR || CLIENT_ID,
     meta: {
       pid: process.pid,
       started: STARTED_AT,
@@ -1002,7 +1026,9 @@ function registerWithServer() {
       source: CLIENT_ID_SOURCE,
       relayUrl: RELAY_URL
     }
-  }));
+  };
+  if (DELEGATE_FOR) registration.delegate = true;
+  ws.send(JSON.stringify(registration));
   return true;
 }
 
@@ -1029,6 +1055,28 @@ function connectToRelay() {
       switch (msg.type) {
         case 'registered':
           peers = msg.peers || [];
+          // Adopt the server-assigned ID (differs from ours only in delegate
+          // mode, where the server mints the visible `<base>~wake-<pid>` ID).
+          if (msg.clientId && msg.clientId !== CLIENT_ID) {
+            CLIENT_ID = msg.clientId;
+          }
+          break;
+
+        case 'register_rejected':
+          rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
+          console.error(JSON.stringify({
+            timestamp: new Date().toISOString(),
+            event: 'relay_register_rejected',
+            clientId: CLIENT_ID,
+            holderPid: msg.holderPid || null,
+            action: 'suspending reconnect; use relay_rename to take a different ID'
+          }));
+          // The socket is up but we hold no identity on it: reflect that
+          // immediately (relay_status must not claim "Connected as X" while
+          // the close is still in flight), then close and stay down (the
+          // close handler sees rejectedReason and will not retry).
+          connected = false;
+          ws.close();
           break;
 
         case 'peers':
@@ -1217,9 +1265,10 @@ function connectToRelay() {
     // Any in-flight history response belonged to this closed socket and can
     // never arrive. Do not let its tombstone consume a post-reconnect reply.
     pendingMessages = pendingMessages.filter(p => p.type !== 'wait_history');
-    // Attempt reconnect after delay — unless displaced: reconnecting under a
-    // taken-over ID just re-seizes it and starts an endless takeover fight.
-    if (!shuttingDown && !displaced) {
+    // Attempt reconnect after delay — unless displaced (reconnecting under a
+    // taken-over ID just re-seizes it and starts an endless takeover fight)
+    // or rejected (the label's live owner would refuse us again forever).
+    if (!shuttingDown && !displaced && !rejectedReason) {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectToRelay();

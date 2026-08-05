@@ -71,6 +71,19 @@ test('debounceSeconds collapses a burst into one firing', t => {
   assert.equal(fired.length, 2);
 });
 
+test('a live delegate suppresses exec wakes but not banners', t => {
+  const { hooks, fired } = makeHooks(t, {
+    CODEX3: [
+      { type: 'exec', command: 'poke' },
+      { type: 'banner' }
+    ]
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'd1', delivered: true, deliveredToDelegate: true });
+  assert.deepEqual(fired.map(f => f.entry.type), ['banner']);
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'd2', delivered: false, deliveredToDelegate: false });
+  assert.deepEqual(fired.map(f => f.entry.type), ['banner', 'exec', 'banner']);
+});
+
 test('missing or invalid config disables hooks without throwing', t => {
   const { hooks, fired, configPath } = makeHooks(t, undefined);
   hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'm8', delivered: false });

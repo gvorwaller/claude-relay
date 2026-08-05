@@ -64,7 +64,7 @@ class NotifyHooks {
     }
   }
 
-  fire({ to, from, messageId, delivered }) {
+  fire({ to, from, messageId, delivered, deliveredToDelegate }) {
     try {
       const config = this.loadConfig();
       if (!config) return;
@@ -82,16 +82,19 @@ class NotifyHooks {
       for (const job of jobs) {
         const entries = Array.isArray(config[job.key]) ? config[job.key] : [];
         entries.forEach((entry, index) =>
-          this.fireEntry(entry, index, job, { from, messageId, delivered }));
+          this.fireEntry(entry, index, job, { from, messageId, delivered, deliveredToDelegate }));
       }
     } catch (err) {
       this.logger.error('notify_fire_failed', { error: err.message });
     }
   }
 
-  fireEntry(entry, index, job, { from, messageId, delivered }) {
+  fireEntry(entry, index, job, { from, messageId, delivered, deliveredToDelegate }) {
     if (!entry || typeof entry !== 'object') return;
     if (entry.onlyIfUndelivered && delivered) return;
+    // A live delegate for this target already received the mail push — it IS
+    // the woken instance, so firing another exec wake would double-spawn.
+    if (entry.type === 'exec' && deliveredToDelegate) return;
     const debounceMs = Math.max(0, Number(entry.debounceSeconds) || 0) * 1000;
     const key = `${job.key}:${index}`;
     const now = this.now();

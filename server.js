@@ -79,6 +79,49 @@ wss.on('connection', (ws, req) => {
           // Client identifies itself (M1, M2, etc.)
           const requestedClientId = msg.clientId || 'unknown';
 
+          // Delegate registration: a helper the server's own wake hook spawned
+          // (e.g. a resumed headless Codex run) that must read and answer mail
+          // for an existing label WITHOUT owning it. It gets a visibly derived
+          // ID and never contests the base label, so the interactive session
+          // holding that label is untouched.
+          if (msg.delegate === true) {
+            if (!isLoopback(req.socket.remoteAddress)) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Delegate registration is only permitted from the relay host'
+              }));
+              return;
+            }
+            const delegateBase = String(requestedClientId);
+            const delegatePid = msg.meta && msg.meta.pid ? msg.meta.pid : Date.now().toString(36);
+            const delegateId = `${delegateBase}~wake-${delegatePid}`;
+            const staleDelegate = clients.get(delegateId);
+            if (staleDelegate && staleDelegate !== ws) staleDelegate.terminate();
+            clientId = delegateId;
+            ws.clientId = delegateId;
+            ws.delegateOf = delegateBase;
+            clients.set(delegateId, ws);
+            clientMeta.set(delegateId, {
+              ...(msg.meta && typeof msg.meta === 'object' ? msg.meta : {}),
+              delegateOf: delegateBase,
+              remoteAddress: req.socket.remoteAddress,
+              connectedAt: new Date().toISOString()
+            });
+            logger.info('delegate_registered', { delegateId, delegateOf: delegateBase });
+            ws.send(JSON.stringify({
+              type: 'registered',
+              clientId: delegateId,
+              delegateOf: delegateBase,
+              peers: Array.from(clients.keys()).filter(id => id !== delegateId)
+            }));
+            broadcast({
+              type: 'peer_joined',
+              clientId: delegateId,
+              peers: Array.from(clients.keys())
+            }, delegateId);
+            break;
+          }
+
           // Same-socket rename: this connection is already registered under a
           // different ID (relay_rename). Drop the old identity completely so it
           // can't linger as a zombie entry that shows online forever and
@@ -99,29 +142,56 @@ wss.on('connection', (ws, req) => {
 
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
-            // Newest-wins takeover (2026-07-17). Reject-duplicate looked safe but
-            // locked out every legitimate reconnect: a stale-but-alive holder
-            // (an MCP bridge whose Claude Code session was replaced, a Codex CLI
-            // that respawned) passes the ws heartbeat forever, so the REAL
-            // client could never reclaim its ID (CC2 and CODEX2 both hit this).
-            // The newest registration is the one a human is actually using.
-            // The displaced socket is told why and terminated, so its owner
-            // fails loudly instead of consuming messages nobody reads.
-            const now = Date.now();
-            if (now - (duplicateLogTimes.get(requestedClientId) || 0) >= 60000) {
-              logger.warn('duplicate_client_takeover', {
+            // Pid-anchored ownership (2026-08-05): a label belongs to the
+            // process that registered it, for that process's lifetime. The
+            // old newest-wins takeover guessed which claimant was real; when
+            // the holder is local its pid makes that checkable, so we check
+            // instead of guessing:
+            //   - same pid re-registering        -> reseat (reconnect)
+            //   - holder pid dead                -> label was orphaned; reassign
+            //   - holder pid verifiably alive    -> REJECT the newcomer
+            //   - holder remote / pid unknown    -> legacy newest-wins
+            const verdict = contestLabel(requestedClientId, existingClient, msg.meta);
+            if (verdict.action === 'reject') {
+              logger.warn('register_rejected_label_owned', {
                 clientId: requestedClientId,
-                displacedRemoteAddress: existingClient._socket?.remoteAddress || null,
+                holderPid: verdict.holderPid,
                 newRemoteAddress: req.socket.remoteAddress
               });
-              duplicateLogTimes.set(requestedClientId, now);
-            }
-            try {
-              existingClient.send(JSON.stringify({
-                type: 'error',
-                message: `Client ID ${requestedClientId} was re-registered by a newer connection; this connection is being closed`
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                clientId: requestedClientId,
+                holderPid: verdict.holderPid,
+                reason: `"${requestedClientId}" is owned by live pid ${verdict.holderPid} on the relay host. `
+                  + 'Labels are pid-anchored: stop that process, or register under a different ID '
+                  + '(or as its delegate).'
               }));
-            } catch (_) { /* displaced socket may already be unwritable */ }
+              return;
+            }
+            if (verdict.action === 'takeover') {
+              // Liveness unverifiable (remote holder or no reported pid):
+              // keep the newest-wins behavior this path was built for.
+              const now = Date.now();
+              if (now - (duplicateLogTimes.get(requestedClientId) || 0) >= 60000) {
+                logger.warn('duplicate_client_takeover', {
+                  clientId: requestedClientId,
+                  displacedRemoteAddress: existingClient._socket?.remoteAddress || null,
+                  newRemoteAddress: req.socket.remoteAddress
+                });
+                duplicateLogTimes.set(requestedClientId, now);
+              }
+              try {
+                existingClient.send(JSON.stringify({
+                  type: 'error',
+                  message: `Client ID ${requestedClientId} was re-registered by a newer connection; this connection is being closed`
+                }));
+              } catch (_) { /* displaced socket may already be unwritable */ }
+            } else {
+              logger.info(verdict.action === 'reseat' ? 'label_reseated_same_pid' : 'orphaned_label_reclaimed', {
+                clientId: requestedClientId,
+                holderPid: verdict.holderPid
+              });
+            }
             existingClient.displacedByTakeover = true;
             existingClient.terminate();
           }
@@ -172,22 +242,36 @@ wss.on('connection', (ws, req) => {
             return;
           }
           const to = msg.to || 'all';
-          const target = to === 'all' ? null : clients.get(to);
+          // A delegate speaks AS its base label: its mail is stored from the
+          // base so peers see one consistent identity and the base session
+          // keeps visibility of the conversation.
+          const fromId = ws.delegateOf || clientId;
+          // Direct mail reaches the label's owner AND any live delegates of it.
+          const directSockets = [];
+          if (to !== 'all') {
+            const primary = clients.get(to);
+            if (primary && primary.readyState === 1) directSockets.push(primary);
+            for (const peer of clients.values()) {
+              if (peer.delegateOf === to && peer.readyState === 1 && peer !== ws) {
+                directSockets.push(peer);
+              }
+            }
+          }
+          const deliveredToDelegate = directSockets.some(peer => peer.delegateOf === to);
           const delivered = to === 'all'
             ? Array.from(clients.entries()).some(([id, peer]) => id !== clientId && peer.readyState === 1)
-            : Boolean(target && target.readyState === 1);
+            : directSockets.length > 0;
           const envelope = messageStore.append({
             type: 'message',
-            from: clientId,
+            from: fromId,
             to,
             content: msg.content,
             delivered
           });
 
           if (msg.to && msg.to !== 'all') {
-            // Direct message to specific client
-            if (target && target.readyState === 1) {
-              target.send(JSON.stringify(envelope));
+            for (const peer of directSockets) {
+              peer.send(JSON.stringify(envelope));
             }
           } else {
             // Broadcast to all except sender
@@ -205,17 +289,19 @@ wss.on('connection', (ws, req) => {
           }));
           logger.info('message_recorded', {
             messageId: envelope.id,
-            from: clientId,
+            from: fromId,
+            sentBy: fromId === clientId ? undefined : clientId,
             to,
             bytes: Buffer.byteLength(msg.content, 'utf8'),
             delivered
           });
-          notifyWatchers(to, envelope.timestamp, clientId);
+          notifyWatchers(to, envelope.timestamp, fromId);
           notifyHooks.fire({
             to,
-            from: clientId,
+            from: fromId,
             messageId: envelope.id,
-            delivered
+            delivered,
+            deliveredToDelegate
           });
           break;
 
@@ -267,8 +353,10 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'error', message: 'Register before reading history' }));
             return;
           }
+          // A delegate reads with its base label's visibility — that is the
+          // entire reason it exists (mail is addressed to the base).
           const result = messageStore.query({
-            requester: clientId,
+            requester: ws.delegateOf || clientId,
             count: msg.count,
             from: msg.from,
             to: msg.to,
@@ -389,6 +477,36 @@ const retentionInterval = setInterval(() => {
   logger.prune();
 }, 60 * 60 * 1000);
 wss.on('close', () => clearInterval(retentionInterval));
+
+function isLoopback(address) {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+// true = alive, false = dead, null = unknowable from this process
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === 'EPERM') return true;
+    if (err.code === 'ESRCH') return false;
+    return null;
+  }
+}
+
+function contestLabel(labelId, holder, newMeta) {
+  const holderMeta = clientMeta.get(labelId) || {};
+  const holderPid = Number(holderMeta.pid) || null;
+  const newPid = newMeta && Number(newMeta.pid) ? Number(newMeta.pid) : null;
+  if (holderPid && newPid && holderPid === newPid) return { action: 'reseat', holderPid };
+  const holderLocal = isLoopback(holder._socket && holder._socket.remoteAddress);
+  if (holderLocal && holderPid) {
+    const alive = pidAlive(holderPid);
+    if (alive === true) return { action: 'reject', holderPid };
+    if (alive === false) return { action: 'orphan', holderPid };
+  }
+  return { action: 'takeover', holderPid };
+}
 
 function broadcast(message, excludeClient = null) {
   const data = JSON.stringify(message);

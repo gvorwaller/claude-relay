@@ -136,9 +136,35 @@ The registry key, MCP `CLIENT_ID`, WebSocket `clientId`, and message `from`/`to`
 
 The relay server rejects duplicate live client IDs. Multiple Codex windows should therefore register distinct IDs (`CODEX2`, `CODEX3`, etc.) instead of sharing `CODEX`.
 
-**Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry. If the target ID is live on another connection, the newest registration wins and the stale holder is displaced.
+**Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry.
 
-**Displacement backoff.** When a newer connection takes over this client's ID, the displaced client does **not** auto-reconnect — reconnecting under a taken-over ID guarantees an endless 5-second takeover ping-pong between the two holders (observed as thousands of `duplicate_client_takeover` events per day). It goes quiet instead; `relay_status` reports the DISPLACED state and the remedy: `relay_rename` to a new ID, or to the *same* ID to deliberately reclaim it.
+**Pid-anchored labels.** A label belongs to the process that registered it, for
+that process's lifetime — the ID you see in `relay_status`/`relay_sessions` is
+the ID peers use, and nothing can silently steal it. When a registration claims
+an already-held label, the server checks the current holder instead of
+guessing:
+
+- same pid re-registering → reseated (normal reconnect)
+- holder's pid is dead → the label was orphaned by a crash; the newcomer takes it
+- holder's pid is verifiably alive on the relay host → the newcomer is
+  **rejected** (`relay_status` shows REJECTED and stays down; `relay_rename` to
+  a different ID, or retry after the owner exits)
+- holder is remote or reported no pid → legacy newest-wins takeover (the server
+  cannot check pids across machines)
+
+**Displacement backoff (unverifiable holders only).** When newest-wins does
+displace a client, the displaced side does **not** auto-reconnect — that
+guarantees an endless takeover ping-pong. It goes quiet; `relay_status` reports
+DISPLACED and the remedy (`relay_rename`).
+
+**Delegates (`RELAY_DELEGATE_FOR`).** A wake hook that resumes a headless
+session must read and answer mail for a label an interactive session owns. It
+registers as a *delegate*: visible as `<label>~wake-<pid>` in the peer list, it
+reads with the label's visibility and its sends arrive from the label, but it
+never owns the label — so the interactive session is never displaced, and the
+delegate's exit changes nothing. Delegate registration is only honored from the
+relay host itself, and a live delegate suppresses further exec wake hooks for
+its label (it *is* the woken instance).
 
 **Background forks don't inherit identity.** Forked or background Claude sessions (`--fork-session` subagents, `--bg-pty-host` daemon resumes, scheduled runs) inherit `CLAUDE_RELAY_SESSION_ID`/`RELAY_CLIENT_ID` from the original session's environment. The MCP client detects that ancestry (or an explicit `RELAY_BACKGROUND_FORK=1`) and registers as `<ID>-bg<pid36>` instead of seizing the live session's identity. An explicit `--client-id` argument still wins — that's a deliberate choice by the spawner.
 

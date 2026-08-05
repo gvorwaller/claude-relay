@@ -188,7 +188,7 @@ test('relay_rename corrects a live MCP session identity without restart', async 
   assert.match(waited.result.content[0].text, /OBSERVER: review request/);
 });
 
-test('displaced client backs off instead of takeover ping-pong, and can reclaim', async t => {
+test('a label owned by a verified-live pid cannot be stolen; it frees on owner death', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-displace-'));
   const port = startServer(t, root);
 
@@ -198,7 +198,7 @@ test('displaced client backs off instead of takeover ping-pong, and can reclaim'
   const joined = waitForMessage(observer, msg => msg.type === 'peer_joined' && msg.clientId === 'DISPTEST');
   const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
     '--client-id=DISPTEST', `--relay-url=ws://127.0.0.1:${port}`], {
-    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
+    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '', RELAY_DELEGATE_FOR: '' },
     stdio: ['pipe', 'pipe', 'pipe']
   });
   t.after(() => mcp.kill('SIGTERM'));
@@ -208,36 +208,77 @@ test('displaced client backs off instead of takeover ping-pong, and can reclaim'
   await next(msg => msg.id === 1);
   await joined;
 
-  // A newer connection seizes the ID; the MCP client is displaced.
-  const usurper = await connect(port, 'DISPTEST');
-  t.after(() => usurper.close());
+  // A claimant with a different pid tries to take the label while the owning
+  // bridge process is verifiably alive: the server refuses; nothing is
+  // displaced and the peer list never churns.
+  const claimant = new WebSocket(`ws://127.0.0.1:${port}`);
+  t.after(() => claimant.close());
+  await new Promise((resolve, reject) => {
+    claimant.once('open', resolve);
+    claimant.once('error', reject);
+  });
+  const rejected = waitForMessage(claimant, msg => msg.type === 'register_rejected');
+  claimant.send(JSON.stringify({
+    type: 'register',
+    clientId: 'DISPTEST',
+    meta: { pid: process.pid }
+  }));
+  const rejection = await rejected;
+  assert.match(rejection.reason, /pid-anchored/);
+  assert.ok(rejection.holderPid > 0);
 
-  // The old behavior reconnected after 5s and seized the ID back, closing the
-  // usurper's socket. With backoff, the usurper must still hold the ID well
-  // past the 5s reconnect window.
-  const usurperClosed = new Promise(resolve => usurper.once('close', () => resolve('usurper displaced')));
-  const stayedQuiet = new Promise(resolve => setTimeout(() => resolve('no ping-pong'), 7000));
-  assert.equal(await Promise.race([usurperClosed, stayedQuiet]), 'no ping-pong');
-
-  // relay_status explains the displaced state.
+  // The owner never noticed: still connected under its label.
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
   const status = await next(msg => msg.id === 2);
-  assert.match(status.result.content[0].text, /DISPLACED/);
-  assert.match(status.result.content[0].text, /relay_rename/);
+  assert.match(status.result.content[0].text, /Connected .* as "DISPTEST"/);
 
-  // Same-ID rename while displaced is a deliberate reclaim: the usurper is
-  // displaced and the MCP client comes back online as DISPTEST.
+  // A second MCP bridge claiming the same label is rejected, reports it
+  // clearly, and stays down instead of retry-looping.
+  const rival = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    '--client-id=DISPTEST', `--relay-url=ws://127.0.0.1:${port}`], {
+    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '', RELAY_DELEGATE_FOR: '' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => rival.kill('SIGTERM'));
+  const rivalNext = mcpLines(rival.stdout);
+  // stderr mixes JSON log events with plain-text notes; scan tolerantly.
+  const rivalRejectedEvent = new Promise(resolve => {
+    let buffer = '';
+    rival.stderr.setEncoding('utf8');
+    rival.stderr.on('data', chunk => {
+      buffer += chunk;
+      for (const line of buffer.split('\n')) {
+        try {
+          const value = JSON.parse(line);
+          if (value.event === 'relay_register_rejected') resolve(value);
+        } catch {}
+      }
+    });
+  });
+  const rivalSend = value => rival.stdin.write(`${JSON.stringify(value)}\n`);
+  rivalSend({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await rivalNext(msg => msg.id === 1);
+  await rivalRejectedEvent;
+
+  rivalSend({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
+  const rivalStatus = await rivalNext(msg => msg.id === 2);
+  assert.match(rivalStatus.result.content[0].text, /REJECTED/);
+  assert.match(rivalStatus.result.content[0].text, /relay_rename/);
+
+  // Owner dies -> the label frees; the rival reclaims it via relay_rename.
+  const ownerGone = waitForMessage(observer, msg => msg.type === 'peer_left' && msg.clientId === 'DISPTEST', 10000);
+  mcp.kill('SIGKILL');
+  await ownerGone;
+
   const reclaimed = waitForMessage(observer, msg => msg.type === 'peer_joined' && msg.clientId === 'DISPTEST', 10000);
-  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+  rivalSend({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
     name: 'relay_rename', arguments: { to: 'DISPTEST' }
   }});
-  const reclaim = await next(msg => msg.id === 3);
-  assert.match(reclaim.result.content[0].text, /Reclaiming relay identity "DISPTEST"/);
+  await rivalNext(msg => msg.id === 3);
   await reclaimed;
-  await usurperClosed;
 
-  send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
-  const after = await next(msg => msg.id === 4);
+  rivalSend({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
+  const after = await rivalNext(msg => msg.id === 4);
   assert.match(after.result.content[0].text, /Connected .* as "DISPTEST"/);
 });
 
