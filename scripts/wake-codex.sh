@@ -24,7 +24,10 @@ for arg in "$@"; do
 done
 [[ ${#ARGS[@]} -ge 1 && -z "$FOR" ]] && FOR="${ARGS[0]}"
 [[ -z "$FOR" ]] && { echo "error: peer ID required (RELAY_FOR or first argument)"; exit 2; }
-PROMPT="${ARGS[1]:-[Automated wake from the relay server's notify hook — no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives.}"
+# NOTE: keep this text apostrophe-free; macOS bash 3.2 mis-parses quotes
+# inside ${var:-default}, which is also why the default lives in its own var.
+DEFAULT_PROMPT="[Automated wake from the relay notify hook - no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives."
+PROMPT="${ARGS[1]:-$DEFAULT_PROMPT}"
 
 read -r PEER_PID PEER_CWD <<< "$(python3 - "$REGISTRY" "$FOR" <<'PY'
 import json, sys
