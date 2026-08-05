@@ -72,16 +72,36 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// true = alive, false = dead, null = no/unreadable pid (treated as claimable)
+function registryPidAlive(info) {
+  const pid = Number(info && info.pid);
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM' ? true : err.code === 'ESRCH' ? false : null;
+  }
+}
+
 function findRegisteredSessionId(baseId, cwd, registry = readRegistry()) {
   if (!baseId) return null;
 
-  if (registry[baseId] && sameCwd(cwd, registry[baseId].cwd)) {
+  // Labels are pid-anchored: a registry entry whose recorded bridge pid is
+  // verifiably ALIVE belongs to a running session — claiming it would only be
+  // rejected by the server, so it is excluded here. A dead (or unrecorded)
+  // pid means the label is ours to reclaim: this is what lets a restarted
+  // session land directly back on its old label with no relay_rename step.
+  const claimable = ([id, info]) =>
+    sameCwd(cwd, info?.cwd) && registryPidAlive(info) !== true;
+
+  if (registry[baseId] && claimable([baseId, registry[baseId]])) {
     return { id: baseId, source: 'registry-exact' };
   }
 
   const numberedPattern = new RegExp(`^${escapeRegExp(baseId)}\\d+$`);
   const matches = Object.entries(registry)
-    .filter(([id, info]) => numberedPattern.test(id) && sameCwd(cwd, info?.cwd))
+    .filter(([id, info]) => numberedPattern.test(id) && claimable([id, info]))
     .map(([id]) => id);
 
   if (matches.length === 1) {
@@ -265,12 +285,21 @@ function updateRegistry(action = 'connect') {
         relayUrl: RELAY_URL,
         source: CLIENT_ID_SOURCE
       };
-    } else if (action === 'disconnect' && CLIENT_ID_SOURCE.startsWith('registry-')) {
+    } else if (action === 'release') {
+      // Deliberate abandonment (relay_rename away from a wrong identity):
+      // the mapping is incorrect, so it must not survive for reclaim.
+      delete registry[CLIENT_ID];
+    } else if (action === 'disconnect' && (CLIENT_ID_SOURCE === 'auto' || CLIENT_ID_SOURCE === 'background-fork')) {
+      // Throwaway identities (hostname-pid, bg-fork suffixes) never recur;
+      // drop them so they don't clutter the registry.
+      delete registry[CLIENT_ID];
+    } else if (action === 'disconnect') {
+      // Keep the label->cwd mapping on clean exit (marked ended, pid now
+      // dead). This is what a restarted session in the same cwd reclaims —
+      // deleting it here is why restarts used to come up auto-numbered.
       if (registry[CLIENT_ID]) {
         registry[CLIENT_ID].ended = new Date().toISOString();
       }
-    } else if (action === 'disconnect') {
-      delete registry[CLIENT_ID];
     }
 
     const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
@@ -885,7 +914,9 @@ function handleToolCall(requestId, toolName, args) {
       // then claim the new identity locally and on the server. A same-ID call
       // while displaced is a deliberate reclaim (newest registration wins).
       if (!reclaiming) {
-        updateRegistry('disconnect');
+        // 'release', not 'disconnect': a rename means the old mapping was
+        // WRONG — delete it, don't preserve it for reclaim.
+        updateRegistry('release');
         CLIENT_ID = newId;
         CLIENT_ID_SOURCE = 'rename';
         updateRegistry('connect');

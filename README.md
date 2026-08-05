@@ -152,6 +152,14 @@ guessing:
 - holder is remote or reported no pid → legacy newest-wins takeover (the server
   cannot check pids across machines)
 
+**Restarts come home automatically.** A clean exit keeps the label→cwd mapping
+in the local registry (marked `ended`) instead of deleting it, and startup
+resolution claims a matching registry label whose recorded pid is dead — so
+restarting a session in the same directory lands directly back on its old
+label, no `relay_rename` needed. Entries whose pid is still alive are skipped
+(that label is owned; the new session auto-numbers instead of fighting), and
+`relay_rename` away from a wrong identity still deletes the bad mapping.
+
 **Displacement backoff (unverifiable holders only).** When newest-wins does
 displace a client, the displaced side does **not** auto-reconnect — that
 guarantees an endless takeover ping-pong. It goes quiet; `relay_status` reports

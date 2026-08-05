@@ -212,6 +212,99 @@ test('bridge spawned under codex exec self-selects delegate mode (ancestry fallb
   await joined;
 });
 
+function writeRegistry(root, entries) {
+  const dir = path.join(root, 'claude-relay', 'sessions');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'registry.json'), JSON.stringify(entries, null, 2));
+}
+
+function spawnBridge(t, root, port, projDir, extraEnv = {}) {
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    `--relay-url=ws://127.0.0.1:${port}`], {
+    cwd: projDir,
+    env: {
+      ...process.env,
+      HOME: root,
+      CLAUDE_RELAY_SESSION_ID: '',
+      RELAY_DELEGATE_FOR: '',
+      RELAY_CLIENT_ID: '',
+      ...extraEnv
+    },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  // The bridge connects to the relay only on MCP initialize.
+  mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+  return mcp;
+}
+
+test('restart auto-reclaims a registry label whose recorded pid is dead', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  writeRegistry(root, {
+    CODEXR3: { pid: await deadPid(), cwd: projDir, source: 'rename' }
+  });
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'CODEXR3', 10000);
+  spawnBridge(t, root, port, projDir, { RELAY_CLIENT_ID: 'CODEXR' });
+  await joined;
+});
+
+test('a registry label whose pid is alive is skipped, not fought over', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const occupant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+  t.after(() => occupant.kill('SIGKILL'));
+  writeRegistry(root, {
+    CODEXR3: { pid: occupant.pid, cwd: projDir, source: 'rename' }
+  });
+
+  // CODEXR3's owner is alive -> the new session must not claim it; with no
+  // bare-base registry entry it falls through to plain CODEXR.
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'CODEXR', 10000);
+  spawnBridge(t, root, port, projDir, { RELAY_CLIENT_ID: 'CODEXR' });
+  await joined;
+});
+
+test('clean exit keeps the label->cwd mapping (marked ended) for later reclaim', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'KEEPME', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'KEEPME' });
+  await joined;
+
+  const exited = new Promise(resolve => mcp.once('exit', resolve));
+  mcp.kill('SIGTERM');
+  await exited;
+
+  const registry = JSON.parse(
+    fs.readFileSync(path.join(root, 'claude-relay', 'sessions', 'registry.json'), 'utf8'));
+  assert.ok(registry.KEEPME, 'mapping survives clean exit');
+  assert.ok(registry.KEEPME.ended, 'entry is marked ended');
+  assert.equal(registry.KEEPME.cwd, projDir);
+});
+
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
   const port = startServer(t, root);
