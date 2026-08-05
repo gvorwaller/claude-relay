@@ -285,7 +285,11 @@ paying attention.
 
 When a message is stored, the server consults optional operator-local config
 `data/notify.json` (see `notify.json.example`; override path with
-`RELAY_NOTIFY_CONFIG`). Entries per target ID (or `"*"` for any target):
+`RELAY_NOTIFY_CONFIG`). The shipped default is a single `"*"` wildcard that
+works for **any** peer with zero per-peer configuration: the wake script
+itself detects what the target is (Codex peers get resumed; Claude Code peers
+exit untouched — they wake via their own watcher; unresumable peers fall back
+to a banner). Per-target entries remain available for overrides:
 
 - `{ "type": "banner" }` — content-free macOS notification (sender + target
   only) via `osascript`.

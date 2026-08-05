@@ -1,10 +1,19 @@
 #!/bin/bash
-# Wake the specific Codex session behind a relay peer ID.
+# Wake the peer behind a relay ID — generic, zero per-peer configuration.
 #
-# Called from a notify.json exec hook with RELAY_FOR set (e.g. CODEX3), or
-# manually: scripts/wake-codex.sh CODEX3 [prompt]. Never uses `--last`:
-# with several Codex instances running concurrently, "most recent" is the
-# wrong session as often as not. Resolution order:
+# Designed to be fired from a single wildcard notify.json entry for EVERY
+# target. The script decides what the peer is and what waking it means:
+#
+#   - Codex peer (its bridge's parent is a codex process, or its label starts
+#     with CODEX): resume its exact session headlessly as a delegate.
+#   - Claude Code / anything else: exit 0 silently — those sessions wake via
+#     their own armed relay-watch-loop.sh; there is nothing to exec.
+#   - "all" (broadcast) / unknown peers: exit 0 silently.
+#
+# Called with RELAY_FOR set (hook) or manually: scripts/wake-codex.sh CODEX3
+# [prompt]. Never uses `--last`: with several Codex instances running
+# concurrently, "most recent" is the wrong session as often as not.
+# Session resolution order:
 #
 #   1. Exact: registry pid (the peer's MCP bridge) -> parent codex process ->
 #      the rollout-*.jsonl it holds open -> session id.
@@ -24,6 +33,8 @@ for arg in "$@"; do
 done
 [[ ${#ARGS[@]} -ge 1 && -z "$FOR" ]] && FOR="${ARGS[0]}"
 [[ -z "$FOR" ]] && { echo "error: peer ID required (RELAY_FOR or first argument)"; exit 2; }
+# Broadcasts have no single peer to wake.
+[[ "$FOR" == "all" ]] && exit 0
 # NOTE: keep this text apostrophe-free; macOS bash 3.2 mis-parses quotes
 # inside ${var:-default}, which is also why the default lives in its own var.
 DEFAULT_PROMPT="[Automated wake from the relay notify hook - no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives."
@@ -39,15 +50,58 @@ print(entry.get("pid") or 0, entry.get("cwd") or "")
 PY
 )"
 
+# Peer-type guard: only Codex peers get an exec wake. A live bridge is
+# inspected directly (its parent process is the harness that spawned it);
+# otherwise the label convention decides. Claude Code peers wake through
+# their own armed relay-watch-loop.sh — exec-ing anything for them is wrong.
+IS_CODEX=0
+PARENT_ARGS=""
+if [[ "$PEER_PID" != "0" ]] && kill -0 "$PEER_PID" 2>/dev/null; then
+  PARENT_PID="$(ps -o ppid= -p "$PEER_PID" 2>/dev/null | tr -d ' ')"
+  PARENT_ARGS="$(ps -o command= -p "${PARENT_PID:-0}" 2>/dev/null)"
+fi
+if [[ "$PARENT_ARGS" == *[Cc]odex* || "$FOR" == CODEX* ]]; then
+  IS_CODEX=1
+fi
+if [[ "$IS_CODEX" == "0" ]]; then
+  [[ "$DRY_RUN" == "1" ]] && echo "$FOR -> not a codex peer; nothing to exec (wakes via its own watcher)"
+  exit 0
+fi
+
 SESSION_ID=""
 
 # 1. Exact: which rollout file does the peer's live codex process hold open?
+# A multi-session host (the ChatGPT app-server parents several bridges) holds
+# several rollouts open at once — disambiguate by the peer's registered cwd.
 if [[ "$PEER_PID" != "0" ]]; then
   CODEX_PID="$(ps -o ppid= -p "$PEER_PID" 2>/dev/null | tr -d ' ')"
   if [[ -n "${CODEX_PID:-}" && "$CODEX_PID" != "0" && "$CODEX_PID" != "1" ]]; then
-    ROLLOUT="$(lsof -p "$CODEX_PID" 2>/dev/null | grep -o '/[^ ]*rollout-[^ ]*\.jsonl' | head -1)"
-    if [[ -n "$ROLLOUT" ]]; then
-      SESSION_ID="$(basename "$ROLLOUT" .jsonl | sed -E 's/^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-//')"
+    ROLLOUTS="$(lsof -p "$CODEX_PID" 2>/dev/null | grep -o '/[^ ]*rollout-[^ ]*\.jsonl' | sort -u)"
+    if [[ -n "$ROLLOUTS" ]]; then
+      if [[ "$(echo "$ROLLOUTS" | wc -l | tr -d ' ')" == "1" ]]; then
+        ROLLOUT="$ROLLOUTS"
+      else
+        ROLLOUT="$(python3 - "$PEER_CWD" $ROLLOUTS <<'PY'
+import json, sys
+cwd = sys.argv[1]
+chosen = ""
+for f in sys.argv[2:]:
+    try:
+        with open(f) as fh:
+            payload = json.loads(fh.readline())
+        payload = payload.get("payload", payload)
+        if payload.get("cwd") == cwd:
+            chosen = f
+            break
+    except Exception:
+        continue
+print(chosen)
+PY
+)"
+      fi
+      if [[ -n "$ROLLOUT" ]]; then
+        SESSION_ID="$(basename "$ROLLOUT" .jsonl | sed -E 's/^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-//')"
+      fi
     fi
   fi
 fi
@@ -75,6 +129,11 @@ fi
 
 if [[ -z "$SESSION_ID" ]]; then
   echo "error: no codex session found for $FOR (pid=$PEER_PID cwd=$PEER_CWD)"
+  # Automation cannot reach this peer (e.g. an app conversation with no
+  # CLI-resumable rollout) — fall back to telling the human, content-free.
+  if [[ "$DRY_RUN" == "0" ]]; then
+    osascript -e "display notification \"$FOR has unread relay mail but no auto-wakeable session - poke it manually\" with title \"relay: $FOR\"" 2>/dev/null
+  fi
   exit 1
 fi
 

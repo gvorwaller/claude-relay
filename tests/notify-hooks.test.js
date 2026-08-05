@@ -71,6 +71,20 @@ test('debounceSeconds collapses a burst into one firing', t => {
   assert.equal(fired.length, 2);
 });
 
+test('wildcard debounce is per target, not per entry', t => {
+  let clock = 5000000;
+  const { hooks, fired } = makeHooks(t, {
+    '*': [{ type: 'exec', command: 'poke', debounceSeconds: 60 }]
+  }, { now: () => clock });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'w1', delivered: false });
+  clock += 1000;
+  hooks.fire({ to: 'CODEX', from: 'CC5', messageId: 'w2', delivered: false });
+  assert.equal(fired.length, 2, 'different targets each fire despite one shared entry');
+  clock += 1000;
+  hooks.fire({ to: 'CODEX', from: 'CC5', messageId: 'w3', delivered: false });
+  assert.equal(fired.length, 2, 'same target within the window is debounced');
+});
+
 test('a live delegate suppresses exec wakes but not banners', t => {
   const { hooks, fired } = makeHooks(t, {
     CODEX3: [

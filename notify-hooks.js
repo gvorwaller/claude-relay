@@ -96,7 +96,9 @@ class NotifyHooks {
     // the woken instance, so firing another exec wake would double-spawn.
     if (entry.type === 'exec' && deliveredToDelegate) return;
     const debounceMs = Math.max(0, Number(entry.debounceSeconds) || 0) * 1000;
-    const key = `${job.key}:${index}`;
+    // Keyed per TARGET, not just per config entry: a wildcard entry serving
+    // many peers must not let one peer's wake swallow another's.
+    const key = `${job.key}:${index}:${job.target}`;
     const now = this.now();
     if (debounceMs > 0 && now - (this.lastFired.get(key) || 0) < debounceMs) return;
     this.lastFired.set(key, now);
