@@ -92,6 +92,16 @@ wss.on('connection', (ws, req) => {
               }));
               return;
             }
+            if (clientId && !ws.delegateOf) {
+              // A primary switching itself to delegate mode would leave its
+              // old label mapped to this socket while authorization changed
+              // underneath it (review finding #10). Fresh connections only.
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `Already registered as "${clientId}"; delegate registration requires a fresh connection`
+              }));
+              return;
+            }
             const delegateBase = String(requestedClientId);
             const delegatePid = msg.meta && msg.meta.pid ? msg.meta.pid : Date.now().toString(36);
             const delegateId = `${delegateBase}~wake-${delegatePid}`;
@@ -122,23 +132,24 @@ wss.on('connection', (ws, req) => {
             break;
           }
 
+          if (ws.delegateOf) {
+            // The mirror image: a delegate must not shed its restrictions by
+            // re-registering as a primary on the same socket.
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `This connection is a delegate of "${ws.delegateOf}"; primary registration requires a fresh connection`
+            }));
+            return;
+          }
+
           // Same-socket rename: this connection is already registered under a
-          // different ID (relay_rename). Drop the old identity completely so it
-          // can't linger as a zombie entry that shows online forever and
-          // swallows messages addressed to the old name.
+          // different ID (relay_rename). The old identity is dropped ONLY
+          // after the new label's contest is won — destroying it first left a
+          // rejected renamer identity-less and unroutable (review finding #5).
           const renamedFrom =
             clientId && clientId !== requestedClientId && clients.get(clientId) === ws
               ? clientId
               : null;
-          if (renamedFrom) {
-            clients.delete(renamedFrom);
-            clientMeta.delete(renamedFrom);
-            logger.info('client_renamed', {
-              from: renamedFrom,
-              to: requestedClientId,
-              remoteAddress: req.socket.remoteAddress
-            });
-          }
 
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
@@ -194,6 +205,18 @@ wss.on('connection', (ws, req) => {
             }
             existingClient.displacedByTakeover = true;
             existingClient.terminate();
+          }
+
+          // Contest won (or uncontested): now it is safe to release the
+          // renamed-from identity.
+          if (renamedFrom) {
+            clients.delete(renamedFrom);
+            clientMeta.delete(renamedFrom);
+            logger.info('client_renamed', {
+              from: renamedFrom,
+              to: requestedClientId,
+              remoteAddress: req.socket.remoteAddress
+            });
           }
 
           clientId = requestedClientId;
@@ -365,7 +388,8 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({
             type: 'history',
             messages: result.messages,
-            cursor: result.cursor
+            cursor: result.cursor,
+            unknownCursor: result.unknownCursor
           }));
           break;
 

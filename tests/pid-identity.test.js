@@ -374,3 +374,27 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
     assert.deepEqual(Object.keys(registry).filter(id => id.includes('CODEXD')), []);
   }
 });
+
+test('identity mode cannot be switched on a live socket (primary<->delegate)', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
+  const port = startServer(t, root);
+
+  // Primary -> delegate: rejected.
+  const primary = await connectWithRetry(port, 'MODEA', { pid: process.pid });
+  t.after(() => primary.close());
+  const primaryRefused = waitForMessage(primary, msg =>
+    msg.type === 'error' && /delegate registration requires a fresh connection/.test(msg.message));
+  primary.send(JSON.stringify({ type: 'register', clientId: 'MODEA', delegate: true, meta: { pid: 111 } }));
+  await primaryRefused;
+
+  // Delegate -> primary: rejected.
+  const delegate = await open(port);
+  t.after(() => delegate.close());
+  const delegateRegistered = waitForMessage(delegate, msg => msg.type === 'registered');
+  delegate.send(JSON.stringify({ type: 'register', clientId: 'MODEB', delegate: true, meta: { pid: 222 } }));
+  await delegateRegistered;
+  const delegateRefused = waitForMessage(delegate, msg =>
+    msg.type === 'error' && /primary registration requires a fresh connection/.test(msg.message));
+  delegate.send(JSON.stringify({ type: 'register', clientId: 'MODEB', meta: { pid: 222 } }));
+  await delegateRefused;
+});

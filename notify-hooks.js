@@ -36,6 +36,11 @@ class NotifyHooks {
     this.now = options.now || (() => Date.now());
     // Debounce state per config entry: `${configKey}:${entryIndex}` -> last-fired ms
     this.lastFired = new Map();
+    // Suppressed fires that MUST still happen: `key` -> pending timer. A
+    // debounced message with no later trigger would otherwise sit unread
+    // forever (2026-08-05 review finding #4), so suppression always schedules
+    // a trailing-edge fire for the newest suppressed context.
+    this.pendingTrailing = new Map();
     this.configCache = { mtimeMs: -1, entries: null };
   }
 
@@ -89,25 +94,58 @@ class NotifyHooks {
     }
   }
 
-  fireEntry(entry, index, job, { from, messageId, delivered, deliveredToDelegate }) {
+  fireEntry(entry, index, job, context) {
+    const { delivered, deliveredToDelegate } = context;
     if (!entry || typeof entry !== 'object') return;
     if (entry.onlyIfUndelivered && delivered) return;
-    // A live delegate for this target already received the mail push — it IS
-    // the woken instance, so firing another exec wake would double-spawn.
-    if (entry.type === 'exec' && deliveredToDelegate) return;
     const debounceMs = Math.max(0, Number(entry.debounceSeconds) || 0) * 1000;
     // Keyed per TARGET, not just per config entry: a wildcard entry serving
     // many peers must not let one peer's wake swallow another's.
     const key = `${job.key}:${index}:${job.target}`;
+    // Suppression NEVER simply drops a wake — the suppressed message may be
+    // the last one for hours. Both suppression reasons get a trailing-edge
+    // fire instead: a delegate that was live at arrival may exit without
+    // reading this message, and a debounced message needs a wake once the
+    // window closes.
+    if (entry.type === 'exec' && deliveredToDelegate) {
+      this.scheduleTrailing(key, entry, index, job, context, debounceMs || 15000);
+      return;
+    }
     const now = this.now();
-    if (debounceMs > 0 && now - (this.lastFired.get(key) || 0) < debounceMs) return;
-    this.lastFired.set(key, now);
+    if (debounceMs > 0 && now - (this.lastFired.get(key) || 0) < debounceMs) {
+      const remaining = (this.lastFired.get(key) || 0) + debounceMs - now;
+      this.scheduleTrailing(key, entry, index, job, context, Math.max(remaining, 50));
+      return;
+    }
+    const pending = this.pendingTrailing.get(key);
+    if (pending) {
+      clearTimeout(pending);
+      this.pendingTrailing.delete(key);
+    }
     try {
-      this.runner(entry, { target: job.target, from, messageId, delivered });
-      this.logger.info('notify_hook_fired', { target: job.target, kind: entry.type, from });
+      this.runner(entry, { target: job.target, from: context.from, messageId: context.messageId, delivered });
+      // Committed only AFTER the runner succeeds: a failed spawn must not
+      // start a debounce window that suppresses the retry.
+      this.lastFired.set(key, this.now());
+      this.logger.info('notify_hook_fired', { target: job.target, kind: entry.type, from: context.from });
     } catch (err) {
       this.logger.warn('notify_hook_failed', { target: job.target, kind: entry.type, error: err.message });
     }
+  }
+
+  scheduleTrailing(key, entry, index, job, context, delayMs) {
+    const existing = this.pendingTrailing.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.pendingTrailing.delete(key);
+      // Re-enter with delegate suppression cleared (the delegate that caused
+      // it is likely gone; a redundant wake is a cheap no-op, a missing wake
+      // is stranded mail). The debounce window is re-checked naturally.
+      this.fireEntry(entry, index, job, { ...context, deliveredToDelegate: false });
+    }, delayMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.pendingTrailing.set(key, timer);
+    this.logger.info('notify_hook_deferred', { target: job.target, kind: entry.type, delayMs });
   }
 
   defaultRunner(entry, { target, from, messageId, delivered }) {

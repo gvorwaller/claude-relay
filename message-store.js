@@ -52,14 +52,15 @@ class MessageStore {
       || (Number.isFinite(Date.parse(after))
         && this.cache.length > 0
         && Date.parse(after) >= Date.parse(this.cache[0].timestamp));
-    let messages = cachedResult.length >= limit && afterIsCovered
+    const result = cachedResult.messages.length >= limit && afterIsCovered
       ? cachedResult
       : this.filterMessages(this.readAll(), { requester, from, to, after });
 
-    messages = messages.slice(-limit);
+    const messages = result.messages.slice(-limit);
     return {
       messages,
-      cursor: messages.length ? messages[messages.length - 1].id : null
+      cursor: messages.length ? messages[messages.length - 1].id : null,
+      unknownCursor: result.unknownCursor || undefined
     };
   }
 
@@ -68,6 +69,7 @@ class MessageStore {
 
     if (from) messages = messages.filter(message => message.from === from);
     if (to) messages = messages.filter(message => message.to === to);
+    let unknownCursor = false;
     if (after) {
       const index = messages.findIndex(message => message.id === after);
       if (index >= 0) {
@@ -76,10 +78,17 @@ class MessageStore {
         const afterTime = Date.parse(after);
         if (Number.isFinite(afterTime)) {
           messages = messages.filter(message => Date.parse(message.timestamp) > afterTime);
+        } else {
+          // An opaque cursor we cannot place (pruned by retention, mistyped,
+          // or foreign) must NOT silently replay the entire visible tail —
+          // that caused stale wakes and duplicate processing (review finding
+          // #7). Return nothing and say why, so callers resync explicitly.
+          messages = [];
+          unknownCursor = true;
         }
       }
     }
-    return messages;
+    return { messages, unknownCursor };
   }
 
   clearCache() {

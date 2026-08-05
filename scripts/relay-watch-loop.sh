@@ -41,7 +41,9 @@ if [[ -z "$FOR" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[[ -z "$SINCE" ]] && SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Millisecond precision: a whole-second default cursor re-triggers on mail
+# processed earlier in the same second (review finding #8).
+[[ -z "$SINCE" ]] && SINCE="$(node -e 'console.log(new Date().toISOString())')"
 DEADLINE=$(( $(date +%s) + MAX_MINUTES * 60 ))
 FAILURES=0
 

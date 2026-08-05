@@ -70,3 +70,23 @@ test('bounds the memory cache by count', () => {
   store.append({ from: 'A', to: 'B', content: 'three' });
   assert.deepEqual(store.cache.map(m => m.content), ['two', 'three']);
 });
+
+test('unknown opaque cursor returns nothing and flags it instead of replaying history', () => {
+  const store = new MessageStore({ dataDir: tempDir() });
+  store.initialize();
+  store.append({ from: 'A', to: 'B', content: 'one' });
+  const second = store.append({ from: 'A', to: 'B', content: 'two' });
+
+  // Pruned/mistyped/foreign UUID: nothing replayed, caller told to resync.
+  const unknown = store.query({ requester: 'B', after: 'ffffffff-0000-0000-0000-000000000000' });
+  assert.deepEqual(unknown.messages, []);
+  assert.equal(unknown.unknownCursor, true);
+
+  // Known id and ISO timestamps keep their exact prior semantics.
+  const afterFirst = store.query({ requester: 'B', after: second.id });
+  assert.deepEqual(afterFirst.messages, []);
+  assert.equal(afterFirst.unknownCursor, undefined);
+  const afterEpoch = store.query({ requester: 'B', after: '2000-01-01T00:00:00.000Z' });
+  assert.deepEqual(afterEpoch.messages.map(m => m.content), ['one', 'two']);
+  assert.equal(afterEpoch.unknownCursor, undefined);
+});

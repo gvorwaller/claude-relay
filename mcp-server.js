@@ -465,11 +465,35 @@ let displaced = false;
 // suspended: retrying the same register would be refused forever. relay_rename
 // picks a new ID (or retries this one once the owner is gone).
 let rejectedReason = null;
+// In-flight transactional rename: {requestId, oldId, oldSource, newId,
+// reclaiming, timer}. Committed on `registered`, rolled back untouched on
+// `register_rejected` — local identity/registry never change speculatively.
+let pendingRename = null;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
 let reconnectTimer = null;
 let shuttingDown = false;
+
+function commitRename(rename, suffix = '') {
+  clearTimeout(rename.timer);
+  if (!rename.reclaiming) {
+    // CLIENT_ID is still the old identity here — nothing changed
+    // speculatively. Release the wrong mapping, then record the new one.
+    updateRegistry('release');
+    CLIENT_ID = rename.newId;
+    CLIENT_ID_SOURCE = 'rename';
+    updateRegistry('connect');
+  }
+  displaced = false;
+  rejectedReason = null;
+  let text = rename.reclaiming
+    ? `Reclaimed relay identity "${rename.newId}". ${suffix}`
+    : `Renamed relay identity: ${rename.oldId} → ${rename.newId}, confirmed by the relay server. ${suffix}`;
+  text += `\nNote: tool descriptions cached by this client may still show "${rename.oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
+  sendToolText(rename.requestId, text.trim());
+  pendingRename = null;
+}
 
 function sendToolText(requestId, text) {
   sendMcpResponse({
@@ -909,13 +933,32 @@ function handleToolCall(requestId, toolName, args) {
       }
       const oldId = CLIENT_ID;
       const reclaiming = newId === CLIENT_ID;
-      // Release the old identity's registry entry with the same semantics as a
-      // disconnect (registry-sourced IDs are marked ended, others removed),
-      // then claim the new identity locally and on the server. A same-ID call
-      // while displaced is a deliberate reclaim (newest registration wins).
+
+      // Connected path is TRANSACTIONAL (review finding #5): nothing local —
+      // not CLIENT_ID, not the registry — changes until the server confirms
+      // with `registered`. A rejection leaves the old identity fully intact.
+      if (connected && ws && ws.readyState === WebSocket.OPEN) {
+        pendingRename = {
+          requestId,
+          oldId,
+          oldSource: CLIENT_ID_SOURCE,
+          newId,
+          reclaiming
+        };
+        pendingRename.timer = setTimeout(() => {
+          // Old servers never ack registration; they applied the rename the
+          // moment it arrived. Commit optimistically after the grace period.
+          if (pendingRename && pendingRename.requestId === requestId) {
+            commitRename(pendingRename, '(no server confirmation — old server? — assumed applied)');
+          }
+        }, 4000);
+        registerWithServer(newId);
+        break;
+      }
+
+      // Disconnected path: there is no live server-side identity to protect,
+      // so commit locally and let the (re)connect announce it.
       if (!reclaiming) {
-        // 'release', not 'disconnect': a rename means the old mapping was
-        // WRONG — delete it, don't preserve it for reclaim.
         updateRegistry('release');
         CLIENT_ID = newId;
         CLIENT_ID_SOURCE = 'rename';
@@ -927,16 +970,13 @@ function handleToolCall(requestId, toolName, args) {
       let renameText = reclaiming
         ? `Reclaiming relay identity "${CLIENT_ID}".`
         : `Renamed relay identity: ${oldId} → ${CLIENT_ID}.`;
-      if (registerWithServer()) {
-        renameText += ' Re-registered with the relay server; the old ID was released immediately.';
-      } else if (!reconnectTimer) {
+      if (!reconnectTimer) {
         connectToRelay();
         renameText += ` Reconnecting to the relay server; "${CLIENT_ID}" will be announced as soon as the connection is up.`;
       } else {
         renameText += ' Relay server unreachable right now; the new ID will be announced automatically on the next (re)connect.';
       }
-      renameText += `\nIf "${CLIENT_ID}" is held by another connection whose process is verifiably alive on the relay host, this registration will be rejected (labels are pid-anchored) — check relay_status. Unverifiable or dead holders are displaced. Peers should message ${CLIENT_ID} once relay_status confirms the identity.`;
-      renameText += `\nNote: tool descriptions cached by this client may still show "${oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
+      renameText += `\nIf "${CLIENT_ID}" is held by another connection whose process is verifiably alive on the relay host, that registration will be rejected (labels are pid-anchored) — check relay_status.`;
       sendToolText(requestId, renameText);
       break;
     }
@@ -1064,11 +1104,11 @@ function handleToolCall(requestId, toolName, args) {
  * Used on socket open and by relay_rename (the server treats a register from
  * an already-registered socket as a rename and drops the old identity).
  */
-function registerWithServer() {
+function registerWithServer(idOverride) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   const registration = {
     type: 'register',
-    clientId: DELEGATE_FOR || CLIENT_ID,
+    clientId: DELEGATE_FOR || idOverride || CLIENT_ID,
     meta: {
       pid: process.pid,
       started: STARTED_AT,
@@ -1106,6 +1146,11 @@ function connectToRelay() {
       switch (msg.type) {
         case 'registered':
           peers = msg.peers || [];
+          if (pendingRename && msg.clientId === pendingRename.newId) {
+            // Server confirmed the rename: commit identity + registry now.
+            commitRename(pendingRename);
+            break;
+          }
           // Adopt the server-assigned ID (differs from ours only in delegate
           // mode, where the server mints the visible `<base>~wake-<pid>` ID).
           if (msg.clientId && msg.clientId !== CLIENT_ID) {
@@ -1114,6 +1159,17 @@ function connectToRelay() {
           break;
 
         case 'register_rejected':
+          if (pendingRename && msg.clientId === pendingRename.newId) {
+            // A failed RENAME is not a failed session: the server never
+            // touched our old identity, this socket is still registered as
+            // it, and nothing local changed. Report and carry on.
+            clearTimeout(pendingRename.timer);
+            sendToolText(pendingRename.requestId,
+              `Rename to "${pendingRename.newId}" rejected: ${msg.reason || 'label is owned by a live process'}\n`
+              + `Still connected and registered as "${CLIENT_ID}"; the registry is unchanged.`);
+            pendingRename = null;
+            break;
+          }
           rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
           console.error(JSON.stringify({
             timestamp: new Date().toISOString(),
@@ -1185,6 +1241,9 @@ function connectToRelay() {
             let text = messages.length > 0
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
+            if (msg.unknownCursor) {
+              text = `Warning: the "after" cursor was not found (expired, pruned, or foreign) — nothing was replayed. Call relay_receive WITHOUT "after" to resync, then continue from the new cursor.\n${text}`;
+            }
             if (msg.cursor) text += `\n\nCursor: ${msg.cursor}`;
             sendMcpResponse({
               jsonrpc: '2.0',
@@ -1312,6 +1371,14 @@ function connectToRelay() {
   ws.on('close', () => {
     connected = false;
     peers = [];
+    if (pendingRename) {
+      // The socket died before the server could confirm or reject: nothing
+      // local changed, so the rename simply did not happen.
+      clearTimeout(pendingRename.timer);
+      sendToolText(pendingRename.requestId,
+        `Relay disconnected before the rename to "${pendingRename.newId}" was confirmed; identity unchanged ("${CLIENT_ID}").`);
+      pendingRename = null;
+    }
     relayWaiter.finish('disconnect');
     // Any in-flight history response belonged to this closed socket and can
     // never arrive. Do not let its tombstone consume a post-reconnect reply.

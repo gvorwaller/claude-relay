@@ -98,6 +98,50 @@ test('a live delegate suppresses exec wakes but not banners', t => {
   assert.deepEqual(fired.map(f => f.entry.type), ['banner', 'exec', 'banner']);
 });
 
+test('a debounced message still gets a trailing-edge wake', async t => {
+  const { hooks, fired } = makeHooks(t, {
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 0.15 }]
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 't1', delivered: false });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 't2', delivered: false });
+  assert.equal(fired.length, 1, 'second fire suppressed inside the window');
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(fired.length, 2, 'suppressed message wakes once the window closes');
+});
+
+test('delegate-suppressed exec gets a trailing-edge wake too', async t => {
+  const { hooks, fired } = makeHooks(t, {
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 0.1 }]
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'd1', delivered: true, deliveredToDelegate: true });
+  assert.equal(fired.length, 0, 'no immediate wake while a delegate is live');
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(fired.length, 1, 'wake fires after the delegate window in case it exited unread');
+});
+
+test('a failed runner does not start a debounce window that eats the retry', t => {
+  let shouldThrow = true;
+  const fired = [];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notify-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configPath = path.join(root, 'notify.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 300 }]
+  }));
+  const hooks = new NotifyHooks({
+    configPath,
+    runner: entry => {
+      if (shouldThrow) throw new Error('spawn failed');
+      fired.push(entry);
+    }
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'f1', delivered: false });
+  assert.equal(fired.length, 0);
+  shouldThrow = false;
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'f2', delivered: false });
+  assert.equal(fired.length, 1, 'retry fires immediately because the failure committed no window');
+});
+
 test('missing or invalid config disables hooks without throwing', t => {
   const { hooks, fired, configPath } = makeHooks(t, undefined);
   hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'm8', delivered: false });

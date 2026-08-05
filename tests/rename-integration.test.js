@@ -165,7 +165,7 @@ test('relay_rename corrects a live MCP session identity without restart', async 
   }});
   const renamed = await next(msg => msg.id === 3);
   assert.match(renamed.result.content[0].text, /CODEXTEST → CODEXTEST1/);
-  assert.match(renamed.result.content[0].text, /old ID was released/);
+  assert.match(renamed.result.content[0].text, /confirmed by the relay server/);
   await Promise.all([leftWrong, joinedRight]);
 
   // relay_status reports the corrected identity.
@@ -311,4 +311,46 @@ test('background fork registers a derived identity instead of seizing the inheri
   // The plain CC9 identity is still free for the real session to register.
   const real = await connect(port, 'CC9');
   t.after(() => real.close());
+});
+
+test('rename onto an owned label is rejected transactionally: old identity intact', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-tx-'));
+  const port = startServer(t, root);
+
+  // TARGET is owned by a verifiably-live pid.
+  const holder = await connectWithRetry(port, 'TARGET');
+  t.after(() => holder.close());
+  holder.send(JSON.stringify({ type: 'register', clientId: 'TARGET', meta: { pid: process.pid } }));
+  await waitForMessage(holder, msg => msg.type === 'registered');
+
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    '--client-id=OTHER', `--relay-url=ws://127.0.0.1:${port}`], {
+    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '', RELAY_DELEGATE_FOR: '' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  const next = mcpLines(mcp.stdout);
+  const send = value => mcp.stdin.write(`${JSON.stringify(value)}\n`);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await next(msg => msg.id === 1);
+  await waitForMessage(holder, msg => msg.type === 'peer_joined' && msg.clientId === 'OTHER');
+
+  // The rename is refused, reported as such, and nothing local changed.
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'relay_rename', arguments: { to: 'TARGET' }
+  }});
+  const reply = await next(msg => msg.id === 2);
+  assert.match(reply.result.content[0].text, /Rename to "TARGET" rejected/);
+  assert.match(reply.result.content[0].text, /Still connected and registered as "OTHER"/);
+
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
+  const status = await next(msg => msg.id === 3);
+  assert.match(status.result.content[0].text, /Connected .* as "OTHER"/);
+
+  // The old identity still routes: mail to OTHER reaches this bridge.
+  const peersMsg = waitForMessage(holder, msg => msg.type === 'peers');
+  holder.send(JSON.stringify({ type: 'get_peers' }));
+  const peerList = (await peersMsg).peers;
+  assert.ok(peerList.includes('OTHER'), 'OTHER survived the rejected rename');
+  assert.ok(peerList.includes('TARGET'), 'TARGET was never displaced');
 });

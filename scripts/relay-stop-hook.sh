@@ -77,29 +77,41 @@ if [[ "$RESOLVE_ONLY" == "1" ]]; then
   exit 0
 fi
 
-# One listener per label. A lock whose hook or claude process is dead is stale
-# and gets taken over (killing any orphaned listener first).
+# One listener per label. mkdir is the atomic acquire (check-then-write races
+# two simultaneous Stop hooks into double listeners); a lock whose hook or
+# claude process is dead is stale and gets taken over.
 LOCK="${TMPDIR:-/tmp}/claude-relay-stop-hook-${ID}.lock"
-if [[ -f "$LOCK" ]]; then
-  read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK" 2>/dev/null || true
+acquire_lock() {
+  mkdir "$LOCK" 2>/dev/null && return 0
+  if [[ -f "$LOCK" ]]; then
+    # Migration: pre-mkdir versions used a plain lock file.
+    read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK" 2>/dev/null || true
+  else
+    read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK/owner" 2>/dev/null || true
+  fi
   if [[ -n "${LOCK_HOOK:-}" && -n "${LOCK_CLAUDE:-}" ]] \
      && kill -0 "$LOCK_HOOK" 2>/dev/null && kill -0 "$LOCK_CLAUDE" 2>/dev/null; then
-    exit 0
+    return 1 # a live listener for a live session already exists
   fi
   [[ -n "${LOCK_HOOK:-}" ]] && kill "$LOCK_HOOK" 2>/dev/null
-fi
-echo "$$ $CLAUDE_PID" > "$LOCK"
+  rm -rf "$LOCK"
+  mkdir "$LOCK" 2>/dev/null
+}
+acquire_lock || exit 0
+echo "$$ $CLAUDE_PID" > "$LOCK/owner"
+trap 'rm -rf "$LOCK"' EXIT
 
-SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Millisecond precision matters: a whole-second cursor makes the freshly armed
+# watcher see the message this session JUST processed (stored with ms) as
+# "newer" and re-wake immediately (2026-08-05 review finding #8).
+SINCE="$(node -e 'console.log(new Date().toISOString())')"
 while true; do
   if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
-    rm -f "$LOCK"
     exit 0
   fi
   OUT="$(node "$WATCH" --for "$ID" --timeout 300 --since "$SINCE" 2>/dev/null)"
   case "$OUT" in
     new-message)
-      rm -f "$LOCK"
       echo "Relay mail is waiting for $ID. Run relay_receive now and act on what it says; reply to the sender via relay_send if a reply is warranted." >&2
       exit 2
       ;;
