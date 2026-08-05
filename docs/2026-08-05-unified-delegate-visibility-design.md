@@ -30,8 +30,11 @@ required, and both want the same missing foundation.
 Adopted verbatim from CODEX3's §1–§3 with one explicit extension. This is the
 single source of truth both surfaces read.
 
-- `delegate-job-store.js` (new): owns the job state machine
-  (`spawned → running → completed | failed | interrupted → surfaced`),
+- `delegate-job-store.js` (new): owns the canonical job state machine —
+  `spawned → running → completed | failed | interrupted → reported [→ surfaced]`,
+  where **`reported` is terminal for the baseline** (Stop-hook-verified
+  inclusion in a completed assistant message) and `surfaced` exists only if a
+  real client acknowledgement becomes available via the App Server tier —
   atomic persistence, seven-day retention, bounded disk, crash recovery for
   jobs whose process died, idempotent transitions. Invalid transitions fail
   closed. Restrictive permissions (receipts can contain source findings).
@@ -39,13 +42,29 @@ single source of truth both surfaces read.
   original synthesis wrongly merged them). A job capability authorizes
   *delegate* registration, but it cannot fix ordinary owner-label takeover,
   where an attacker registers as a normal bridge quoting a live holder's pid:
-  - **Owner/reconnect capability** — long-lived, rotatable, server-issued at
-    first registration; required to claim or reseat a base label.
+  - **Owner/reconnect capability** — long-lived, rotatable, generation-
+    versioned, revocable; required to claim or reseat a base label. **First
+    claim must be enrolled, not first-come** (CODEX3 re-check #2): on an
+    unauthenticated 0.0.0.0 protocol, "issued at first registration" lets a
+    squatter claim a label and receive its durable authority. Enrollment is
+    via an operator secret / explicit admin approval / trusted local channel;
+    a rename may only target an unclaimed label under those same rules, and
+    an existing owner capability never authorizes claiming an arbitrary new
+    label. Credentials rotate on successful rename rather than being copied.
+    The client's plaintext secret lives in a per-owner 0600 file, never in
+    the shared registry; the server stores only hashes, compared in constant
+    time, persisted atomically, surviving restart.
   - **Job capability** — single-use, expiring, bound to (and derived from) the
-    owner capability plus the inbound message; consumed at delegate
-    registration and bound to the resulting connection.
-  Pid is **never** proof in either path (it stays diagnostic only). Tokens are
-  stored hashed. Together these fix findings #2 and #3.
+    owner capability generation plus the inbound message ID, consumed
+    atomically and bound to the resulting connection. **Least authority, not
+    just authenticated identity** (CODEX3 re-check #3): a job delegate may
+    read only its assigned inbound message/job queue — *not* the base label's
+    seven-day mailbox — may send only as that job and only to the inbound
+    sender (or an explicit allowlist), and is denied admin, clear/purge, and
+    session-enumeration operations. The owner secret is never passed to the
+    child. Rotating owner authority revokes all outstanding job capabilities.
+  Pid is **never** proof in either path (it stays diagnostic only).
+  Together these fix findings #2 and #3.
 - While a job runs, the server attaches every successful `message` append from
   the authenticated delegate to the job: recipient, durable message ID,
   delivered-vs-queued, timestamp. Receipts assert outbound actions from server
@@ -75,10 +94,15 @@ parsing: no state or correctness derives from the delegate's stream.
 machine" is not a security boundary; any web page the operator visits can
 issue requests to localhost):**
 
-- A **separate HTTP listener bound to 127.0.0.1** (not the 0.0.0.0 relay
-  socket), plus strict local-address enforcement.
+- **Topology (decided, CODEX3 re-check #4 — option A):** the relay WebSocket
+  stays exactly as it is on `0.0.0.0:9999`, untouched. The status surface is a
+  **separate `http.Server` bound to 127.0.0.1 on its own port**, serving HTML
+  and SSE only. There is therefore **no page WebSocket and no upgrade path to
+  secure**, and no refactor of the live relay listener (superseding the
+  earlier "same port" note and CODEX3 #9's refactor requirement). Smaller
+  attack surface, zero coupling to the message path.
 - **Host header validation** (anti-DNS-rebinding) and **Origin rejection**;
-  no CORS. Applied to ordinary routes, SSE, *and* WebSocket upgrades alike.
+  no CORS. Applied to page routes and the SSE stream.
 - An **unguessable bearer credential**, never in the URL (printed at server
   start / readable from a 0600 local file).
 - `Cache-Control: no-store`, CSP, frame denial, `X-Content-Type-Options`.
@@ -89,9 +113,8 @@ issue requests to localhost):**
   an **allowlisted event projection** with redaction, truncation, and bounded
   retention, default-closed. Relay message body previews are default-off
   (omitted in the first version).
-- Implementation note: serving HTTP+SSE alongside the WebSocket requires
-  refactoring the current direct `WebSocketServer` listener into an explicit
-  `http.Server` with a validated upgrade path (CODEX3 #9).
+- The page process reads the job store and subscribes to server state; it
+  never accepts control operations.
 
 - Content, pushed live over SSE:
   - **Peer table**: labels, pid/cwd, online state; delegates rendered
@@ -99,7 +122,7 @@ issue requests to localhost):**
     2m14s`).
   - **Job feed**: every wake as a causal chain — inbound message → hook fired
     (or deferred, with reason) → delegate registered → outbound sends (server-
-    recorded, with delivered/queued) → terminal state → surfaced-or-pending.
+    recorded, with delivered/queued) → terminal state → reported-or-pending.
     This is a rendering of job-store rows, so it is exactly as trustworthy as
     the receipts.
   - **Delegate activity pane**: the allowlisted, redacted event projection
@@ -113,7 +136,7 @@ issue requests to localhost):**
 CODEX3's tier 1, adopted unchanged as the enforcement layer:
 
 - `UserPromptSubmit` hook injects pending receipts for the session's owner
-  (injection is NOT display; never marks surfaced; must exclude delegates via
+  (injection is NOT display; never marks a receipt reported; must exclude delegates via
   the job capability, not process-name heuristics).
 - `Stop` hook verifies the final assistant message covers every injected job
   ID (compact machine marker for the handshake, natural prose for the human);
@@ -209,8 +232,8 @@ and rejected if replayed on a second connection.
 
 Page tests (expanded per CODEX3 #9): non-loopback request refused; hostile
 `Host` header refused (DNS rebinding); hostile `Origin` refused; missing or
-wrong credential refused — each asserted on ordinary routes, SSE, *and*
-WebSocket upgrade; SSE exhaustion/backpressure and disconnect cleanup;
+wrong credential refused — each asserted on page routes and the SSE stream
+(there is no page WebSocket under the chosen topology); SSE exhaustion/backpressure and disconnect cleanup;
 redaction and allowlist proof that no raw model/tool stream ever crosses the
 endpoint; page state derives only from job-store/server state (kill the log
 mid-run: the page stays correct and the activity pane degrades gracefully);
@@ -218,8 +241,9 @@ SSE reflects job transitions within one second.
 
 ## Acceptance criteria
 
-CODEX3's §9 stands as written for the receipt baseline, with `surfaced` read
-as `reported` (terminal Stop-verified state) unless the App Server tier lands.
+CODEX3's §9 stands as written for the receipt baseline, reading its
+`surfaced` as this document's `reported` (the terminal Stop-verified state)
+unless the App Server tier lands and supplies a real client acknowledgement.
 The page adds one: during any delegate run started while the page is open, a
 human can answer "what is CODEX3 doing right now, and did it reply yet?"
 without touching a CLI. The combined feature is done when both are true and
@@ -228,9 +252,21 @@ week of real use.
 
 ## Review status
 
-CODEX3 sanity check (2026-08-05, on the pre-revision draft): *request changes*
-— blockers on capability merging (#1), `surfaced` semantics (#4), page
-hardening (#5), raw stream exposure (#6), plus ordering (#7), CC symmetry
-scope (#8), and the http.Server refactor (#9). All are folded into this
-revision; the hook contract was confirmed against codex-cli 0.146.0 (#3) and
-the control-plane loop rules were cleared unchanged (#2). Awaiting re-check.
+Round 1 (2026-08-05): *request changes* — capability merging, `surfaced`
+semantics, page hardening, raw stream exposure, ordering, CC symmetry scope.
+All folded in. Hook contract confirmed against codex-cli 0.146.0; control-plane
+loop rules cleared unchanged.
+
+Round 2 re-check (2026-08-05): *request changes*, "much closer". Its four
+design blockers are resolved here: the state machine is now one canonical
+chain with `reported` terminal (#1); owner-capability first claim requires
+enrollment, never first-come (#2); job capabilities carry least-authority
+scope limits, not just authentication (#3); and the listener topology is
+decided as option A — relay WebSocket untouched, status page a separate
+loopback HTTP+SSE server with no upgrade path (#4).
+
+Its code verdicts on the shipped branch: findings #1 (injection), #7
+(cursors), #10 (mode switching) PASS; #4, #5, #8 were PARTIAL and are now
+closed by commit e353311 (async spawn-failure retry, no optimistic rename
+commit, token-owned locks), plus delegate immutability and nonce-based
+delegate IDs. Awaiting round-3 verification of those code changes.
