@@ -1,0 +1,113 @@
+#!/bin/bash
+# Claude Code Stop hook (asyncRewake): every session listens for relay mail
+# while idle, with zero model cooperation.
+#
+# Configured in ~/.claude/settings.json as an async-rewake Stop hook. When a
+# session ends its turn, this script keeps running in the background:
+#
+#   1. Works out which relay peer THIS session is: a registry entry whose
+#      bridge pid hangs off one of our ancestor processes (the claude CLI).
+#      No env vars, no per-project config; multiple sessions in one cwd each
+#      resolve their own label.
+#   2. Takes a per-label lock so repeated stops arm exactly one listener.
+#   3. Watches the relay (content-free) until mail for this label arrives,
+#      then exits 2 — which asyncRewake turns into waking the model, which
+#      runs relay_receive and acts. Watch timeouts re-arm with a pinned
+#      --since cursor, so mail landing between re-arms is never missed.
+#
+# Sessions with no relay bridge exit instantly. If the claude process dies,
+# the listener stands down. --resolve-only prints the resolved label + anchor
+# pid and exits (for testing).
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+REGISTRY="$HOME/claude-relay/sessions/registry.json"
+WATCH="$HOME/claude-relay/scripts/relay-watch.js"
+[[ -f "$REGISTRY" && -f "$WATCH" ]] || exit 0
+
+RESOLVE_ONLY=0
+[[ "${1:-}" == "--resolve-only" ]] && RESOLVE_ONLY=1
+
+# Resolve label + owning claude pid by ancestry: hooks and MCP bridges are
+# both children of the claude process, so the registry entry whose bridge
+# parent appears in OUR ancestor chain names this session.
+read -r ID CLAUDE_PID <<< "$(python3 - "$REGISTRY" $$ <<'PY'
+import json, subprocess, sys
+
+def ps_field(pid, field):
+    try:
+        return subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+registry_path, self_pid = sys.argv[1], sys.argv[2]
+try:
+    registry = json.load(open(registry_path))
+except Exception:
+    sys.exit(0)
+
+ancestors = []
+pid = self_pid
+for _ in range(6):
+    pid = ps_field(pid, "ppid")
+    if not pid or pid in ("0", "1"):
+        break
+    ancestors.append(pid)
+
+bridge_parents = {}
+for label, info in registry.items():
+    bridge_pid = info.get("pid")
+    if not bridge_pid:
+        continue
+    parent = ps_field(bridge_pid, "ppid")
+    if parent:
+        bridge_parents[parent] = label
+
+for ancestor in ancestors:
+    if ancestor in bridge_parents:
+        print(bridge_parents[ancestor], ancestor)
+        break
+PY
+)"
+[[ -z "${ID:-}" || -z "${CLAUDE_PID:-}" ]] && exit 0
+
+if [[ "$RESOLVE_ONLY" == "1" ]]; then
+  echo "session peer: $ID (claude pid $CLAUDE_PID)"
+  exit 0
+fi
+
+# One listener per label. A lock whose hook or claude process is dead is stale
+# and gets taken over (killing any orphaned listener first).
+LOCK="${TMPDIR:-/tmp}/claude-relay-stop-hook-${ID}.lock"
+if [[ -f "$LOCK" ]]; then
+  read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK" 2>/dev/null || true
+  if [[ -n "${LOCK_HOOK:-}" && -n "${LOCK_CLAUDE:-}" ]] \
+     && kill -0 "$LOCK_HOOK" 2>/dev/null && kill -0 "$LOCK_CLAUDE" 2>/dev/null; then
+    exit 0
+  fi
+  [[ -n "${LOCK_HOOK:-}" ]] && kill "$LOCK_HOOK" 2>/dev/null
+fi
+echo "$$ $CLAUDE_PID" > "$LOCK"
+
+SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+while true; do
+  if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    rm -f "$LOCK"
+    exit 0
+  fi
+  OUT="$(node "$WATCH" --for "$ID" --timeout 300 --since "$SINCE" 2>/dev/null)"
+  case "$OUT" in
+    new-message)
+      rm -f "$LOCK"
+      echo "Relay mail is waiting for $ID. Run relay_receive now and act on what it says; reply to the sender via relay_send if a reply is warranted." >&2
+      exit 2
+      ;;
+    timeout)
+      : # normal re-arm; SINCE stays pinned so gap mail still backfills a ping
+      ;;
+    *)
+      sleep 15 # relay unreachable; retry gently
+      ;;
+  esac
+done

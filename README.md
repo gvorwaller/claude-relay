@@ -272,6 +272,17 @@ pins a `--since` cursor at start and passes it to every re-arm — the server
 backfills a ping at subscribe time if mail landed in the deaf gap between one
 watcher exiting and the next arming, so nothing sits silently queued.
 
+**Fully automatic version (recommended): the Stop hook.** Sessions should not
+have to remember to arm anything, so `scripts/relay-stop-hook.sh` is installed
+as an async-rewake `Stop` hook in `~/.claude/settings.json`. Every time any
+Claude Code session ends a turn, the hook resolves which relay peer that
+session is (by process ancestry against the registry — no env vars, no
+per-project config), takes a per-label lock, and listens until mail arrives —
+then exits code 2, which makes the harness wake the model with instructions to
+run `relay_receive`. Sessions without a relay bridge exit instantly; the
+listener stands down if its session dies. With this installed, every CC
+session is always reachable while idle, automatically.
+
 ### Send acks are honest
 
 `relay_send` (and the raw `message` protocol) now acks every send with
