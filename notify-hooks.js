@@ -4,6 +4,9 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 
 const EXEC_TIMEOUT_MS = 30000;
+// A nonzero exit sooner than this means the command never really ran
+// (missing binary -> shell exits 127, bad flags, etc).
+const EARLY_EXIT_MS = 5000;
 
 /**
  * Server-side wake hooks, consulted after a message is stored.
@@ -41,6 +44,10 @@ class NotifyHooks {
     // forever (2026-08-05 review finding #4), so suppression always schedules
     // a trailing-edge fire for the newest suppressed context.
     this.pendingTrailing = new Map();
+    // Retry bookkeeping for wakes whose command failed to actually run.
+    this.retryCounts = new Map();
+    this.maxRetries = options.maxRetries === undefined ? 3 : options.maxRetries;
+    this.retryDelayMs = options.retryDelayMs === undefined ? 2000 : options.retryDelayMs;
     this.configCache = { mtimeMs: -1, entries: null };
   }
 
@@ -123,14 +130,50 @@ class NotifyHooks {
       this.pendingTrailing.delete(key);
     }
     try {
-      this.runner(entry, { target: job.target, from: context.from, messageId: context.messageId, delivered });
-      // Committed only AFTER the runner succeeds: a failed spawn must not
-      // start a debounce window that suppresses the retry.
+      this.runner(
+        entry,
+        { target: job.target, from: context.from, messageId: context.messageId, delivered },
+        // Asynchronous outcome. With `shell: true` a missing command spawns
+        // the shell fine and exits 127 later, so synchronous success proves
+        // nothing (review re-check #6): a wake that never really ran must
+        // release its debounce window and retry.
+        outcome => this.handleRunnerOutcome(outcome, key, entry, index, job, context)
+      );
       this.lastFired.set(key, this.now());
       this.logger.info('notify_hook_fired', { target: job.target, kind: entry.type, from: context.from });
     } catch (err) {
+      this.lastFired.delete(key);
       this.logger.warn('notify_hook_failed', { target: job.target, kind: entry.type, error: err.message });
+      this.scheduleRetry(key, entry, index, job, context, 'threw');
     }
+  }
+
+  handleRunnerOutcome(outcome, key, entry, index, job, context) {
+    if (!outcome || outcome.ok !== false) {
+      this.retryCounts.delete(key);
+      return;
+    }
+    this.lastFired.delete(key);
+    this.logger.warn('notify_hook_run_failed', {
+      target: job.target,
+      kind: entry.type,
+      error: outcome.error || null,
+      exitCode: outcome.code === undefined ? null : outcome.code
+    });
+    this.scheduleRetry(key, entry, index, job, context, outcome.error || `exit ${outcome.code}`);
+  }
+
+  scheduleRetry(key, entry, index, job, context, reason) {
+    const attempts = (this.retryCounts.get(key) || 0) + 1;
+    if (attempts > this.maxRetries) {
+      // Permanently broken command: stop retrying, but say so loudly rather
+      // than leaving a wake silently undelivered.
+      this.logger.error('notify_hook_giving_up', { target: job.target, kind: entry.type, attempts, reason });
+      this.retryCounts.delete(key);
+      return;
+    }
+    this.retryCounts.set(key, attempts);
+    this.scheduleTrailing(key, entry, index, job, context, this.retryDelayMs * attempts);
   }
 
   scheduleTrailing(key, entry, index, job, context, delayMs) {
@@ -148,7 +191,7 @@ class NotifyHooks {
     this.logger.info('notify_hook_deferred', { target: job.target, kind: entry.type, delayMs });
   }
 
-  defaultRunner(entry, { target, from, messageId, delivered }) {
+  defaultRunner(entry, { target, from, messageId, delivered }, onOutcome = () => {}) {
     if (entry.type === 'banner') {
       // Values arrive as argv (`on run argv`), never interpolated into the
       // script source: a hostile target/sender name cannot become AppleScript
@@ -161,6 +204,7 @@ class NotifyHooks {
         `New message from ${from}`
       ], { detached: true, stdio: 'ignore' }).unref();
     } else if (entry.type === 'exec' && typeof entry.command === 'string' && entry.command.trim()) {
+      const startedAt = Date.now();
       const child = spawn(entry.command, {
         shell: true,
         detached: true,
@@ -174,8 +218,17 @@ class NotifyHooks {
           RELAY_DELIVERED: delivered ? '1' : '0'
         }
       });
-      child.on('error', err =>
-        this.logger.warn('notify_exec_error', { target, error: err.message }));
+      child.on('error', err => onOutcome({ ok: false, error: err.message }));
+      child.on('exit', code => {
+        // A wake command legitimately runs long (a resumed agent turn). Only
+        // an early nonzero exit means it never really started — that is the
+        // shell-127 case a synchronous check cannot see.
+        if (code !== 0 && Date.now() - startedAt < EARLY_EXIT_MS) {
+          onOutcome({ ok: false, code });
+        } else {
+          onOutcome({ ok: true, code });
+        }
+      });
       child.unref();
     }
   }

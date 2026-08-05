@@ -146,7 +146,9 @@ test('delegate reads and speaks as its base label without ever owning it', async
     meta: { pid: 424242 }
   }));
   const registration = await delegateRegistered;
-  assert.equal(registration.clientId, 'CODEXD~wake-424242');
+  const delegateId = registration.clientId;
+  // Server-minted nonce suffix — never client-supplied text.
+  assert.match(delegateId, /^CODEXD~wake-[0-9a-f]{8}$/);
   assert.equal(registration.delegateOf, 'CODEXD');
 
   // It reads with the base's visibility.
@@ -171,7 +173,7 @@ test('delegate reads and speaks as its base label without ever owning it', async
 
   // Delegate exit does not disturb the base label.
   const delegateLeft = waitForMessage(sender, msg =>
-    msg.type === 'peer_left' && msg.clientId === 'CODEXD~wake-424242');
+    msg.type === 'peer_left' && msg.clientId === delegateId);
   delegate.close();
   await delegateLeft;
   const baseGotThird = nextMessage(base, 'message');
@@ -196,7 +198,7 @@ test('bridge spawned under codex exec self-selects delegate mode (ancestry fallb
   ].join('\n'), { mode: 0o755 });
 
   const joined = waitForMessage(observer, msg =>
-    msg.type === 'peer_joined' && /^CODEXW~wake-\d+$/.test(msg.clientId), 10000);
+    msg.type === 'peer_joined' && /^CODEXW~wake-[0-9a-f]{8}$/.test(msg.clientId), 10000);
   const wrapper = spawn(fakeCodex, ['exec', 'resume', 'fake-session-id'], {
     env: {
       ...process.env,
@@ -313,7 +315,7 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
   t.after(() => observer.close());
 
   const joined = waitForMessage(observer, msg =>
-    msg.type === 'peer_joined' && /^CODEXD~wake-\d+$/.test(msg.clientId), 10000);
+    msg.type === 'peer_joined' && /^CODEXD~wake-[0-9a-f]{8}$/.test(msg.clientId), 10000);
   const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
     `--relay-url=ws://127.0.0.1:${port}`], {
     env: {
@@ -355,7 +357,7 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
   const statusReply = next(msg => msg.id === 2);
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });
   const status = (await statusReply).result.content[0].text;
-  assert.match(status, /CODEXD~wake-\d+/);
+  assert.match(status, /CODEXD~wake-[0-9a-f]{8}/);
   assert.match(status, /delegate of CODEXD/);
 
   // Its relay_send arrives at the peer as the base label.
@@ -451,4 +453,31 @@ test('hostile client IDs and message targets are refused at the boundary', async
   const delegateGot = waitForMessage(delegate, msg => msg.type === 'message');
   good.send(JSON.stringify({ type: 'message', to: delegateId, content: 'direct to delegate' }));
   assert.equal((await delegateGot).content, 'direct to delegate');
+});
+
+test('a delegate connection is immutable: no re-registration under another base', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
+  const port = startServer(t, root);
+
+  // Wait for the server to be listening before opening a raw socket.
+  const observer = await connectWithRetry(port, 'OBS', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const delegate = await open(port);
+  t.after(() => delegate.close());
+  const registered = waitForMessage(delegate, msg => msg.type === 'registered');
+  delegate.send(JSON.stringify({ type: 'register', clientId: 'IMMUT', delegate: true, meta: { pid: 4242 } }));
+  const firstId = (await registered).clientId;
+
+  const refused = waitForMessage(delegate, msg =>
+    msg.type === 'error' && /delegates are immutable/.test(msg.message));
+  delegate.send(JSON.stringify({ type: 'register', clientId: 'OTHERBASE', delegate: true, meta: { pid: 4242 } }));
+  await refused;
+
+  // The original delegate identity is untouched and still the only mapping.
+  const peersMsg = waitForMessage(observer, msg => msg.type === 'peers');
+  observer.send(JSON.stringify({ type: 'get_peers' }));
+  const peerList = (await peersMsg).peers;
+  assert.ok(peerList.includes(firstId));
+  assert.equal(peerList.some(id => id.startsWith('OTHERBASE')), false);
 });

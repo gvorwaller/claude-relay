@@ -81,25 +81,40 @@ fi
 # two simultaneous Stop hooks into double listeners); a lock whose hook or
 # claude process is dead is stale and gets taken over.
 LOCK="${TMPDIR:-/tmp}/claude-relay-stop-hook-${ID}.lock"
+# Unique per-run token: a lock is only ever released by the run that owns it,
+# so a killed predecessor's EXIT trap can never delete its successor's lock
+# (review re-check #9).
+TOKEN="$$-$(date +%s)-${RANDOM}"
+
+release_lock() {
+  local held
+  read -r _ _ held < "$LOCK/owner" 2>/dev/null || return 0
+  [[ "${held:-}" == "$TOKEN" ]] && rm -rf "$LOCK"
+}
+
 acquire_lock() {
   mkdir "$LOCK" 2>/dev/null && return 0
   if [[ -f "$LOCK" ]]; then
     # Migration: pre-mkdir versions used a plain lock file.
     read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK" 2>/dev/null || true
   else
-    read -r LOCK_HOOK LOCK_CLAUDE < "$LOCK/owner" 2>/dev/null || true
+    read -r LOCK_HOOK LOCK_CLAUDE _ < "$LOCK/owner" 2>/dev/null || true
   fi
   if [[ -n "${LOCK_HOOK:-}" && -n "${LOCK_CLAUDE:-}" ]] \
      && kill -0 "$LOCK_HOOK" 2>/dev/null && kill -0 "$LOCK_CLAUDE" 2>/dev/null; then
     return 1 # a live listener for a live session already exists
   fi
+  # Move the stale lock aside atomically before reaping it: the old owner can
+  # then never match its token against the live lock path.
+  local stale="${LOCK}.stale.$$"
+  mv "$LOCK" "$stale" 2>/dev/null || return 1
   [[ -n "${LOCK_HOOK:-}" ]] && kill "$LOCK_HOOK" 2>/dev/null
-  rm -rf "$LOCK"
+  rm -rf "$stale"
   mkdir "$LOCK" 2>/dev/null
 }
 acquire_lock || exit 0
-echo "$$ $CLAUDE_PID" > "$LOCK/owner"
-trap 'rm -rf "$LOCK"' EXIT
+echo "$$ $CLAUDE_PID $TOKEN" > "$LOCK/owner"
+trap release_lock EXIT
 
 # Millisecond precision matters: a whole-second cursor makes the freshly armed
 # watcher see the message this session JUST processed (stored with ms) as

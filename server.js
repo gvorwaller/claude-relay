@@ -10,6 +10,7 @@
  */
 
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
@@ -109,21 +110,24 @@ wss.on('connection', (ws, req) => {
               }));
               return;
             }
-            if (clientId && !ws.delegateOf) {
-              // A primary switching itself to delegate mode would leave its
-              // old label mapped to this socket while authorization changed
-              // underneath it (review finding #10). Fresh connections only.
+            if (clientId) {
+              // A registered connection — primary OR delegate — may never
+              // change identity: switching modes stranded the old mapping,
+              // and delegate→delegate left a stale entry behind (review
+              // finding #10 and its re-check). Delegates are immutable;
+              // fresh connections only.
               ws.send(JSON.stringify({
                 type: 'error',
-                message: `Already registered as "${clientId}"; delegate registration requires a fresh connection`
+                message: ws.delegateOf
+                  ? `This connection is already a delegate of "${ws.delegateOf}"; delegates are immutable`
+                  : `Already registered as "${clientId}"; delegate registration requires a fresh connection`
               }));
               return;
             }
             const delegateBase = String(requestedClientId);
-            const delegatePid = msg.meta && msg.meta.pid ? msg.meta.pid : Date.now().toString(36);
-            const delegateId = `${delegateBase}~wake-${delegatePid}`;
-            const staleDelegate = clients.get(delegateId);
-            if (staleDelegate && staleDelegate !== ws) staleDelegate.terminate();
+            // Suffix is a server-generated nonce: no client-supplied text
+            // (previously meta.pid) may appear in a minted identity.
+            const delegateId = `${delegateBase}~wake-${randomUUID().slice(0, 8)}`;
             clientId = delegateId;
             ws.clientId = delegateId;
             ws.delegateOf = delegateBase;

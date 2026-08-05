@@ -938,6 +938,11 @@ function handleToolCall(requestId, toolName, args) {
       // not CLIENT_ID, not the registry — changes until the server confirms
       // with `registered`. A rejection leaves the old identity fully intact.
       if (connected && ws && ws.readyState === WebSocket.OPEN) {
+        if (pendingRename) {
+          sendToolText(requestId,
+            `A rename to "${pendingRename.newId}" is already awaiting server confirmation; retry once it settles.`);
+          return;
+        }
         pendingRename = {
           requestId,
           oldId,
@@ -945,13 +950,19 @@ function handleToolCall(requestId, toolName, args) {
           newId,
           reclaiming
         };
+        // NEVER infer success from silence (review re-check #7): a late
+        // rejection after an optimistic commit produces local/server
+        // split-brain. Every server acks a register with `registered` or
+        // `register_rejected`; a timeout here means "unknown", so we roll
+        // back and let the operator retry.
         pendingRename.timer = setTimeout(() => {
-          // Old servers never ack registration; they applied the rename the
-          // moment it arrived. Commit optimistically after the grace period.
           if (pendingRename && pendingRename.requestId === requestId) {
-            commitRename(pendingRename, '(no server confirmation — old server? — assumed applied)');
+            sendToolText(requestId,
+              `No response from the relay server for the rename to "${pendingRename.newId}". `
+              + `Nothing was changed — still "${CLIENT_ID}". Check relay_status and retry.`);
+            pendingRename = null;
           }
-        }, 4000);
+        }, 10000);
         registerWithServer(newId);
         break;
       }

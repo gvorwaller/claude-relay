@@ -179,3 +179,51 @@ test('a throwing runner is contained and logged, never propagated', t => {
   assert.equal(fired.length, 0);
   assert.equal(warnings[0].event, 'notify_hook_failed');
 });
+
+test('a command that spawns but exits nonzero early is retried (shell-127 case)', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notify-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configPath = path.join(root, 'notify.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 300 }]
+  }));
+  const attempts = [];
+  const hooks = new NotifyHooks({
+    configPath,
+    retryDelayMs: 60,
+    maxRetries: 2,
+    // Emulate production: the spawn "succeeds" synchronously, the failure
+    // arrives later as a nonzero exit.
+    runner: (entry, context, onOutcome) => {
+      attempts.push(context.messageId);
+      setTimeout(() => onOutcome({ ok: false, code: 127 }), 10);
+    }
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'e1', delivered: false });
+  assert.equal(attempts.length, 1);
+  // Debounce must NOT block the retry, and retries are bounded.
+  await new Promise(resolve => setTimeout(resolve, 500));
+  assert.ok(attempts.length >= 2, `expected a retry after early nonzero exit, got ${attempts.length}`);
+  assert.ok(attempts.length <= 3, `retries must be bounded, got ${attempts.length}`);
+});
+
+test('a long-running command exiting nonzero later is not treated as a failed spawn', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notify-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configPath = path.join(root, 'notify.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 300 }]
+  }));
+  const attempts = [];
+  const hooks = new NotifyHooks({
+    configPath,
+    retryDelayMs: 50,
+    runner: (entry, context, onOutcome) => {
+      attempts.push(context.messageId);
+      setTimeout(() => onOutcome({ ok: true, code: 1 }), 10);
+    }
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'l1', delivered: false });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(attempts.length, 1, 'a real run that later failed must not be retried as a bad spawn');
+});
