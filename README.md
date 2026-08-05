@@ -164,7 +164,12 @@ reads with the label's visibility and its sends arrive from the label, but it
 never owns the label — so the interactive session is never displaced, and the
 delegate's exit changes nothing. Delegate registration is only honored from the
 relay host itself, and a live delegate suppresses further exec wake hooks for
-its label (it *is* the woken instance).
+its label (it *is* the woken instance). The flag reaches Codex bridges via a
+`codex exec -c mcp_servers.claude-relay.env.RELAY_DELEGATE_FOR=<label>` config
+override (Codex gives MCP servers only curated config env — plain shell
+exports never arrive); as a fallback, a bridge that detects a `codex exec`
+process ancestor self-selects delegate mode, so headless one-offs never seize
+a label even without the flag.
 
 **Background forks don't inherit identity.** Forked or background Claude sessions (`--fork-session` subagents, `--bg-pty-host` daemon resumes, scheduled runs) inherit `CLAUDE_RELAY_SESSION_ID`/`RELAY_CLIENT_ID` from the original session's environment. The MCP client detects that ancestry (or an explicit `RELAY_BACKGROUND_FORK=1`) and registers as `<ID>-bg<pid36>` instead of seizing the live session's identity. An explicit `--client-id` argument still wins — that's a deliberate choice by the spawner.
 
@@ -279,10 +284,16 @@ When a message is stored, the server consults optional operator-local config
 - `{ "type": "exec", "command": "...", "debounceSeconds": 300 }` — run a
   command detached with `RELAY_FOR`, `RELAY_FROM`, `RELAY_MESSAGE_ID`,
   `RELAY_DELIVERED` in the environment. This is how a turn-based harness with
-  a headless CLI gets woken, e.g. Codex:
-  `codex exec resume --last 'You have unread relay mail — run relay_receive'`.
+  a headless CLI gets woken. For Codex, use `scripts/wake-codex.sh` (see
+  `notify.json.example`): it resolves the peer's *exact* session — registry
+  pid → parent codex process → the rollout file it holds open, falling back
+  to newest-rollout-matching-cwd — never `--last`, which picks the wrong
+  session as soon as several Codex instances run concurrently. The resumed
+  run's bridge registers as a delegate (see "Delegates" above), so the
+  interactive session that owns the label is never displaced.
 - `"onlyIfUndelivered": true` — fire only when the target socket was not live
-  at store time.
+  at store time. A live delegate for the target also suppresses exec entries
+  (it *is* the woken instance; double-spawning would fight it).
 
 Edits to `notify.json` are picked up without a restart. Hook failures are
 logged and never affect message handling. The config is deliberately not a
