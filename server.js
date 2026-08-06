@@ -707,11 +707,15 @@ wss.on('connection', (ws, req) => {
           // What did my delegates do while I was away? Owner-scoped: a
           // session sees only its own jobs, and a delegate may not ask at
           // all (it would be reporting on itself).
-          if (!clientId || ws.delegateJob) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Register as a primary session to read receipts' }));
+          const readOwner = resolveReceiptOwner(ws, req, msg);
+          if (!readOwner) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Reading receipts requires a registered primary session, or a local connection presenting the owner capability'
+            }));
             return;
           }
-          const pending = jobStore.pending(clientId).map(job => ({
+          const pending = jobStore.pending(readOwner).map(job => ({
             jobId: job.jobId,
             inboundMessageId: job.inboundMessageId,
             from: job.from,
@@ -738,8 +742,12 @@ wss.on('connection', (ws, req) => {
 
         case 'ack_receipts': {
           // The owning session states it has reported these to the human.
-          if (!clientId || ws.delegateJob) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Register as a primary session to acknowledge receipts' }));
+          const ackOwner = resolveReceiptOwner(ws, req, msg);
+          if (!ackOwner) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Acknowledging receipts requires a registered primary session, or a local connection presenting the owner capability'
+            }));
             return;
           }
           const requested = [...new Set(
@@ -751,11 +759,11 @@ wss.on('connection', (ws, req) => {
           // Only this owner's jobs may be marked, whatever ids were sent.
           const own = requested.filter(id => {
             const job = jobStore.get(id);
-            return job && job.owner === clientId;
+            return job && job.owner === ackOwner;
           });
           const marked = jobStore.markReported(own, turnId);
           ws.send(JSON.stringify({ type: 'receipts_acked', jobIds: marked }));
-          logger.info('receipts_reported', { clientId, count: marked.length, turnId });
+          logger.info('receipts_reported', { owner: ackOwner, count: marked.length, turnId });
           break;
         }
 
@@ -939,6 +947,22 @@ const retentionInterval = setInterval(() => {
   logger.prune();
 }, 60 * 60 * 1000);
 wss.on('close', () => clearInterval(retentionInterval));
+
+/**
+ * Who may read/acknowledge a label's receipts:
+ *   - the registered primary session itself (never a delegate: it would be
+ *     reporting on its own work), or
+ *   - a local process presenting that label's owner capability, which is how
+ *     the session's own hooks query without registering a second label or
+ *     contesting the live one.
+ */
+function resolveReceiptOwner(ws, req, msg) {
+  if (ws.delegateJob) return null;
+  if (ws.clientId) return ws.clientId;
+  const owner = typeof msg.owner === 'string' ? msg.owner : null;
+  if (!owner || !isLoopback(req.socket.remoteAddress)) return null;
+  return capabilities.verifyOwner(owner, msg.ownerSecret) ? owner : null;
+}
 
 function isLoopback(address) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';

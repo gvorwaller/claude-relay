@@ -783,7 +783,7 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
 
   // A delegate may not read or acknowledge receipts (it would report on itself).
   const refused = waitForMessage(delegate, msg =>
-    msg.type === 'error' && /primary session to read receipts/.test(msg.message));
+    msg.type === 'error' && /Reading receipts requires a registered primary session/.test(msg.message));
   delegate.send(JSON.stringify({ type: 'get_receipts' }));
   await refused;
 
