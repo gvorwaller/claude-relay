@@ -183,12 +183,13 @@ class CapabilityStore {
    * delegate may do; `spawnPid` is filled in after the wake process starts so
    * registration can require the connection to come from that process tree.
    */
-  mintJob({ owner, messageId, replyTo }) {
+  mintJob({ owner, messageId, replyTo, jobId }) {
     this.pruneJobs();
     const token = randomBytes(32).toString('base64url');
     const key = sha256(token);
     const job = {
       owner,
+      jobId: jobId || null,
       messageId: messageId || null,
       replyTo: replyTo || null,
       generation: this.ownerGeneration(owner),

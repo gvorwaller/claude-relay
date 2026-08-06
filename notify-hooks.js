@@ -40,6 +40,8 @@ class NotifyHooks {
     this.logger = options.logger || { info() {}, warn() {}, error() {} };
     // Mints the single-use job capability each delegated wake must present.
     this.capabilities = options.capabilities || null;
+    // Durable record of every delegated wake (accountability layer).
+    this.jobStore = options.jobStore || null;
     this.runner = options.runner || this.defaultRunner.bind(this);
     this.now = options.now || (() => Date.now());
     // Debounce state per config entry: `${configKey}:${entryIndex}` -> last-fired ms
@@ -216,12 +218,19 @@ class NotifyHooks {
       // failure, do not spawn and report failure so the retry path runs.
       let tokenFile = null;
       let jobKey = null;
+      let jobRecord = null;
       if (this.capabilities && target !== 'all') {
         try {
+          // The job record exists BEFORE the wake is spawned, so a process
+          // that dies immediately still leaves an auditable trace.
+          if (this.jobStore) {
+            jobRecord = this.jobStore.create({ owner: target, inboundMessageId: messageId, from });
+          }
           const { token, key } = this.capabilities.mintJob({
             owner: target,
             messageId,
-            replyTo: from
+            replyTo: from,
+            jobId: jobRecord ? jobRecord.jobId : null
           });
           jobKey = key;
           tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
@@ -253,11 +262,24 @@ class NotifyHooks {
       // Bind the capability to this process tree: registration later requires
       // the connecting bridge to be a descendant of the wake we started.
       if (jobKey && child.pid) this.capabilities.setJobSpawnPid(jobKey, child.pid);
+      if (jobRecord && this.jobStore) {
+        this.jobStore.transition(jobRecord.jobId, 'spawned', { spawnPid: child.pid || null });
+      }
       // 'error' and 'exit' can both fire; the outcome must be reported once.
       let settled = false;
       const settle = outcome => {
         if (settled) return;
         settled = true;
+        if (jobRecord && this.jobStore) {
+          // Terminal state from the wake process itself. A nonzero exit or a
+          // spawn error is a FAILED job, and failures must surface exactly
+          // like successes.
+          this.jobStore.transition(
+            jobRecord.jobId,
+            outcome.ok ? 'completed' : 'failed',
+            { exitCode: outcome.code === undefined ? null : outcome.code }
+          );
+        }
         if (!outcome.ok) {
           // A wake that never really ran must leave nothing usable behind:
           // its capability is revoked and its handoff file removed, so a

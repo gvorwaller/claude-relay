@@ -17,6 +17,7 @@ const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
 const { NotifyHooks } = require('./notify-hooks');
 const { CapabilityStore } = require('./capabilities');
+const { DelegateJobStore } = require('./delegate-job-store');
 
 const PORT = parseInt(process.argv[2] || process.env.RELAY_PORT || '9999', 10);
 const MESSAGE_RETENTION_DAYS = parseInt(process.env.RELAY_MESSAGE_RETENTION_DAYS || '7', 10);
@@ -60,10 +61,18 @@ const REQUIRE_OWNER_CAPABILITY = process.env.RELAY_REQUIRE_OWNER_CAPABILITY === 
 // ancestry is unavailable (some sandboxes) or for synthetic test delegates.
 const BIND_DELEGATE_ANCESTRY = process.env.RELAY_BIND_DELEGATE_ANCESTRY !== '0';
 
+const jobStore = new DelegateJobStore({
+  dataDir: process.env.RELAY_MESSAGE_DIR
+    ? path.join(path.dirname(process.env.RELAY_MESSAGE_DIR), 'jobs')
+    : path.join(__dirname, 'data', 'jobs'),
+  logger
+}).initialize();
+
 const notifyHooks = new NotifyHooks({
   configPath: process.env.RELAY_NOTIFY_CONFIG || path.join(__dirname, 'data', 'notify.json'),
   logger,
-  capabilities
+  capabilities,
+  jobStore
 });
 
 // Connected clients: Map<clientId, WebSocket>
@@ -227,6 +236,9 @@ wss.on('connection', (ws, req) => {
             // Least authority: the delegate may read only mail from its
             // inbound message onward, never the label's full history.
             ws.delegateJob = job;
+            if (job.jobId) {
+              jobStore.transition(job.jobId, 'running', { delegateId, spawnPid: job.spawnPid });
+            }
             // Bounded lease: a consumed token must not grant an indefinite
             // session. The socket is closed when the job's session window
             // ends, whatever the delegate is doing.
@@ -546,6 +558,13 @@ wss.on('connection', (ws, req) => {
             to,
             delivered
           }));
+          if (ws.delegateJob && ws.delegateJob.jobId) {
+            jobStore.recordOutbound(ws.delegateJob.jobId, {
+              to,
+              messageId: envelope.id,
+              delivered
+            });
+          }
           logger.info('message_recorded', {
             messageId: envelope.id,
             from: fromId,
@@ -606,6 +625,48 @@ wss.on('connection', (ws, req) => {
             }
           }
           break;
+
+        case 'get_receipts': {
+          // What did my delegates do while I was away? Owner-scoped: a
+          // session sees only its own jobs, and a delegate may not ask at
+          // all (it would be reporting on itself).
+          if (!clientId || ws.delegateJob) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register as a primary session to read receipts' }));
+            return;
+          }
+          const pending = jobStore.pending(clientId).map(job => ({
+            jobId: job.jobId,
+            status: job.status,
+            from: job.from,
+            requestedAt: job.requestedAt,
+            completedAt: job.completedAt,
+            exitCode: job.exitCode,
+            summary: job.summary,
+            // Server-attested: what this delegate actually sent, and whether
+            // it was delivered live or queued.
+            outbound: job.outbound
+          }));
+          ws.send(JSON.stringify({ type: 'receipts', receipts: pending }));
+          break;
+        }
+
+        case 'ack_receipts': {
+          // The owning session states it has reported these to the human.
+          if (!clientId || ws.delegateJob) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register as a primary session to acknowledge receipts' }));
+            return;
+          }
+          const requested = Array.isArray(msg.jobIds) ? msg.jobIds : [];
+          // Only this owner's jobs may be marked, whatever ids were sent.
+          const own = requested.filter(id => {
+            const job = jobStore.get(id);
+            return job && job.owner === clientId;
+          });
+          const marked = jobStore.markReported(own, msg.turnId);
+          ws.send(JSON.stringify({ type: 'receipts_acked', jobIds: marked }));
+          logger.info('receipts_reported', { clientId, count: marked.length, turnId: msg.turnId || null });
+          break;
+        }
 
         case 'ack_enrollment': {
           // Phase 2 of enrollment: the client proves it durably holds the

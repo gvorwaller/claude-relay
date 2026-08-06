@@ -731,3 +731,57 @@ test('a delegate may only reply to the peer that woke it', async t => {
   delegate.send(JSON.stringify({ type: 'message', to: 'all', content: 'should not broadcast' }));
   await refusedBroadcast;
 });
+
+test('a delegate wake produces a server-attested receipt for its owner', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-receipt-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, {
+    RELAY_NOTIFY_CONFIG: configPath,
+    RELAY_BIND_DELEGATE_ANCESTRY: '0'
+  });
+
+  const waker = await connectWithRetry(port, 'RCPWAKER', { pid: process.pid });
+  const owner = await connect(port, 'RCPOWNER', { pid: process.pid });
+  t.after(() => [waker, owner].forEach(ws => ws.close()));
+
+  const token = await mintJobToken(outDir, waker, 'RCPOWNER');
+  const delegate = await open(port);
+  t.after(() => delegate.close());
+  const registered = waitForMessage(delegate, msg => msg.type === 'registered');
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'RCPOWNER', delegate: true, jobToken: token, meta: { pid: process.pid }
+  }));
+  const delegateId = (await registered).clientId;
+
+  // The delegate replies to the peer that woke it.
+  const wakerGot = nextMessage(waker, 'message');
+  delegate.send(JSON.stringify({ type: 'message', to: 'RCPWAKER', content: 'work done' }));
+  const relayed = await wakerGot;
+
+  // The OWNER can now see what its delegate did — from server evidence.
+  const receipts = waitForMessage(owner, msg => msg.type === 'receipts');
+  owner.send(JSON.stringify({ type: 'get_receipts' }));
+  const list = (await receipts).receipts;
+  assert.equal(list.length >= 1, true, 'the wake produced a receipt');
+  const receipt = list.find(r => r.outbound.some(o => o.messageId === relayed.id));
+  assert.ok(receipt, 'the receipt records the actual send');
+  assert.equal(receipt.from, 'RCPWAKER');
+  assert.equal(receipt.outbound[0].to, 'RCPWAKER');
+  assert.equal(receipt.outbound[0].delivered, true);
+
+  // A delegate may not read or acknowledge receipts (it would report on itself).
+  const refused = waitForMessage(delegate, msg =>
+    msg.type === 'error' && /primary session to read receipts/.test(msg.message));
+  delegate.send(JSON.stringify({ type: 'get_receipts' }));
+  await refused;
+
+  // Acknowledging clears it; a second read shows nothing pending.
+  const acked = waitForMessage(owner, msg => msg.type === 'receipts_acked');
+  owner.send(JSON.stringify({ type: 'ack_receipts', jobIds: [receipt.jobId], turnId: 'turn-1' }));
+  assert.deepEqual((await acked).jobIds, [receipt.jobId]);
+
+  const after = waitForMessage(owner, msg => msg.type === 'receipts');
+  owner.send(JSON.stringify({ type: 'get_receipts' }));
+  assert.equal((await after).receipts.some(r => r.jobId === receipt.jobId), false);
+  assert.ok(delegateId.startsWith('RCPOWNER~wake-'));
+});
