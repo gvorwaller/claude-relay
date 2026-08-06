@@ -188,7 +188,7 @@ test('relay_rename corrects a live MCP session identity without restart', async 
   assert.match(waited.result.content[0].text, /OBSERVER: review request/);
 });
 
-test('a label owned by a verified-live pid cannot be stolen; it frees on owner death', async t => {
+test('a live label cannot be stolen; it frees when its holder dies', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-displace-'));
   const port = startServer(t, root);
 
@@ -224,8 +224,7 @@ test('a label owned by a verified-live pid cannot be stolen; it frees on owner d
     meta: { pid: process.pid }
   }));
   const rejection = await rejected;
-  assert.match(rejection.reason, /pid-anchored/);
-  assert.ok(rejection.holderPid > 0);
+  assert.match(rejection.reason, /answered a liveness probe/);
 
   // The owner never noticed: still connected under its label.
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'relay_status', arguments: {} } });

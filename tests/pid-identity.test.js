@@ -110,49 +110,46 @@ async function mintJobToken(outDir, sender, base) {
   throw new Error(`job capability never appeared for ${base}`);
 }
 
-test('orphaned label (dead pid, socket still open) is reassigned to a newcomer', async t => {
+
+
+test('a responsive holder is never evicted, even by a claimant quoting its pid', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
   const port = startServer(t, root);
 
-  const stalePid = await deadPid();
-  const holder = await connectWithRetry(port, 'ORPH', { pid: stalePid });
-  // Arm the close listener BEFORE the contest: the server terminates the
-  // stale holder while the newcomer's registration is still in flight.
-  const holderClosed = new Promise(resolve => holder.once('close', resolve));
-  const newcomer = await connect(port, 'ORPH', { pid: process.pid });
-  t.after(() => [holder, newcomer].forEach(ws => ws.close()));
+  const holder = await connectWithRetry(port, 'SEAT', { pid: process.pid });
+  t.after(() => holder.close());
 
-  // The stale holder's socket is terminated; the newcomer owns the label.
-  await holderClosed;
-  const pong = nextMessage(newcomer, 'pong');
-  newcomer.send(JSON.stringify({ type: 'ping' }));
+  // Forging the holder's pid used to be enough to be "reseated". The server
+  // now asks the holder itself, so the assertion is worthless.
+  const claimant = await open(port);
+  t.after(() => claimant.close());
+  const rejected = waitForMessage(claimant, msg => msg.type === 'register_rejected', 6000);
+  claimant.send(JSON.stringify({ type: 'register', clientId: 'SEAT', meta: { pid: process.pid } }));
+  assert.match((await rejected).reason, /answered a liveness probe/);
+
+  // The holder is undisturbed.
+  const pong = nextMessage(holder, 'pong');
+  holder.send(JSON.stringify({ type: 'ping' }));
   await pong;
 });
 
-test('same pid re-registering reseats without rejection', async t => {
+test('an unresponsive holder is reclaimed (legitimate reconnect after a drop)', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
   const port = startServer(t, root);
 
-  const first = await connectWithRetry(port, 'SEAT', { pid: process.pid });
-  const firstClosed = new Promise(resolve => first.once('close', resolve));
-  const second = await connect(port, 'SEAT', { pid: process.pid });
-  t.after(() => [first, second].forEach(ws => ws.close()));
-  await firstClosed;
-  const pong = nextMessage(second, 'pong');
-  second.send(JSON.stringify({ type: 'ping' }));
-  await pong;
-});
+  const holder = await connectWithRetry(port, 'DEADSOCK', { pid: process.pid });
+  t.after(() => holder.close());
+  // Simulate a corpse: the socket is still open server-side but the client
+  // will never answer a probe again.
+  holder.pong = () => {};
+  holder._receiver.removeAllListeners('ping');
+  holder.pause();
 
-test('pid-less holder keeps legacy newest-wins takeover (remote/old-client path)', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
-  const port = startServer(t, root);
-
-  const holder = await connectWithRetry(port, 'LEGACY');
-  const displacedNotice = waitForMessage(holder, msg =>
-    msg.type === 'error' && /re-registered by a newer connection/.test(msg.message));
-  const usurper = await connect(port, 'LEGACY');
-  t.after(() => [holder, usurper].forEach(ws => ws.close()));
-  await displacedNotice;
+  const reconnect = await open(port);
+  t.after(() => reconnect.close());
+  const registered = waitForMessage(reconnect, msg => msg.type === 'registered', 8000);
+  reconnect.send(JSON.stringify({ type: 'register', clientId: 'DEADSOCK', meta: { pid: process.pid } }));
+  assert.equal((await registered).clientId, 'DEADSOCK');
 });
 
 test('delegate reads and speaks as its base label without ever owning it', async t => {
@@ -647,7 +644,7 @@ test('an owner capability never evicts a live holder', async t => {
   duplicate.send(JSON.stringify({
     type: 'register', clientId: 'LIVEOWN', ownerSecret: secret, meta: { pid: 999999 }
   }));
-  assert.match((await rejected).reason, /pid-anchored/);
+  assert.match((await rejected).reason, /answered a liveness probe/);
 
   // The holder never noticed.
   const pong = nextMessage(holder, 'pong');

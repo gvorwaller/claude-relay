@@ -83,6 +83,9 @@ const watchers = new Map();
 // deliberately excluded: it is reserved for server-minted delegate IDs, so a
 // client can never register a name that impersonates one.
 const CLIENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+// "all" is the broadcast target; a client owning that name would let its
+// delegate's reply scope become a broadcast permit (re-check #5).
+const RESERVED_CLIENT_IDS = new Set(['all']);
 
 const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
 
@@ -99,7 +102,7 @@ wss.on('connection', (ws, req) => {
 
   logger.info('connection_opened', { remoteAddress: req.socket.remoteAddress });
 
-  ws.on('message', (data) => {
+  ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
 
@@ -110,6 +113,14 @@ wss.on('connection', (ws, req) => {
           // on that one shared label and displace the others. A client must
           // name itself, validly.
           const requestedClientId = typeof msg.clientId === 'string' ? msg.clientId : '';
+          if (RESERVED_CLIENT_IDS.has(requestedClientId.toLowerCase())) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `"${requestedClientId}" is a reserved name and cannot be a client ID`
+            }));
+            logger.warn('register_reserved_client_id', { requestedClientId });
+            return;
+          }
           if (!CLIENT_ID_PATTERN.test(requestedClientId)) {
             ws.send(JSON.stringify({
               type: 'error',
@@ -152,35 +163,33 @@ wss.on('connection', (ws, req) => {
             // mail, and suppress its wakes. A delegate must present the
             // single-use capability the notify path minted when it spawned
             // the wake.
-            const job = capabilities.consumeJob(msg.jobToken, delegateBase);
-            if (!job) {
+            // Authorize-and-consume atomically: a failed attempt must NOT
+            // spend the capability, or a thief could deny the real delegate
+            // by trying once (re-check #2). Every factor is checked first.
+            const claimantPid = msg.meta && Number(msg.meta.pid);
+            const authorized = capabilities.authorizeJob(msg.jobToken, delegateBase, jobRecord => {
+              if (!BIND_DELEGATE_ANCESTRY) return true;
+              // Fail closed when the binding cannot be evaluated: a wake with
+              // no recorded pid must not silently downgrade to bearer-only.
+              if (!jobRecord.spawnPid) return false;
+              return isDescendantOf(claimantPid, jobRecord.spawnPid);
+            });
+            if (!authorized.ok) {
               ws.send(JSON.stringify({
                 type: 'error',
-                message: 'Delegate registration requires a valid, unexpired job capability'
+                message: authorized.reason === 'verification-failed'
+                  ? 'Delegate registration must come from the spawned wake process tree'
+                  : 'Delegate registration requires a valid, unexpired job capability'
               }));
               logger.warn('delegate_capability_rejected', {
                 delegateOf: delegateBase,
+                reason: authorized.reason,
+                claimantPid: claimantPid || null,
                 remoteAddress: req.socket.remoteAddress
               });
               return;
             }
-            // Second factor: the connection must come from the process tree
-            // this server actually spawned. A same-user attacker who steals
-            // the bearer file still cannot register, because it is not a
-            // descendant of the wake we started.
-            const claimantPid = msg.meta && Number(msg.meta.pid);
-            if (BIND_DELEGATE_ANCESTRY && job.spawnPid && !isDescendantOf(claimantPid, job.spawnPid)) {
-              ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Delegate registration must come from the spawned wake process tree'
-              }));
-              logger.warn('delegate_ancestry_rejected', {
-                delegateOf: delegateBase,
-                claimantPid: claimantPid || null,
-                spawnPid: job.spawnPid
-              });
-              return;
-            }
+            const job = authorized.job;
             // Suffix is a server-generated nonce: no client-supplied text
             // (previously meta.pid) may appear in a minted identity.
             const delegateId = `${delegateBase}~wake-${randomUUID().slice(0, 8)}`;
@@ -307,67 +316,40 @@ wss.on('connection', (ws, req) => {
 
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
-            // Pid-anchored ownership (2026-08-05): a label belongs to the
-            // process that registered it, for that process's lifetime. The
-            // old newest-wins takeover guessed which claimant was real; when
-            // the holder is local its pid makes that checkable, so we check
-            // instead of guessing:
-            //   - same pid re-registering        -> reseat (reconnect)
-            //   - holder pid dead                -> label was orphaned; reassign
-            //   - holder pid verifiably alive    -> REJECT the newcomer
-            //   - holder remote / pid unknown    -> legacy newest-wins
-            // The capability and the pid answer DIFFERENT questions, and both
-            // must pass: the capability gates "may this connection claim the
-            // label at all" (above), while the pid contest decides "is a live
-            // process already using it". A capability must never evict a
-            // running session — two processes holding the same owner secret
-            // means the newcomer is a duplicate, not the true owner. It does
-            // authorize taking over a holder whose liveness is unverifiable
-            // (remote), which is the case pid rules cannot decide.
-            const contest = contestLabel(requestedClientId, existingClient, msg.meta);
-            const verdict = contest.action === 'takeover' && !ownerProven && REQUIRE_OWNER_CAPABILITY
-              ? { action: 'reject', holderPid: contest.holderPid }
-              : contest;
-            if (verdict.action === 'reject') {
-              logger.warn('register_rejected_label_owned', {
+            // The label's socket is open. Ask the SERVER's own question —
+            // "is that connection actually alive?" — instead of believing
+            // the claimant's asserted pid, which is forgeable and was the
+            // hole in every previous version of this contest.
+            const holderAlive = await probeHolder(existingClient);
+            if (holderAlive) {
+              const holderPid = (clientMeta.get(requestedClientId) || {}).pid || null;
+              logger.warn('register_rejected_label_in_use', {
                 clientId: requestedClientId,
-                holderPid: verdict.holderPid,
+                holderPid,
                 newRemoteAddress: req.socket.remoteAddress
               });
               ws.send(JSON.stringify({
                 type: 'register_rejected',
                 clientId: requestedClientId,
-                holderPid: verdict.holderPid,
-                reason: `"${requestedClientId}" is owned by live pid ${verdict.holderPid} on the relay host. `
-                  + 'Labels are pid-anchored: stop that process, or register under a different ID '
-                  + '(or as its delegate).'
+                holderPid,
+                reason: `"${requestedClientId}" is held by a live connection that answered a liveness probe. `
+                  + 'Labels are pid-anchored: stop that session, or register under a different ID '
+                  + '(or as its delegate). The label frees itself as soon as that connection drops.'
               }));
               return;
             }
-            if (verdict.action === 'takeover') {
-              // Liveness unverifiable (remote holder or no reported pid):
-              // keep the newest-wins behavior this path was built for.
-              const now = Date.now();
-              if (now - (duplicateLogTimes.get(requestedClientId) || 0) >= 60000) {
-                logger.warn('duplicate_client_takeover', {
-                  clientId: requestedClientId,
-                  displacedRemoteAddress: existingClient._socket?.remoteAddress || null,
-                  newRemoteAddress: req.socket.remoteAddress
-                });
-                duplicateLogTimes.set(requestedClientId, now);
-              }
-              try {
-                existingClient.send(JSON.stringify({
-                  type: 'error',
-                  message: `Client ID ${requestedClientId} was re-registered by a newer connection; this connection is being closed`
-                }));
-              } catch (_) { /* displaced socket may already be unwritable */ }
-            } else {
-              logger.info(verdict.action === 'reseat' ? 'label_reseated_same_pid' : 'orphaned_label_reclaimed', {
-                clientId: requestedClientId,
-                holderPid: verdict.holderPid
-              });
-            }
+            // No answer: the holder is a corpse (crash, sleep, network drop).
+            // Reclaiming it is exactly the legitimate-reconnect case.
+            logger.info('unresponsive_holder_reclaimed', {
+              clientId: requestedClientId,
+              newRemoteAddress: req.socket.remoteAddress
+            });
+            try {
+              existingClient.send(JSON.stringify({
+                type: 'error',
+                message: `Client ID ${requestedClientId} was reclaimed after this connection failed a liveness probe`
+              }));
+            } catch (_) { /* corpse may be unwritable */ }
             existingClient.displacedByTakeover = true;
             existingClient.terminate();
           }
@@ -438,7 +420,7 @@ wss.on('connection', (ws, req) => {
           // broadcast (review re-check #2).
           if (ws.delegateJob) {
             const allowed = ws.delegateJob.replyTo;
-            if (!allowed || to !== allowed) {
+            if (to === 'all' || !allowed || allowed === 'all' || to !== allowed) {
               ws.send(JSON.stringify({
                 type: 'error',
                 message: allowed
@@ -667,6 +649,10 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    if (ws.delegateLease) {
+      clearTimeout(ws.delegateLease);
+      ws.delegateLease = null;
+    }
     removeWatcher(ws);
     if (clientId) {
       const wasLiveClient = clients.get(clientId) === ws;
@@ -741,30 +727,40 @@ function isDescendantOf(pid, ancestorPid) {
   return false;
 }
 
-// true = alive, false = dead, null = unknowable from this process
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    if (err.code === 'EPERM') return true;
-    if (err.code === 'ESRCH') return false;
-    return null;
-  }
-}
-
-function contestLabel(labelId, holder, newMeta) {
-  const holderMeta = clientMeta.get(labelId) || {};
-  const holderPid = Number(holderMeta.pid) || null;
-  const newPid = newMeta && Number(newMeta.pid) ? Number(newMeta.pid) : null;
-  if (holderPid && newPid && holderPid === newPid) return { action: 'reseat', holderPid };
-  const holderLocal = isLoopback(holder._socket && holder._socket.remoteAddress);
-  if (holderLocal && holderPid) {
-    const alive = pidAlive(holderPid);
-    if (alive === true) return { action: 'reject', holderPid };
-    if (alive === false) return { action: 'orphan', holderPid };
-  }
-  return { action: 'takeover', holderPid };
+/**
+ * Decide a contest for a label whose socket is currently open.
+ *
+ * The old rules trusted the CLAIMANT's asserted pid ("same pid, so it must be
+ * me reconnecting"), which is forgeable — the exact error that made pid
+ * anchoring bypassable (review finding #2 and its re-checks). The server now
+ * relies only on what IT can observe:
+ *
+ *   - the holder answers a liveness probe  -> the label is in use: REJECT,
+ *     no matter what the claimant asserts or presents.
+ *   - the holder does not answer           -> the socket is a corpse: the
+ *     claimant may take it, provided it passed the capability gate.
+ *
+ * A pid is recorded for diagnostics only and never decides the outcome.
+ */
+function probeHolder(holder, timeoutMs = 2000) {
+  return new Promise(resolve => {
+    if (!holder || holder.readyState !== 1) return resolve(false);
+    let settled = false;
+    const done = alive => {
+      if (settled) return;
+      settled = true;
+      holder.off('pong', onPong);
+      resolve(alive);
+    };
+    const onPong = () => done(true);
+    holder.on('pong', onPong);
+    try {
+      holder.ping();
+    } catch {
+      return done(false);
+    }
+    setTimeout(() => done(false), timeoutMs).unref();
+  });
 }
 
 function broadcast(message, excludeClient = null) {

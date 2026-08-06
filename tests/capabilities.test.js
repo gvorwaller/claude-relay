@@ -36,7 +36,7 @@ test('rotation invalidates the old secret and every derived job capability', t =
 
   assert.equal(caps.verifyOwner('CODEX9', first), false, 'old secret revoked');
   assert.ok(caps.verifyOwner('CODEX9', second));
-  assert.equal(caps.consumeJob(job.token, 'CODEX9'), null, 'derived job revoked by rotation');
+  assert.equal(caps.authorizeJob(job.token, 'CODEX9').job || null, null, 'derived job revoked by rotation');
   assert.equal(caps.ownerGeneration('CODEX9'), 2);
 });
 
@@ -46,19 +46,21 @@ test('job capability is single-use, owner-bound, and expiring', t => {
   caps.mintOwner('CODEX9');
 
   const job = caps.mintJob({ owner: 'CODEX9', messageId: 'm7' });
-  assert.equal(caps.consumeJob(job.token, 'OTHER'), null, 'owner-bound');
+  assert.equal(caps.authorizeJob(job.token, 'OTHER').ok, false, 'owner-bound');
+  // An owner mismatch must not spend it either.
+  assert.equal(caps.authorizeJob(job.token, 'CODEX9').ok, true, 'survives a wrong-owner attempt');
 
   const fresh = caps.mintJob({ owner: 'CODEX9', messageId: 'm8' });
-  const consumed = caps.consumeJob(fresh.token, 'CODEX9');
+  const consumed = caps.authorizeJob(fresh.token, 'CODEX9').job || null;
   assert.equal(consumed.messageId, 'm8');
-  assert.equal(caps.consumeJob(fresh.token, 'CODEX9'), null, 'single use');
+  assert.equal(caps.authorizeJob(fresh.token, 'CODEX9').job || null, null, 'single use');
 
   const expiring = caps.mintJob({ owner: 'CODEX9', messageId: 'm9' });
   clock += 5000;
-  assert.equal(caps.consumeJob(expiring.token, 'CODEX9'), null, 'expired');
+  assert.equal(caps.authorizeJob(expiring.token, 'CODEX9').job || null, null, 'expired');
 
-  assert.equal(caps.consumeJob('not-a-token', 'CODEX9'), null);
-  assert.equal(caps.consumeJob(undefined, 'CODEX9'), null);
+  assert.equal(caps.authorizeJob('not-a-token', 'CODEX9').job || null, null);
+  assert.equal(caps.authorizeJob(undefined, 'CODEX9').job || null, null);
 });
 
 test('corrupt or unreadable capability state fails closed, never empty', t => {
@@ -110,12 +112,32 @@ test('job capability carries reply scope, spawn binding, and a session lease', t
   assert.equal(job.replyTo, 'CC6');
   assert.ok(job.sessionExpiresAt > job.expiresAt, 'session lease outlives the consume window');
   caps.setJobSpawnPid(key, 4242);
-  const consumed = caps.consumeJob(token, 'CODEXJ');
+  const consumed = caps.authorizeJob(token, 'CODEXJ').job;
   assert.equal(consumed.spawnPid, 4242);
   assert.equal(consumed.replyTo, 'CC6');
 
   // Revocation before consumption.
   const second = caps.mintJob({ owner: 'CODEXJ', messageId: 'm2', replyTo: 'CC6' });
   caps.revokeJobByKey(second.key);
-  assert.equal(caps.consumeJob(second.token, 'CODEXJ'), null);
+  assert.equal(caps.authorizeJob(second.token, 'CODEXJ').job || null, null);
+});
+
+test('a failed authorization does not burn the capability', t => {
+  const { store: caps } = store(t);
+  caps.mintOwner('CODEXB');
+  const { token } = caps.mintJob({ owner: 'CODEXB', messageId: 'm1', replyTo: 'CC6' });
+
+  // A thief fails the extra verification (e.g. wrong process tree)...
+  const attacked = caps.authorizeJob(token, 'CODEXB', () => false);
+  assert.equal(attacked.ok, false);
+  assert.equal(attacked.reason, 'verification-failed');
+
+  // ...and the real delegate can still use it. Burning it here would let an
+  // attacker deny the wake with a single failed attempt.
+  const real = caps.authorizeJob(token, 'CODEXB', () => true);
+  assert.equal(real.ok, true);
+  assert.equal(real.job.replyTo, 'CC6');
+
+  // Now it is spent.
+  assert.equal(caps.authorizeJob(token, 'CODEXB').ok, false);
 });

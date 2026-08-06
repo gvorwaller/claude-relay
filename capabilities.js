@@ -67,11 +67,19 @@ class CapabilityStore {
     // as already-enrolled via the prototype chain.
     const owners = Object.create(null);
     for (const [label, record] of Object.entries(parsed)) {
-      if (!record || typeof record !== 'object'
-        || typeof record.hash !== 'string' || !/^[0-9a-f]{64}$/.test(record.hash)) {
+      const invalid = !record
+        || typeof record !== 'object'
+        || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(label)
+        || typeof record.hash !== 'string' || !/^[0-9a-f]{64}$/.test(record.hash)
+        || !Number.isInteger(record.generation) || record.generation < 1
+        || (record.acknowledged !== undefined && typeof record.acknowledged !== 'boolean')
+        || (record.createdAt !== undefined
+          && (typeof record.createdAt !== 'string' || Number.isNaN(Date.parse(record.createdAt))))
+        || (record.host !== undefined && record.host !== null && typeof record.host !== 'string');
+      if (invalid) {
         throw new Error(`Owner capability store has an invalid record for "${label}": ${this.filePath}`);
       }
-      owners[label] = record;
+      owners[label] = { acknowledged: false, ...record };
     }
     return owners;
   }
@@ -176,18 +184,32 @@ class CapabilityStore {
     this.jobs.delete(key);
   }
 
-  /** Atomically consume a job token. Returns the job, or null if invalid. */
-  consumeJob(token, owner) {
+  /**
+   * Authorize AND consume in one step. Every factor is checked before the
+   * token is spent: a failed attempt (wrong owner, expired, failing the
+   * caller's extra check) must not burn the capability, or an attacker could
+   * deny the real delegate simply by trying once (re-check #2).
+   *
+   * `verify` receives the job and returns true to accept.
+   */
+  authorizeJob(token, owner, verify = () => true) {
     this.pruneJobs();
-    if (typeof token !== 'string' || !token) return null;
+    if (typeof token !== 'string' || !token) return { ok: false, reason: 'missing' };
     const key = sha256(token);
     const job = this.jobs.get(key);
-    if (!job) return null;
-    this.jobs.delete(key); // single use, consumed even if it fails below
-    if (job.owner !== owner) return null;
-    if (job.expiresAt <= this.now()) return null;
-    if (job.generation !== this.ownerGeneration(owner)) return null;
-    return job;
+    if (!job) return { ok: false, reason: 'unknown' };
+    if (job.owner !== owner) return { ok: false, reason: 'owner-mismatch' };
+    if (job.expiresAt <= this.now()) {
+      this.jobs.delete(key);
+      return { ok: false, reason: 'expired' };
+    }
+    if (job.generation !== this.ownerGeneration(owner)) {
+      this.jobs.delete(key);
+      return { ok: false, reason: 'revoked' };
+    }
+    if (!verify(job)) return { ok: false, reason: 'verification-failed', job };
+    this.jobs.delete(key); // spent only on success
+    return { ok: true, job };
   }
 
   revokeJobsFor(owner) {
