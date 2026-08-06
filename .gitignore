@@ -16,3 +16,4 @@ sessions/backups/
 .sidecar-start.sh
 .sidecar-base
 .td-root
+sessions/owners/
