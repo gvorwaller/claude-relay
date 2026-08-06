@@ -102,6 +102,21 @@ logger.info('server_starting', { port: PORT });
 
 wss.on('listening', () => {
   logger.info('server_listening', { port: PORT, host: '0.0.0.0' });
+  if (BIND_DELEGATE_ANCESTRY) {
+    // A fail-closed control that cannot run is an outage, so say so at
+    // startup instead of refusing every wake in silence.
+    peerPidForPort(PORT).then(() => {
+      try {
+        require('fs').accessSync(LSOF_PATH, require('fs').constants.X_OK);
+        logger.info('delegate_ancestry_binding_ready', { lsof: LSOF_PATH });
+      } catch {
+        logger.error('delegate_ancestry_binding_unavailable', {
+          lsof: LSOF_PATH,
+          impact: 'every delegate wake will be refused; set RELAY_BIND_DELEGATE_ANCESTRY=0 or fix PATH'
+        });
+      }
+    });
+  }
 });
 
 wss.on('connection', (ws, req) => {
@@ -862,11 +877,18 @@ function isLoopback(address) {
  * from the wake's own process tree. The peer's real pid cannot be asserted —
  * only observed.
  */
+// Resolved by absolute path, never via PATH: the launchd plist ships a
+// minimal PATH without /usr/sbin, which made every peer lookup fail — and
+// because the binding fails closed, every delegate wake was refused.
+const LSOF_PATH = ['/usr/sbin/lsof', '/usr/bin/lsof', '/opt/homebrew/bin/lsof', '/usr/local/bin/lsof']
+  .find(candidate => { try { require('fs').accessSync(candidate, require('fs').constants.X_OK); return true; } catch { return false; } })
+  || 'lsof';
+
 function peerPidForPort(port) {
   if (!port) return Promise.resolve(null);
   return new Promise(resolve => {
     execFile(
-      'lsof',
+      LSOF_PATH,
       ['-nP', '-a', `-iTCP:${port}`, '-sTCP:ESTABLISHED', '-Fpn'],
       { encoding: 'utf8', timeout: 3000 },
       (err, stdout) => resolve(err ? null : parsePeerPid(stdout, port))
