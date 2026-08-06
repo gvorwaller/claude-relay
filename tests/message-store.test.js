@@ -90,3 +90,21 @@ test('unknown opaque cursor returns nothing and flags it instead of replaying hi
   assert.deepEqual(afterEpoch.messages.map(m => m.content), ['one', 'two']);
   assert.equal(afterEpoch.unknownCursor, undefined);
 });
+
+test('delegate floor slices by durable order, not wall clock', () => {
+  const store = new MessageStore({ dataDir: tempDir(), now: () => new Date('2026-08-06T00:00:00.000Z') });
+  store.initialize();
+  // Three messages sharing one millisecond: a timestamp-based floor would
+  // leak the earlier ones.
+  store.append({ from: 'A', to: 'B', content: 'before' });
+  const floor = store.append({ from: 'A', to: 'B', content: 'floor' });
+  store.append({ from: 'A', to: 'B', content: 'after' });
+
+  const scoped = store.query({ requester: 'B', floorId: floor.id, count: 10 });
+  assert.deepEqual(scoped.messages.map(m => m.content), ['floor', 'after']);
+
+  // An unknown floor yields nothing rather than the whole mailbox.
+  const unknown = store.query({ requester: 'B', floorId: 'nope', count: 10 });
+  assert.deepEqual(unknown.messages, []);
+  assert.equal(unknown.unknownCursor, true);
+});

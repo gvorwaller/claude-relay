@@ -52,9 +52,11 @@ class MessageStore {
     if (floorId) {
       const all = this.readAll();
       const index = all.findIndex(message => message.id === floorId);
-      const floorTime = index >= 0 ? Date.parse(all[index].timestamp) : null;
-      if (floorTime === null) return { messages: [], cursor: null, unknownCursor: true };
-      const scoped = all.filter(message => Date.parse(message.timestamp) >= floorTime);
+      if (index < 0) return { messages: [], cursor: null, unknownCursor: true };
+      // Slice by durable ORDER, not wall-clock: two messages sharing a
+      // millisecond would otherwise leak the earlier one, and a clock
+      // rollback would scramble the boundary entirely (re-check #4).
+      const scoped = all.slice(index);
       const result = this.filterMessages(scoped, { requester, from, to, after });
       const messages = result.messages.slice(-limit);
       return {

@@ -210,19 +210,30 @@ class NotifyHooks {
       ], { detached: true, stdio: 'ignore' }).unref();
     } else if (entry.type === 'exec' && typeof entry.command === 'string' && entry.command.trim()) {
       const startedAt = Date.now();
-      // Mint the single-use delegate capability for this wake and hand it off
-      // through a 0600 file, never an argv/env value that `ps` would expose.
+      // The delegate capability is a PREREQUISITE, not a best-effort extra:
+      // spawning a wake that cannot authenticate produces a rejected delegate
+      // and silently stranded mail (re-check #10). Mint + hand off first; on
+      // failure, do not spawn and report failure so the retry path runs.
       let tokenFile = null;
+      let jobKey = null;
       if (this.capabilities && target !== 'all') {
         try {
-          const { token } = this.capabilities.mintJob({ owner: target, messageId });
+          const { token, key } = this.capabilities.mintJob({
+            owner: target,
+            messageId,
+            replyTo: from
+          });
+          jobKey = key;
           tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
           fs.writeFileSync(tokenFile, token, { mode: 0o600 });
-          // Reap it whether or not the child consumed it.
-          setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, 60000).unref();
+          // Reaped after the consume window, matching the token's own TTL.
+          setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, this.capabilities.jobTtlMs)
+            .unref();
         } catch (err) {
-          this.logger.warn('job_capability_mint_failed', { target, error: err.message });
-          tokenFile = null;
+          this.logger.error('job_capability_mint_failed', { target, error: err.message });
+          if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+          onOutcome({ ok: false, error: `job capability unavailable: ${err.message}` });
+          return;
         }
       }
       const child = spawn(entry.command, {
@@ -239,7 +250,13 @@ class NotifyHooks {
           ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {})
         }
       });
-      child.on('error', err => onOutcome({ ok: false, error: err.message }));
+      // Bind the capability to this process tree: registration later requires
+      // the connecting bridge to be a descendant of the wake we started.
+      if (jobKey && child.pid) this.capabilities.setJobSpawnPid(jobKey, child.pid);
+      child.on('error', err => {
+        if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+        onOutcome({ ok: false, error: err.message });
+      });
       child.on('exit', code => {
         // A wake command legitimately runs long (a resumed agent turn). Only
         // an early nonzero exit means it never really started — that is the

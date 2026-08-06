@@ -158,7 +158,7 @@ test('pid-less holder keeps legacy newest-wins takeover (remote/old-client path)
 test('delegate reads and speaks as its base label without ever owning it', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   const base = await connectWithRetry(port, 'CODEXD', { pid: process.pid });
   const sender = await connect(port, 'A', { pid: process.pid });
@@ -223,7 +223,7 @@ test('delegate reads and speaks as its base label without ever owning it', async
 test('bridge spawned under codex exec self-selects delegate mode (ancestry fallback)', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
@@ -355,7 +355,7 @@ test('clean exit keeps the label->cwd mapping (marked ended) for later reclaim',
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
@@ -431,7 +431,7 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
 test('identity mode cannot be switched on a live socket (primary<->delegate)', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   // Primary -> delegate: rejected.
   const primary = await connectWithRetry(port, 'MODEA', { pid: process.pid });
@@ -462,7 +462,7 @@ test('identity mode cannot be switched on a live socket (primary<->delegate)', a
 test('hostile client IDs and message targets are refused at the boundary', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-grammar-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   const good = await connectWithRetry(port, 'GRAMOK', { pid: process.pid });
   t.after(() => good.close());
@@ -520,7 +520,7 @@ test('hostile client IDs and message targets are refused at the boundary', async
 test('a delegate connection is immutable: no re-registration under another base', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
-  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
 
   // Wait for the server to be listening before opening a raw socket.
   const observer = await connectWithRetry(port, 'OBS', { pid: process.pid });
@@ -653,4 +653,62 @@ test('an owner capability never evicts a live holder', async t => {
   const pong = nextMessage(holder, 'pong');
   holder.send(JSON.stringify({ type: 'ping' }));
   await pong;
+});
+
+test('a stolen job token is useless outside the spawned wake process tree', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-anc-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  // Ancestry binding ON (the default).
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+
+  const sender = await connectWithRetry(port, 'ANCS', { pid: process.pid });
+  t.after(() => sender.close());
+
+  // Steal the bearer exactly as a same-user attacker could: read the handoff
+  // file. The token is valid, but this process is not a descendant of the
+  // wake the server spawned.
+  const stolen = await mintJobToken(outDir, sender, 'ANCBASE');
+  const thief = await open(port);
+  t.after(() => thief.close());
+  const refused = waitForMessage(thief, msg =>
+    msg.type === 'error' && /spawned wake process tree/.test(msg.message));
+  thief.send(JSON.stringify({
+    type: 'register', clientId: 'ANCBASE', delegate: true, jobToken: stolen, meta: { pid: process.pid }
+  }));
+  await refused;
+});
+
+test('a delegate may only reply to the peer that woke it', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-scope-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath, RELAY_BIND_DELEGATE_ANCESTRY: '0' });
+
+  const waker = await connectWithRetry(port, 'WAKER', { pid: process.pid });
+  const bystander = await connect(port, 'BYSTANDER', { pid: process.pid });
+  t.after(() => [waker, bystander].forEach(ws => ws.close()));
+
+  const token = await mintJobToken(outDir, waker, 'SCOPED');
+  const delegate = await open(port);
+  t.after(() => delegate.close());
+  const registered = waitForMessage(delegate, msg => msg.type === 'registered');
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'SCOPED', delegate: true, jobToken: token, meta: { pid: process.pid }
+  }));
+  await registered;
+
+  // Replying to the waker is allowed...
+  const wakerGot = nextMessage(waker, 'message');
+  delegate.send(JSON.stringify({ type: 'message', to: 'WAKER', content: 'reply' }));
+  assert.equal((await wakerGot).content, 'reply');
+
+  // ...messaging a third party is not, and neither is broadcasting.
+  const refusedThird = waitForMessage(delegate, msg =>
+    msg.type === 'error' && /may only reply to "WAKER"/.test(msg.message));
+  delegate.send(JSON.stringify({ type: 'message', to: 'BYSTANDER', content: 'should not arrive' }));
+  await refusedThird;
+
+  const refusedBroadcast = waitForMessage(delegate, msg =>
+    msg.type === 'error' && /may only reply to "WAKER"/.test(msg.message));
+  delegate.send(JSON.stringify({ type: 'message', to: 'all', content: 'should not broadcast' }));
+  await refusedBroadcast;
 });

@@ -60,3 +60,62 @@ test('job capability is single-use, owner-bound, and expiring', t => {
   assert.equal(caps.consumeJob('not-a-token', 'CODEX9'), null);
   assert.equal(caps.consumeJob(undefined, 'CODEX9'), null);
 });
+
+test('corrupt or unreadable capability state fails closed, never empty', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-caps-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'owners.json');
+
+  fs.writeFileSync(file, 'not json');
+  assert.throws(() => new CapabilityStore({ dataDir: dir }), /corrupt/);
+
+  fs.writeFileSync(file, JSON.stringify(['array', 'not', 'object']));
+  assert.throws(() => new CapabilityStore({ dataDir: dir }), /invalid shape/);
+
+  fs.writeFileSync(file, JSON.stringify({ CC1: { generation: 1 } }));
+  assert.throws(() => new CapabilityStore({ dataDir: dir }), /invalid record/);
+
+  // Absent file is the ONLY case that legitimately means "no owners yet".
+  fs.unlinkSync(file);
+  assert.doesNotThrow(() => new CapabilityStore({ dataDir: dir }));
+});
+
+test('prototype-named labels are not treated as enrolled', t => {
+  const { store: caps } = store(t);
+  for (const label of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    assert.equal(caps.hasOwner(label), false, `${label} must not appear enrolled`);
+    assert.equal(caps.verifyOwner(label, 'anything'), false);
+  }
+  const { secret } = caps.mintOwner('constructor');
+  assert.equal(caps.hasOwner('constructor'), true);
+  assert.ok(caps.verifyOwner('constructor', secret));
+});
+
+test('first successful use marks the capability acknowledged (migration closes)', t => {
+  const { store: caps } = store(t);
+  const { secret } = caps.mintOwner('CCM');
+  assert.equal(caps.isAcknowledged('CCM'), false, 'tolerance available before first use');
+  assert.ok(caps.verifyOwner('CCM', secret));
+  assert.equal(caps.isAcknowledged('CCM'), true, 'tolerance closes permanently after first use');
+
+  // And it survives a restart.
+  const reopened = new CapabilityStore({ dataDir: path.dirname(caps.filePath) });
+  assert.equal(reopened.isAcknowledged('CCM'), true);
+});
+
+test('job capability carries reply scope, spawn binding, and a session lease', t => {
+  const { store: caps } = store(t);
+  caps.mintOwner('CODEXJ');
+  const { token, key, job } = caps.mintJob({ owner: 'CODEXJ', messageId: 'm1', replyTo: 'CC6' });
+  assert.equal(job.replyTo, 'CC6');
+  assert.ok(job.sessionExpiresAt > job.expiresAt, 'session lease outlives the consume window');
+  caps.setJobSpawnPid(key, 4242);
+  const consumed = caps.consumeJob(token, 'CODEXJ');
+  assert.equal(consumed.spawnPid, 4242);
+  assert.equal(consumed.replyTo, 'CC6');
+
+  // Revocation before consumption.
+  const second = caps.mintJob({ owner: 'CODEXJ', messageId: 'm2', replyTo: 'CC6' });
+  caps.revokeJobByKey(second.key);
+  assert.equal(caps.consumeJob(second.token, 'CODEXJ'), null);
+});

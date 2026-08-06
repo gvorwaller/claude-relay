@@ -74,32 +74,50 @@ function withRegistryLock(fn) {
   while (Date.now() < deadline) {
     try {
       fs.mkdirSync(REGISTRY_LOCK);
-      fs.writeFileSync(path.join(REGISTRY_LOCK, 'owner'), token, { mode: 0o600 });
+      fs.writeFileSync(path.join(REGISTRY_LOCK, 'owner'), `${token}\n${process.pid}`, { mode: 0o600 });
       held = true;
       break;
     } catch {
-      // Break a lock whose holder died or hung.
+      // Break a lock only when its recorded holder is provably gone. Age
+      // alone is not evidence: a live-but-paused holder would otherwise have
+      // a second writer started underneath it.
       try {
-        const stat = fs.statSync(REGISTRY_LOCK);
-        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+        const [, holderPid] = fs.readFileSync(path.join(REGISTRY_LOCK, 'owner'), 'utf8').split('\n');
+        const pid = Number(holderPid);
+        let holderAlive = true;
+        if (pid) {
+          try { process.kill(pid, 0); } catch (err) { holderAlive = err.code !== 'ESRCH' ? true : false; }
+        } else {
+          // No recorded pid (older format): fall back to age.
+          const stat = fs.statSync(REGISTRY_LOCK);
+          holderAlive = Date.now() - stat.mtimeMs <= LOCK_STALE_MS;
+        }
+        if (!holderAlive) {
           fs.rmSync(REGISTRY_LOCK, { recursive: true, force: true });
           continue;
         }
-      } catch { /* lock vanished; retry */ }
-      // Brief synchronous backoff: these critical sections are sub-millisecond.
+      } catch { /* lock vanished or unreadable; retry */ }
       const until = Date.now() + 5;
-      while (Date.now() < until) { /* spin */ }
+      while (Date.now() < until) { /* brief spin; critical sections are sub-ms */ }
     }
+  }
+  // FAIL CLOSED. Running the transaction unlocked restores the lost-update
+  // race the lock exists to prevent (re-check #1).
+  if (!held) {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: 'registry_lock_timeout',
+      action: 'skipped registry update rather than racing'
+    }));
+    return undefined;
   }
   try {
     return fn();
   } finally {
-    if (held) {
-      try {
-        const owner = fs.readFileSync(path.join(REGISTRY_LOCK, 'owner'), 'utf8');
-        if (owner === token) fs.rmSync(REGISTRY_LOCK, { recursive: true, force: true });
-      } catch { /* already broken by a stale-breaker */ }
-    }
+    try {
+      const [owner] = fs.readFileSync(path.join(REGISTRY_LOCK, 'owner'), 'utf8').split('\n');
+      if (owner === token) fs.rmSync(REGISTRY_LOCK, { recursive: true, force: true });
+    } catch { /* already broken by a stale-breaker */ }
   }
 }
 
@@ -1041,12 +1059,19 @@ function handleToolCall(requestId, toolName, args) {
         // `register_rejected`; a timeout here means "unknown", so we roll
         // back and let the operator retry.
         pendingRename.timer = setTimeout(() => {
-          if (pendingRename && pendingRename.requestId === requestId) {
-            sendToolText(requestId,
-              `No response from the relay server for the rename to "${pendingRename.newId}". `
-              + `Nothing was changed — still "${CLIENT_ID}". Check relay_status and retry.`);
-            pendingRename = null;
-          }
+          if (!pendingRename || pendingRename.requestId !== requestId) return;
+          // Silence is genuinely UNKNOWN: the server may have applied the
+          // rename and lost the ack. Asserting "nothing changed" would be
+          // split-brain in the other direction (re-check #8), so force the
+          // ambiguity away — drop the socket (the server releases whichever
+          // label it holds) and reconnect under the old identity.
+          const attempted = pendingRename.newId;
+          pendingRename = null;
+          try { if (ws) ws.close(); } catch { /* already closing */ }
+          sendToolText(requestId,
+            `No response from the relay server for the rename to "${attempted}" — outcome unknown. `
+            + `This connection was dropped and is reconnecting as "${CLIENT_ID}"; `
+            + 'confirm with relay_status before relying on either identity.');
         }, 10000);
         registerWithServer(newId);
         break;
@@ -1216,12 +1241,32 @@ function readOwnerSecret(label) {
   }
 }
 
+// Durable, atomic, and permission-verified: the one-time plaintext must
+// survive a crash mid-write, and an existing loose-permission file must be
+// repaired rather than trusted (re-check #11).
 function writeOwnerSecret(label, secret) {
   try {
     fs.mkdirSync(OWNERS_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(ownerSecretPath(label), secret, { mode: 0o600 });
+    fs.chmodSync(OWNERS_DIR, 0o700);
+    const target = ownerSecretPath(label);
+    const tmp = `${target}.${process.pid}.tmp`;
+    const handle = fs.openSync(tmp, 'w', 0o600);
+    try {
+      fs.writeSync(handle, secret);
+      fs.fsyncSync(handle);
+    } finally {
+      fs.closeSync(handle);
+    }
+    fs.renameSync(tmp, target);
+    fs.chmodSync(target, 0o600);
+    try {
+      const dirFd = fs.openSync(OWNERS_DIR, 'r');
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch { /* directory fsync unsupported */ }
+    return readOwnerSecret(label) === secret;
   } catch (err) {
     console.error(`[Claude Relay MCP] Could not persist owner capability for ${label}: ${err.message}`);
+    return false;
   }
 }
 
@@ -1249,7 +1294,12 @@ function registerWithServer(idOverride) {
     ...(DELEGATE_FOR
       ? (JOB_TOKEN ? { jobToken: JOB_TOKEN } : {})
       : (readOwnerSecret(claimedId) ? { ownerSecret: readOwnerSecret(claimedId) } : {})),
-    ...(process.env.RELAY_ENROLL_SECRET ? { enrollSecret: process.env.RELAY_ENROLL_SECRET } : {}),
+    // Enrollment material is sent ONLY when this label has no capability yet
+    // (i.e. we may actually need to enroll). Broadcasting it on every
+    // registration is needless bearer exposure on a plaintext ws:// link.
+    ...(process.env.RELAY_ENROLL_SECRET && !DELEGATE_FOR && !readOwnerSecret(claimedId)
+      ? { enrollSecret: process.env.RELAY_ENROLL_SECRET }
+      : {}),
     meta: {
       pid: process.pid,
       started: STARTED_AT,
@@ -1275,9 +1325,11 @@ function connectToRelay() {
     connected = true;
     // Register with relay, reporting metadata so peers on other machines can see
     // this session in the cluster-wide list (get_sessions), not just locally.
+    // The local registry is written only once the server CONFIRMS the
+    // identity: a rejected claim used to leave a live-pid entry (with its
+    // codexSessionId) for a label this bridge never owned, which a wake could
+    // then resume into the wrong conversation (re-check #7).
     registerWithServer();
-    // Update local session registry
-    updateRegistry('connect');
   });
 
   ws.on('message', (data) => {
@@ -1287,9 +1339,24 @@ function connectToRelay() {
       switch (msg.type) {
         case 'registered':
           peers = msg.peers || [];
-          // A newly enrolled label's owner capability arrives exactly once.
+          // A newly enrolled label's owner capability arrives exactly once —
+          // persist it durably BEFORE anything else claims the identity is
+          // established, or the server holds an enrollment whose only
+          // plaintext was lost.
           if (msg.ownerSecret && msg.clientId) {
-            writeOwnerSecret(msg.clientId, msg.ownerSecret);
+            if (!writeOwnerSecret(msg.clientId, msg.ownerSecret)) {
+              console.error(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                event: 'owner_capability_persist_failed',
+                clientId: msg.clientId,
+                action: 'identity works this session but cannot be reclaimed later'
+              }));
+            }
+          }
+          // Server confirmed this identity: only now is it safe to record it
+          // locally as ours.
+          if (!DELEGATE_FOR && msg.clientId === CLIENT_ID && !pendingRename) {
+            updateRegistry('connect');
           }
           if (pendingRename && msg.clientId === pendingRename.newId) {
             // Server confirmed the rename: commit identity + registry now.

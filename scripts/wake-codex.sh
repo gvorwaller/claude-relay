@@ -90,18 +90,19 @@ if [[ -z "$SESSION_ID" && "$PEER_PID" != "0" ]]; then
         ROLLOUT="$(python3 - "$PEER_CWD" $ROLLOUTS <<'PY'
 import json, sys
 cwd = sys.argv[1]
-chosen = ""
+matches = []
 for f in sys.argv[2:]:
     try:
         with open(f) as fh:
             payload = json.loads(fh.readline())
         payload = payload.get("payload", payload)
         if payload.get("cwd") == cwd:
-            chosen = f
-            break
+            matches.append(f)
     except Exception:
         continue
-print(chosen)
+# Exactly one, or nothing: two live conversations in one directory must not
+# be resolved by arbitrary order (review re-check #6).
+print(matches[0] if len(matches) == 1 else "")
 PY
 )"
       fi
@@ -119,16 +120,20 @@ if [[ -z "$SESSION_ID" && -n "$PEER_CWD" ]]; then
   SESSION_ID="$(python3 - "$PEER_CWD" <<'PY'
 import json, os, sys, glob
 cwd = sys.argv[1]
+# Scan EVERY rollout: a truncated window could make an ambiguous directory
+# look unique and resume the wrong conversation (review re-check #6). Bail
+# out as soon as a second match proves ambiguity.
 files = glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"))
-files.sort(key=os.path.getmtime, reverse=True)
 matches = []
-for f in files[:200]:
+for f in files:
     try:
         with open(f) as fh:
             payload = json.loads(fh.readline())
         payload = payload.get("payload", payload)
         if payload.get("cwd") == cwd and payload.get("id"):
             matches.append(payload["id"])
+            if len(matches) > 1:
+                break
     except Exception:
         continue
 print(matches[0] if len(matches) == 1 else "")

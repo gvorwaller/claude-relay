@@ -11,6 +11,7 @@
 
 const path = require('path');
 const { randomUUID } = require('crypto');
+const { execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
@@ -54,6 +55,10 @@ const capabilities = new CapabilityStore({
 // clients; a local client may still fall back to the pid rules (migration).
 const ENROLL_SECRET = process.env.RELAY_ENROLL_SECRET || null;
 const REQUIRE_OWNER_CAPABILITY = process.env.RELAY_REQUIRE_OWNER_CAPABILITY === '1';
+// Second factor for delegate registration: the claimant must live inside the
+// process tree the server spawned. Defaults ON; set to '0' only where process
+// ancestry is unavailable (some sandboxes) or for synthetic test delegates.
+const BIND_DELEGATE_ANCESTRY = process.env.RELAY_BIND_DELEGATE_ANCESTRY !== '0';
 
 const notifyHooks = new NotifyHooks({
   configPath: process.env.RELAY_NOTIFY_CONFIG || path.join(__dirname, 'data', 'notify.json'),
@@ -159,12 +164,40 @@ wss.on('connection', (ws, req) => {
               });
               return;
             }
+            // Second factor: the connection must come from the process tree
+            // this server actually spawned. A same-user attacker who steals
+            // the bearer file still cannot register, because it is not a
+            // descendant of the wake we started.
+            const claimantPid = msg.meta && Number(msg.meta.pid);
+            if (BIND_DELEGATE_ANCESTRY && job.spawnPid && !isDescendantOf(claimantPid, job.spawnPid)) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Delegate registration must come from the spawned wake process tree'
+              }));
+              logger.warn('delegate_ancestry_rejected', {
+                delegateOf: delegateBase,
+                claimantPid: claimantPid || null,
+                spawnPid: job.spawnPid
+              });
+              return;
+            }
             // Suffix is a server-generated nonce: no client-supplied text
             // (previously meta.pid) may appear in a minted identity.
             const delegateId = `${delegateBase}~wake-${randomUUID().slice(0, 8)}`;
             // Least authority: the delegate may read only mail from its
             // inbound message onward, never the label's full history.
             ws.delegateJob = job;
+            // Bounded lease: a consumed token must not grant an indefinite
+            // session. The socket is closed when the job's session window
+            // ends, whatever the delegate is doing.
+            ws.delegateLease = setTimeout(() => {
+              logger.info('delegate_lease_expired', { delegateId, delegateOf: delegateBase });
+              try {
+                ws.send(JSON.stringify({ type: 'error', message: 'Delegate job lease expired' }));
+              } catch { /* socket may already be gone */ }
+              ws.terminate();
+            }, Math.max(1000, job.sessionExpiresAt - Date.now()));
+            if (typeof ws.delegateLease.unref === 'function') ws.delegateLease.unref();
             clientId = delegateId;
             ws.clientId = delegateId;
             ws.delegateOf = delegateBase;
@@ -222,10 +255,15 @@ wss.on('connection', (ws, req) => {
 
           if (ownerEnrolled && !ownerProven) {
             // Wrong secret is always fatal. A missing secret is tolerated
-            // only for a local client during migration (and never when
-            // RELAY_REQUIRE_OWNER_CAPABILITY=1) — it then still has to win
-            // the pid contest below.
-            const tolerated = !presentedSecret && fromLoopback && !REQUIRE_OWNER_CAPABILITY;
+            // only for a local client whose label has NEVER been claimed with
+            // its capability — the bounded migration window. The moment any
+            // client authenticates for that label the tolerance ends
+            // permanently (self-healing strictness), and it never applies
+            // under RELAY_REQUIRE_OWNER_CAPABILITY=1.
+            const tolerated = !presentedSecret
+              && fromLoopback
+              && !REQUIRE_OWNER_CAPABILITY
+              && !capabilities.isAcknowledged(requestedClientId);
             if (!tolerated) {
               ws.send(JSON.stringify({
                 type: 'register_rejected',
@@ -395,6 +433,26 @@ wss.on('connection', (ws, req) => {
             return;
           }
           const to = msg.to || 'all';
+          // A job delegate may answer only the peer that woke it. It is not a
+          // general-purpose sender on the label's behalf, and it may never
+          // broadcast (review re-check #2).
+          if (ws.delegateJob) {
+            const allowed = ws.delegateJob.replyTo;
+            if (!allowed || to !== allowed) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: allowed
+                  ? `This delegate job may only reply to "${allowed}"`
+                  : 'This delegate job has no reply recipient'
+              }));
+              logger.warn('delegate_send_out_of_scope', {
+                delegateId: clientId,
+                attemptedTo: to,
+                allowed: allowed || null
+              });
+              return;
+            }
+          }
           // Targets pass the same grammar as registrations; a currently
           // connected exact ID (e.g. a server-minted delegate) is also
           // addressable. Everything else is refused BEFORE it can reach
@@ -659,6 +717,28 @@ wss.on('close', () => clearInterval(retentionInterval));
 
 function isLoopback(address) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+// Is `pid` inside the process tree rooted at `ancestorPid`? Used to bind a
+// delegate registration to the wake the server itself spawned, so a stolen
+// bearer token is not sufficient on its own.
+function isDescendantOf(pid, ancestorPid) {
+  if (!pid || !ancestorPid) return false;
+  let current = Number(pid);
+  for (let depth = 0; depth < 12; depth += 1) {
+    if (current === Number(ancestorPid)) return true;
+    if (!current || current <= 1) return false;
+    try {
+      const parent = execFileSync('ps', ['-o', 'ppid=', '-p', String(current)], {
+        encoding: 'utf8',
+        timeout: 2000
+      }).trim();
+      current = Number(parent);
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 // true = alive, false = dead, null = unknowable from this process
