@@ -302,6 +302,17 @@ class NotifyHooks {
       const settle = outcome => {
         if (settled) return;
         settled = true;
+        // Exit 64: the wake script determined there is nothing to wake here
+        // (a Claude Code peer wakes via its own watcher; a broadcast has no
+        // single owner). Nothing ran, so no receipt is owed — discard the
+        // record rather than accumulating reports nobody will ever make.
+        if (jobRecord && this.jobStore && outcome.code === NOT_APPLICABLE_EXIT) {
+          this.jobStore.discard(jobRecord.jobId);
+          if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+          if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+          onOutcome({ ok: true, code: outcome.code });
+          return;
+        }
         if (jobRecord && this.jobStore) {
           // outcome.ok answers "should we retry the wake?", NOT "did the
           // work succeed?" (re-check #3). Any nonzero exit is a failure; a

@@ -313,6 +313,23 @@ class DelegateJobStore {
     }
   }
 
+  /**
+   * Drop a job that never represented real work (the wake had nothing to do).
+   * Distinct from remove(): refuses to discard anything that actually ran or
+   * sent something, so it can never be used to hide a real receipt.
+   */
+  discard(jobId) {
+    const job = this.jobs.get(jobId);
+    if (!job) return false;
+    if (job.outbound.length > 0 || job.status === 'running' || job.delegateId) {
+      this.logger.warn('job_discard_refused', { jobId, status: job.status });
+      return false;
+    }
+    this.remove(jobId);
+    this.logger.info('job_discarded_no_work', { jobId, owner: job.owner });
+    return true;
+  }
+
   remove(jobId) {
     this.jobs.delete(jobId);
     try { fs.unlinkSync(path.join(this.dataDir, `${jobId}.json`)); } catch {}

@@ -33,8 +33,9 @@ for arg in "$@"; do
 done
 [[ ${#ARGS[@]} -ge 1 && -z "$FOR" ]] && FOR="${ARGS[0]}"
 [[ -z "$FOR" ]] && { echo "error: peer ID required (RELAY_FOR or first argument)"; exit 2; }
-# Broadcasts have no single peer to wake.
-[[ "$FOR" == "all" ]] && exit 0
+# Exit 64 == "nothing to wake here": the caller discards the job record
+# rather than leaving a receipt nobody will ever report.
+[[ "$FOR" == "all" ]] && exit 64
 # NOTE: keep this text apostrophe-free; macOS bash 3.2 mis-parses quotes
 # inside ${var:-default}, which is also why the default lives in its own var.
 DEFAULT_PROMPT="[Automated wake from the relay notify hook - no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives."
@@ -65,7 +66,7 @@ if [[ "$PARENT_ARGS" == *[Cc]odex* || "$FOR" == CODEX* ]]; then
 fi
 if [[ "$IS_CODEX" == "0" ]]; then
   [[ "$DRY_RUN" == "1" ]] && echo "$FOR -> not a codex peer; nothing to exec (wakes via its own watcher)"
-  exit 0
+  exit 64
 fi
 
 SESSION_ID=""
