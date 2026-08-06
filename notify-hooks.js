@@ -225,6 +225,7 @@ class NotifyHooks {
       let tokenFile = null;
       let jobKey = null;
       let jobRecord = null;
+      let resultSecretFile = null;
       if (this.capabilities && target !== 'all') {
         try {
           // The job record exists BEFORE the wake is spawned, so a process
@@ -232,13 +233,19 @@ class NotifyHooks {
           if (this.jobStore) {
             jobRecord = this.jobStore.create({ owner: target, inboundMessageId: messageId, from });
           }
-          const { token, key } = this.capabilities.mintJob({
+          const { token, key, resultSecret } = this.capabilities.mintJob({
             owner: target,
             messageId,
             replyTo: from,
             jobId: jobRecord ? jobRecord.jobId : null
           });
           jobKey = key;
+          if (jobRecord && resultSecret) {
+            resultSecretFile = path.join(os.tmpdir(), `relay-result-${randomUUID()}.secret`);
+            fs.writeFileSync(resultSecretFile, resultSecret, { mode: 0o600 });
+            setTimeout(() => { try { fs.unlinkSync(resultSecretFile); } catch {} },
+              this.capabilities.jobSessionMaxMs).unref();
+          }
           tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
           fs.writeFileSync(tokenFile, token, { mode: 0o600 });
           // Reaped after the consume window, matching the token's own TTL.
@@ -270,7 +277,9 @@ class NotifyHooks {
           RELAY_FROM: from,
           RELAY_MESSAGE_ID: messageId || '',
           RELAY_DELIVERED: delivered ? '1' : '0',
-          ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {})
+          ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {}),
+          ...(jobRecord ? { RELAY_JOB_ID: jobRecord.jobId } : {}),
+          ...(resultSecretFile ? { RELAY_JOB_RESULT_SECRET_FILE: resultSecretFile } : {})
         }
       });
       } catch (err) {

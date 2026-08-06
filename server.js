@@ -667,6 +667,42 @@ wss.on('connection', (ws, req) => {
           }
           break;
 
+        case 'submit_job_result': {
+          // Loopback-only and secret-authenticated: only the wake wrapper the
+          // server itself spawned may describe what its run did.
+          if (!isLoopback(req.socket.remoteAddress)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Job results may only be submitted from the relay host' }));
+            return;
+          }
+          const jobId = typeof msg.jobId === 'string' ? msg.jobId : '';
+          if (!capabilities.verifyResultSecret(jobId, msg.resultSecret)) {
+            logger.warn('job_result_rejected', { jobId, remoteAddress: req.socket.remoteAddress });
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid or spent job result credential' }));
+            return;
+          }
+          const clamp = (value, max) => (typeof value === 'string' ? value.slice(0, max) : null);
+          const patch = {
+            // Explicitly delegate-authored. Never authority for what was
+            // sent — that comes from the server's own outbound record.
+            summary: clamp(msg.summary, 2000),
+            changes: clamp(msg.changes, 2000),
+            verification: Array.isArray(msg.verification)
+              ? msg.verification.filter(v => typeof v === 'string').slice(0, 20).map(v => v.slice(0, 500))
+              : []
+          };
+          const job = jobStore.get(jobId);
+          if (!job) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Unknown job' }));
+            return;
+          }
+          // Attach the narrative without moving the state machine: the
+          // process exit decides the terminal state, not the prose.
+          jobStore.attachResult(jobId, patch);
+          ws.send(JSON.stringify({ type: 'job_result_recorded', jobId }));
+          logger.info('job_result_recorded', { jobId, owner: job.owner });
+          break;
+        }
+
         case 'get_receipts': {
           // What did my delegates do while I was away? Owner-scoped: a
           // session sees only its own jobs, and a delegate may not ask at

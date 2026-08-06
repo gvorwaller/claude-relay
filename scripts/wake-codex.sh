@@ -176,4 +176,21 @@ CODEX_ARGS=(-c "mcp_servers.claude-relay.env.RELAY_DELEGATE_FOR=$FOR")
 if [[ -n "${RELAY_JOB_TOKEN_FILE:-}" ]]; then
   CODEX_ARGS+=(-c "mcp_servers.claude-relay.env.RELAY_JOB_TOKEN_FILE=$RELAY_JOB_TOKEN_FILE")
 fi
-exec codex exec "${CODEX_ARGS[@]}" resume "$SESSION_ID" "$PROMPT"
+
+# Capture the run's final message so the job receipt can say what happened,
+# rather than only that a process exited. NOT exec: we must outlive codex to
+# submit the result.
+LAST_MESSAGE_FILE="$(mktemp -t relay-lastmsg)"
+chmod 600 "$LAST_MESSAGE_FILE"
+codex exec "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" resume "$SESSION_ID" "$PROMPT"
+CODEX_EXIT=$?
+
+if [[ -n "${RELAY_JOB_ID:-}" && -n "${RELAY_JOB_RESULT_SECRET_FILE:-}" ]]; then
+  node "$(dirname "${BASH_SOURCE[0]}")/submit-job-result.js" \
+    --job-id "$RELAY_JOB_ID" \
+    --secret-file "$RELAY_JOB_RESULT_SECRET_FILE" \
+    --last-message "$LAST_MESSAGE_FILE" \
+    --exit-code "$CODEX_EXIT" || echo "note: job result submission failed"
+fi
+rm -f "$LAST_MESSAGE_FILE"
+exit $CODEX_EXIT

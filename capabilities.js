@@ -41,6 +41,8 @@ class CapabilityStore {
     // Job tokens are deliberately in-memory: a server restart invalidates
     // outstanding wakes, and a delegate that cannot authenticate fails closed.
     this.jobs = new Map();
+    // jobId -> { hash, expiresAt } for authenticated result submission.
+    this.resultSecrets = new Map();
   }
 
   load() {
@@ -187,9 +189,11 @@ class CapabilityStore {
     this.pruneJobs();
     const token = randomBytes(32).toString('base64url');
     const key = sha256(token);
+    const resultSecret = randomBytes(24).toString('base64url');
     const job = {
       owner,
       jobId: jobId || null,
+      resultSecretHash: sha256(resultSecret),
       messageId: messageId || null,
       replyTo: replyTo || null,
       generation: this.ownerGeneration(owner),
@@ -198,7 +202,10 @@ class CapabilityStore {
       spawnPid: null
     };
     this.jobs.set(key, job);
-    return { token, key, job };
+    // Retained by jobId so a result submission can be verified after the
+    // registration token has been spent.
+    this.resultSecrets.set(job.jobId, { hash: sha256(resultSecret), expiresAt: job.sessionExpiresAt });
+    return { token, key, job, resultSecret };
   }
 
   setJobSpawnPid(key, pid) {
@@ -243,6 +250,22 @@ class CapabilityStore {
     if (!verify(job)) return { ok: false, reason: 'verification-failed', job };
     this.jobs.delete(key); // spent only on success
     return { ok: true, job };
+  }
+
+  /** Verify a wake wrapper's authority to submit THIS job's result. */
+  verifyResultSecret(jobId, secret) {
+    const record = this.resultSecrets.get(jobId);
+    if (!record || typeof secret !== 'string' || !secret) return false;
+    if (record.expiresAt <= this.now()) {
+      this.resultSecrets.delete(jobId);
+      return false;
+    }
+    const provided = Buffer.from(sha256(secret), 'hex');
+    const stored = Buffer.from(record.hash, 'hex');
+    if (provided.length !== stored.length) return false;
+    if (!timingSafeEqual(provided, stored)) return false;
+    this.resultSecrets.delete(jobId); // single use
+    return true;
   }
 
   revokeJobsFor(owner) {

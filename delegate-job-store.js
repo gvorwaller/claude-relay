@@ -211,6 +211,27 @@ class DelegateJobStore {
     return job;
   }
 
+  /**
+   * Attach the wake wrapper's own account of the run. This is DELEGATE
+   * prose: it never moves the state machine and never touches `outbound`,
+   * which is the server's evidence. Refused once the job is reported, so a
+   * receipt cannot change after the human was told about it.
+   */
+  attachResult(jobId, { summary, changes, verification }) {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+    if (job.status === 'reported') {
+      this.logger.warn('job_result_after_report', { jobId });
+      return null;
+    }
+    job.summary = summary || job.summary;
+    job.changes = changes || job.changes;
+    if (Array.isArray(verification) && verification.length) job.verification = verification;
+    job.resultSubmittedAt = new Date(this.now()).toISOString();
+    this.persist(job);
+    return job;
+  }
+
   /** Terminal-but-unreported jobs for an owner, oldest first. */
   pending(owner) {
     return Array.from(this.jobs.values())

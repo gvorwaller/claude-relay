@@ -214,3 +214,29 @@ test('jobs from a previous server instance are interrupted, not resurrected by p
   assert.equal(nextRun.get(job.jobId).status, 'interrupted',
     'a job whose capability died with the old server cannot be considered alive');
 });
+
+test('a wrapper result attaches narrative without moving the state machine', t => {
+  const { store } = makeStore(t);
+  const job = store.create({ owner: 'CODEX3', inboundMessageId: 'w1', from: 'CC6' });
+  store.transition(job.jobId, 'running');
+  store.recordOutbound(job.jobId, { to: 'CC6', messageId: 'msg-1', delivered: true });
+
+  store.attachResult(job.jobId, {
+    summary: 'Reviewed the store and sent findings.',
+    changes: 'No files changed.',
+    verification: ['unit tests 30/30']
+  });
+
+  const withResult = store.get(job.jobId);
+  assert.equal(withResult.status, 'running', 'prose never advances the state machine');
+  assert.equal(withResult.summary, 'Reviewed the store and sent findings.');
+  assert.deepEqual(withResult.verification, ['unit tests 30/30']);
+  // The delegate's account cannot rewrite the server's evidence.
+  assert.deepEqual(withResult.outbound.map(o => o.messageId), ['msg-1']);
+
+  // And it cannot change a receipt after the human was told.
+  store.transition(job.jobId, 'completed');
+  store.transition(job.jobId, 'reported', { reportedTurnId: 't1' });
+  assert.equal(store.attachResult(job.jobId, { summary: 'revised story' }), null);
+  assert.equal(store.get(job.jobId).summary, 'Reviewed the store and sent findings.');
+});
