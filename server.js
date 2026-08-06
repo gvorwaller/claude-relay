@@ -11,7 +11,7 @@
 
 const path = require('path');
 const { randomUUID } = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
@@ -113,6 +113,14 @@ wss.on('connection', (ws, req) => {
           // on that one shared label and displace the others. A client must
           // name itself, validly.
           const requestedClientId = typeof msg.clientId === 'string' ? msg.clientId : '';
+          const clientIdAtEntry = clientId;
+          if (ws.registrationInFlight) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'A registration is already being processed on this connection'
+            }));
+            return;
+          }
           if (RESERVED_CLIENT_IDS.has(requestedClientId.toLowerCase())) {
             ws.send(JSON.stringify({
               type: 'error',
@@ -170,9 +178,25 @@ wss.on('connection', (ws, req) => {
             // socket. A same-user thief who reads the bearer file cannot
             // fake this — it would have to actually be inside the wake's
             // process tree.
+            // Reject junk before doing any expensive work: an unknown token
+            // must cost nothing (re-check #2).
+            if (!capabilities.hasJob(msg.jobToken)) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Delegate registration requires a valid, unexpired job capability'
+              }));
+              logger.warn('delegate_capability_rejected', {
+                delegateOf: delegateBase,
+                reason: 'unknown',
+                remoteAddress: req.socket.remoteAddress
+              });
+              return;
+            }
             const observedPid = BIND_DELEGATE_ANCESTRY
-              ? peerPidForPort(req.socket.remotePort)
+              ? await peerPidForPort(req.socket.remotePort)
               : null;
+            // The token could have been consumed or revoked while we looked.
+            if (ws.readyState !== 1 || clientId) return;
             const authorized = capabilities.authorizeJob(msg.jobToken, delegateBase, jobRecord => {
               if (!BIND_DELEGATE_ANCESTRY) return true;
               // Fail closed when the binding cannot be evaluated: neither a
@@ -327,7 +351,30 @@ wss.on('connection', (ws, req) => {
             // "is that connection actually alive?" — instead of believing
             // the claimant's asserted pid, which is forgeable and was the
             // hole in every previous version of this contest.
-            const holderAlive = await probeHolder(existingClient);
+            ws.registrationInFlight = true;
+            let holderAlive;
+            try {
+              holderAlive = await probeHolder(existingClient);
+            } finally {
+              ws.registrationInFlight = false;
+            }
+            // Re-read the world after awaiting: this socket may have been
+            // closed, may have registered as something else, and the label
+            // may have changed hands while the probe was running (re-check
+            // #1). Nothing decided before the await may be trusted now.
+            if (ws.readyState !== 1) return;
+            // "Registered during the await" means the identity CHANGED while
+            // we waited — not merely that this socket already had one (a
+            // rename legitimately re-registers an identified socket).
+            if (clientId !== clientIdAtEntry) return;
+            if (clients.get(requestedClientId) !== existingClient) {
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                clientId: requestedClientId,
+                reason: `"${requestedClientId}" changed hands while your claim was being checked; retry.`
+              }));
+              return;
+            }
             if (holderAlive) {
               const holderPid = (clientMeta.get(requestedClientId) || {}).pid || null;
               logger.warn('register_rejected_label_in_use', {
@@ -340,7 +387,7 @@ wss.on('connection', (ws, req) => {
                 clientId: requestedClientId,
                 holderPid,
                 reason: `"${requestedClientId}" is held by a live connection that answered a liveness probe. `
-                  + 'Labels are pid-anchored: stop that session, or register under a different ID '
+                  + 'A label belongs to its live session: stop that session, or register under a different ID '
                   + '(or as its delegate). The label frees itself as soon as that connection drops.'
               }));
               return;
@@ -604,6 +651,10 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'clear_history':
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before clearing history' }));
+            return;
+          }
           if (ws.delegateJob) {
             ws.send(JSON.stringify({ type: 'error', message: 'Delegates may not clear history' }));
             return;
@@ -629,6 +680,10 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'get_peers':
+          if (!clientId && !isLoopback(req.socket.remoteAddress)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before listing peers' }));
+            return;
+          }
           // Return list of connected peers
           ws.send(JSON.stringify({
             type: 'peers',
@@ -638,6 +693,13 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'get_sessions':
+          if (!clientId && !isLoopback(req.socket.remoteAddress)) {
+            // Session metadata (pid/cwd/host) must not be readable by an
+            // unregistered socket from the NETWORK (re-check #6). Local
+            // tooling (sessions/status.js) may still query directly.
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before listing sessions' }));
+            return;
+          }
           if (ws.delegateJob) {
             // Session enumeration exposes every peer's pid/cwd; a job
             // delegate has no need for it (least authority).
@@ -740,13 +802,19 @@ function isLoopback(address) {
  * only observed.
  */
 function peerPidForPort(port) {
-  if (!port) return null;
-  try {
-    const out = execFileSync(
+  if (!port) return Promise.resolve(null);
+  return new Promise(resolve => {
+    execFile(
       'lsof',
       ['-nP', '-a', `-iTCP:${port}`, '-sTCP:ESTABLISHED', '-Fpn'],
-      { encoding: 'utf8', timeout: 3000 }
+      { encoding: 'utf8', timeout: 3000 },
+      (err, stdout) => resolve(err ? null : parsePeerPid(stdout, port))
     );
+  });
+}
+
+function parsePeerPid(out, port) {
+  try {
     let pid = null;
     for (const line of out.split('\n')) {
       if (line.startsWith('p')) {
@@ -801,24 +869,37 @@ function isDescendantOf(pid, ancestorPid) {
  *
  * A pid is recorded for diagnostics only and never decides the outcome.
  */
-function probeHolder(holder, timeoutMs = 2000) {
+function probeHolder(holder, { attempts = 3, perAttemptMs = 3000 } = {}) {
   return new Promise(resolve => {
     if (!holder || holder.readyState !== 1) return resolve(false);
     let settled = false;
+    let timer = null;
+    let remaining = attempts;
     const done = alive => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       holder.off('pong', onPong);
       resolve(alive);
     };
     const onPong = () => done(true);
     holder.on('pong', onPong);
-    try {
-      holder.ping();
-    } catch {
-      return done(false);
-    }
-    setTimeout(() => done(false), timeoutMs).unref();
+    // Several probes over ~9s, not one over 2s: an event-loop stall or a
+    // sleep/wake pause must never be mistaken for a dead owner and cost a
+    // live session its label (re-check #7).
+    const attempt = () => {
+      if (settled) return;
+      if (remaining <= 0 || holder.readyState !== 1) return done(false);
+      remaining -= 1;
+      try {
+        holder.ping();
+      } catch {
+        return done(false);
+      }
+      timer = setTimeout(attempt, perAttemptMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    };
+    attempt();
   });
 }
 

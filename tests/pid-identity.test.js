@@ -123,7 +123,7 @@ test('a responsive holder is never evicted, even by a claimant quoting its pid',
   // now asks the holder itself, so the assertion is worthless.
   const claimant = await open(port);
   t.after(() => claimant.close());
-  const rejected = waitForMessage(claimant, msg => msg.type === 'register_rejected', 6000);
+  const rejected = waitForMessage(claimant, msg => msg.type === 'register_rejected', 25000);
   claimant.send(JSON.stringify({ type: 'register', clientId: 'SEAT', meta: { pid: process.pid } }));
   assert.match((await rejected).reason, /answered a liveness probe/);
 
@@ -147,7 +147,7 @@ test('an unresponsive holder is reclaimed (legitimate reconnect after a drop)', 
 
   const reconnect = await open(port);
   t.after(() => reconnect.close());
-  const registered = waitForMessage(reconnect, msg => msg.type === 'registered', 8000);
+  const registered = waitForMessage(reconnect, msg => msg.type === 'registered', 25000);
   reconnect.send(JSON.stringify({ type: 'register', clientId: 'DEADSOCK', meta: { pid: process.pid } }));
   assert.equal((await registered).clientId, 'DEADSOCK');
 });

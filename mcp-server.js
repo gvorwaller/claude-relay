@@ -1079,7 +1079,7 @@ function handleToolCall(requestId, toolName, args) {
             `No response from the relay server for the rename to "${attempted}" — outcome unknown. `
             + `This connection was dropped and is reconnecting as "${CLIENT_ID}"; `
             + 'confirm with relay_status before relying on either identity.');
-        }, 10000);
+        }, 30000); // must exceed the server's worst-case liveness probe
         registerWithServer(newId);
         break;
       }
@@ -1095,7 +1095,7 @@ function handleToolCall(requestId, toolName, args) {
 
       let renameText = reclaiming
         ? `Reclaiming relay identity "${CLIENT_ID}".`
-        : `Renamed relay identity: ${oldId} → ${CLIENT_ID}.`;
+        : `Rename to "${newId}" is PENDING: still "${CLIENT_ID}" until the relay server confirms.`;
       if (!reconnectTimer) {
         connectToRelay();
         renameText += ` Reconnecting to the relay server; "${CLIENT_ID}" will be announced as soon as the connection is up.`;
@@ -1332,6 +1332,10 @@ function connectToRelay() {
   ws.generation = generation;
 
   ws.on('open', () => {
+    if (generation !== socketGeneration) {
+      try { ws.terminate(); } catch { /* already gone */ }
+      return;
+    }
     connected = true;
     // Register with relay, reporting metadata so peers on other machines can see
     // this session in the cluster-wide list (get_sessions), not just locally.
@@ -1420,8 +1424,18 @@ function connectToRelay() {
             break;
           }
           if (desiredRename && msg.clientId === desiredRename.newId) {
+            // The OLD identity was never given up, so drop the intent and
+            // reconnect as ourselves rather than going dark (re-check #4).
             console.error(`[Claude Relay MCP] Rename to ${desiredRename.newId} refused; keeping ${CLIENT_ID}`);
             desiredRename = null;
+            try { if (ws) ws.close(); } catch { /* already closing */ }
+            if (!reconnectTimer) {
+              reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connectToRelay();
+              }, 1000);
+            }
+            break;
           }
           rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
           console.error(JSON.stringify({
@@ -1622,6 +1636,7 @@ function connectToRelay() {
   });
 
   ws.on('close', () => {
+    if (generation !== socketGeneration) return; // superseded socket: no-op
     connected = false;
     peers = [];
     if (pendingRename) {
@@ -1648,6 +1663,7 @@ function connectToRelay() {
   });
 
   ws.on('error', () => {
+    if (generation !== socketGeneration) return; // superseded socket: no-op
     // Error will trigger close, which handles reconnect
   });
 }

@@ -112,8 +112,33 @@ class CapabilityStore {
     return this.hasOwner(label) && this.owners[label].acknowledged === true;
   }
 
+  /**
+   * Drop never-acknowledged records older than the retention window. Every
+   * transient client (watchers, one-off tools) enrolls a label, so without
+   * this the store grows without bound. Acknowledged owners are never pruned.
+   */
+  pruneUnacknowledged(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+    const cutoff = this.now() - maxAgeMs;
+    let removed = 0;
+    for (const label of Object.keys(this.owners)) {
+      const record = this.owners[label];
+      if (record.acknowledged) continue;
+      const created = Date.parse(record.createdAt || '');
+      if (Number.isFinite(created) && created < cutoff) {
+        delete this.owners[label];
+        removed += 1;
+      }
+    }
+    if (removed) {
+      this.persist();
+      this.logger.info('owner_capabilities_pruned', { removed });
+    }
+    return removed;
+  }
+
   /** Mint (or rotate) the owner capability for a label. Returns plaintext once. */
   mintOwner(label, { host = null } = {}) {
+    this.pruneUnacknowledged();
     const secret = randomBytes(32).toString('base64url');
     const previous = this.hasOwner(label) ? this.owners[label] : null;
     this.owners[label] = {
@@ -182,6 +207,13 @@ class CapabilityStore {
 
   revokeJobByKey(key) {
     this.jobs.delete(key);
+  }
+
+  /** Cheap non-consuming existence check (used to reject junk before doing
+   * any expensive verification work). */
+  hasJob(token) {
+    if (typeof token !== 'string' || !token) return false;
+    return this.jobs.has(sha256(token));
   }
 
   /**

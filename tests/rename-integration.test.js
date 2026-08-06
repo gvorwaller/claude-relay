@@ -85,7 +85,7 @@ function mcpLines(stream) {
     entry.timer = setTimeout(() => {
       waiting.splice(waiting.indexOf(entry), 1);
       reject(new Error('Timed out waiting for MCP response'));
-    }, 3000);
+    }, 25000);
     waiting.push(entry);
   });
 }
