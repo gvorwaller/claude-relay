@@ -253,19 +253,29 @@ class NotifyHooks {
       // Bind the capability to this process tree: registration later requires
       // the connecting bridge to be a descendant of the wake we started.
       if (jobKey && child.pid) this.capabilities.setJobSpawnPid(jobKey, child.pid);
-      child.on('error', err => {
-        if (jobKey) this.capabilities.revokeJobByKey(jobKey);
-        onOutcome({ ok: false, error: err.message });
-      });
+      // 'error' and 'exit' can both fire; the outcome must be reported once.
+      let settled = false;
+      const settle = outcome => {
+        if (settled) return;
+        settled = true;
+        if (!outcome.ok) {
+          // A wake that never really ran must leave nothing usable behind:
+          // its capability is revoked and its handoff file removed, so a
+          // retry mints a fresh one instead of leaving several live tokens
+          // (and stale pid bindings) outstanding.
+          if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+          if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+        }
+        onOutcome(outcome);
+      };
+      child.on('error', err => settle({ ok: false, error: err.message }));
       child.on('exit', code => {
         // A wake command legitimately runs long (a resumed agent turn). Only
         // an early nonzero exit means it never really started — that is the
         // shell-127 case a synchronous check cannot see.
-        if (code !== 0 && Date.now() - startedAt < EARLY_EXIT_MS) {
-          onOutcome({ ok: false, code });
-        } else {
-          onOutcome({ ok: true, code });
-        }
+        settle(code !== 0 && Date.now() - startedAt < EARLY_EXIT_MS
+          ? { ok: false, code }
+          : { ok: true, code });
       });
       child.unref();
     }

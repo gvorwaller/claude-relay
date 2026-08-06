@@ -560,6 +560,24 @@ wss.on('connection', (ws, req) => {
           }
           break;
 
+        case 'ack_enrollment': {
+          // Phase 2 of enrollment: the client proves it durably holds the
+          // capability we minted. Only then does the label leave its
+          // migration window (re-check #4) — an enrollment whose plaintext
+          // was lost must stay reclaimable rather than becoming a label
+          // nobody can ever claim again.
+          if (!clientId || msg.clientId !== clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Enrollment acknowledgement must match this identity' }));
+            return;
+          }
+          if (capabilities.verifyOwner(clientId, msg.ownerSecret)) {
+            logger.info('enrollment_acknowledged', { clientId });
+          } else {
+            logger.warn('enrollment_ack_invalid', { clientId });
+          }
+          break;
+        }
+
         case 'get_history':
           if (!clientId) {
             ws.send(JSON.stringify({ type: 'error', message: 'Register before reading history' }));

@@ -572,6 +572,9 @@ let rejectedReason = null;
 // reclaiming, timer}. Committed on `registered`, rolled back untouched on
 // `register_rejected` — local identity/registry never change speculatively.
 let pendingRename = null;
+// A rename requested while disconnected: announced on the next connect and
+// committed only when the server confirms it.
+let desiredRename = null;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
@@ -1067,7 +1070,11 @@ function handleToolCall(requestId, toolName, args) {
           // label it holds) and reconnect under the old identity.
           const attempted = pendingRename.newId;
           pendingRename = null;
-          try { if (ws) ws.close(); } catch { /* already closing */ }
+          // Poison this socket generation, then hard-terminate: the server
+          // releases whatever label it held, and any ack still in flight is
+          // discarded rather than silently changing our identity.
+          socketGeneration += 1;
+          try { if (ws) ws.terminate(); } catch { /* already gone */ }
           sendToolText(requestId,
             `No response from the relay server for the rename to "${attempted}" — outcome unknown. `
             + `This connection was dropped and is reconnecting as "${CLIENT_ID}"; `
@@ -1077,13 +1084,11 @@ function handleToolCall(requestId, toolName, args) {
         break;
       }
 
-      // Disconnected path: there is no live server-side identity to protect,
-      // so commit locally and let the (re)connect announce it.
+      // Disconnected path: nothing may be committed locally before the
+      // server accepts the claim (re-check #6). Record the intent; the
+      // reconnect announces it and the `registered` handler commits.
       if (!reclaiming) {
-        updateRegistry('release');
-        CLIENT_ID = newId;
-        CLIENT_ID_SOURCE = 'rename';
-        updateRegistry('connect');
+        desiredRename = { oldId, newId };
       }
       displaced = false;
       rejectedReason = null;
@@ -1287,7 +1292,7 @@ const JOB_TOKEN = readJobToken();
 
 function registerWithServer(idOverride) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  const claimedId = DELEGATE_FOR || idOverride || CLIENT_ID;
+  const claimedId = DELEGATE_FOR || idOverride || (desiredRename ? desiredRename.newId : CLIENT_ID);
   const registration = {
     type: 'register',
     clientId: claimedId,
@@ -1314,12 +1319,17 @@ function registerWithServer(idOverride) {
   return true;
 }
 
+let socketGeneration = 0;
+
 function connectToRelay() {
   if (ws) {
     ws.close();
   }
 
+  socketGeneration += 1;
+  const generation = socketGeneration;
   ws = new WebSocket(RELAY_URL);
+  ws.generation = generation;
 
   ws.on('open', () => {
     connected = true;
@@ -1333,6 +1343,10 @@ function connectToRelay() {
   });
 
   ws.on('message', (data) => {
+    // Frames from a superseded socket (e.g. a rename ack that arrived after
+    // we gave up waiting) must not mutate identity: that was split-brain in
+    // the opposite direction (re-check #6).
+    if (generation !== socketGeneration) return;
     try {
       const msg = JSON.parse(data.toString());
 
@@ -1344,14 +1358,37 @@ function connectToRelay() {
           // established, or the server holds an enrollment whose only
           // plaintext was lost.
           if (msg.ownerSecret && msg.clientId) {
-            if (!writeOwnerSecret(msg.clientId, msg.ownerSecret)) {
+            if (writeOwnerSecret(msg.clientId, msg.ownerSecret)) {
+              // Phase 2: tell the server the capability is durably ours.
+              // Until this lands the label stays in its migration window, so
+              // a lost secret never leaves an unreclaimable enrollment.
+              try {
+                ws.send(JSON.stringify({
+                  type: 'ack_enrollment',
+                  clientId: msg.clientId,
+                  ownerSecret: msg.ownerSecret
+                }));
+              } catch { /* connection died; enrollment stays pending */ }
+            } else {
               console.error(JSON.stringify({
                 timestamp: new Date().toISOString(),
                 event: 'owner_capability_persist_failed',
                 clientId: msg.clientId,
-                action: 'identity works this session but cannot be reclaimed later'
+                action: 'not acknowledging enrollment; label stays reclaimable'
               }));
             }
+          }
+          // Server confirmed a rename we asked for while disconnected.
+          if (desiredRename && msg.clientId === desiredRename.newId) {
+            const previous = CLIENT_ID;
+            CLIENT_ID = desiredRename.oldId;
+            updateRegistry('release');
+            CLIENT_ID = desiredRename.newId;
+            CLIENT_ID_SOURCE = 'rename';
+            updateRegistry('connect');
+            console.error(`[Claude Relay MCP] Rename confirmed on reconnect: ${previous} → ${CLIENT_ID}`);
+            desiredRename = null;
+            break;
           }
           // Server confirmed this identity: only now is it safe to record it
           // locally as ours.
@@ -1381,6 +1418,10 @@ function connectToRelay() {
               + `Still connected and registered as "${CLIENT_ID}"; the registry is unchanged.`);
             pendingRename = null;
             break;
+          }
+          if (desiredRename && msg.clientId === desiredRename.newId) {
+            console.error(`[Claude Relay MCP] Rename to ${desiredRename.newId} refused; keeping ${CLIENT_ID}`);
+            desiredRename = null;
           }
           rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
           console.error(JSON.stringify({
