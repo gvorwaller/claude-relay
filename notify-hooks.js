@@ -1,6 +1,9 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 
 const EXEC_TIMEOUT_MS = 30000;
@@ -35,6 +38,8 @@ class NotifyHooks {
   constructor(options = {}) {
     this.configPath = options.configPath;
     this.logger = options.logger || { info() {}, warn() {}, error() {} };
+    // Mints the single-use job capability each delegated wake must present.
+    this.capabilities = options.capabilities || null;
     this.runner = options.runner || this.defaultRunner.bind(this);
     this.now = options.now || (() => Date.now());
     // Debounce state per config entry: `${configKey}:${entryIndex}` -> last-fired ms
@@ -205,6 +210,21 @@ class NotifyHooks {
       ], { detached: true, stdio: 'ignore' }).unref();
     } else if (entry.type === 'exec' && typeof entry.command === 'string' && entry.command.trim()) {
       const startedAt = Date.now();
+      // Mint the single-use delegate capability for this wake and hand it off
+      // through a 0600 file, never an argv/env value that `ps` would expose.
+      let tokenFile = null;
+      if (this.capabilities && target !== 'all') {
+        try {
+          const { token } = this.capabilities.mintJob({ owner: target, messageId });
+          tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
+          fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+          // Reap it whether or not the child consumed it.
+          setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, 60000).unref();
+        } catch (err) {
+          this.logger.warn('job_capability_mint_failed', { target, error: err.message });
+          tokenFile = null;
+        }
+      }
       const child = spawn(entry.command, {
         shell: true,
         detached: true,
@@ -215,7 +235,8 @@ class NotifyHooks {
           RELAY_FOR: target,
           RELAY_FROM: from,
           RELAY_MESSAGE_ID: messageId || '',
-          RELAY_DELIVERED: delivered ? '1' : '0'
+          RELAY_DELIVERED: delivered ? '1' : '0',
+          ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {})
         }
       });
       child.on('error', err => onOutcome({ ok: false, error: err.message }));

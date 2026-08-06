@@ -59,6 +59,62 @@ function readRegistry() {
   return {};
 }
 
+// Cross-process lock for registry read-modify-write. Every bridge used to
+// read the whole file, edit one entry, and rename its own copy over the top —
+// so two concurrent connects/renames silently lost one update (review finding
+// #9). mkdir is the atomic primitive; the owner token means a stale-lock
+// breaker can never delete a live holder's lock.
+const REGISTRY_LOCK = `${REGISTRY_FILE}.lock`;
+const LOCK_STALE_MS = 10000;
+
+function withRegistryLock(fn) {
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const deadline = Date.now() + 5000;
+  let held = false;
+  while (Date.now() < deadline) {
+    try {
+      fs.mkdirSync(REGISTRY_LOCK);
+      fs.writeFileSync(path.join(REGISTRY_LOCK, 'owner'), token, { mode: 0o600 });
+      held = true;
+      break;
+    } catch {
+      // Break a lock whose holder died or hung.
+      try {
+        const stat = fs.statSync(REGISTRY_LOCK);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(REGISTRY_LOCK, { recursive: true, force: true });
+          continue;
+        }
+      } catch { /* lock vanished; retry */ }
+      // Brief synchronous backoff: these critical sections are sub-millisecond.
+      const until = Date.now() + 5;
+      while (Date.now() < until) { /* spin */ }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        const owner = fs.readFileSync(path.join(REGISTRY_LOCK, 'owner'), 'utf8');
+        if (owner === token) fs.rmSync(REGISTRY_LOCK, { recursive: true, force: true });
+      } catch { /* already broken by a stale-breaker */ }
+    }
+  }
+}
+
+function writeRegistryAtomic(registry) {
+  const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
+  const handle = fs.openSync(tmpFile, 'w', 0o600);
+  try {
+    fs.writeSync(handle, JSON.stringify(registry, null, 2));
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  fs.renameSync(tmpFile, REGISTRY_FILE);
+}
+
 function sameCwd(a, b) {
   if (!a || !b) return false;
   try {
@@ -215,6 +271,30 @@ let DELEGATE_FOR = (process.env.RELAY_DELEGATE_FOR || '').trim() || null;
 // situation from process ancestry instead: a bridge whose parent is a
 // `codex exec ...` headless run IS a wake/one-off and must act as a delegate
 // of whatever label it would have resolved — never own it.
+// Resolve THIS bridge's owning Codex conversation once, at startup, from
+// process ancestry: the parent codex process holds its rollout file open.
+// Persisting it (review finding #6) lets a wake resume the exact session
+// instead of guessing "newest rollout in the same cwd", which could inject
+// one session's mail into another conversation. Ambiguity yields null — the
+// wake then refuses and notifies rather than resuming the wrong thread.
+function detectCodexSessionId() {
+  try {
+    const parentPid = psField(process.ppid, 'pid') ? process.ppid : null;
+    if (!parentPid) return null;
+    const lsof = require('child_process')
+      .execSync(`lsof -p ${parentPid} 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 });
+    const matches = [...new Set(
+      (lsof.match(/\/[^\s]*rollout-[^\s]*\.jsonl/g) || [])
+    )];
+    if (matches.length !== 1) return null;
+    const uuid = path.basename(matches[0], '.jsonl')
+      .replace(/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, '');
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid) ? uuid : null;
+  } catch {
+    return null;
+  }
+}
+
 function detectCodexHeadless() {
   const parentArgs = psField(process.ppid, 'args');
   if (/(^|\/)codex\S*\s+(-\S+\s+)*exec\b/.test(parentArgs)) {
@@ -245,6 +325,10 @@ if (resolvedIdentity.source !== '--client-id' && !DELEGATE_FOR) {
       `instead of seizing "${baseId}" from the live session that owns it.`;
   }
 }
+// Recorded for primary sessions only: a delegate's own rollout is the same
+// conversation, and delegates never write the registry.
+const CODEX_SESSION_ID = DELEGATE_FOR ? null : detectCodexSessionId();
+
 if (DELEGATE_FOR) {
   resolvedIdentity.id = `${DELEGATE_FOR}~wake-${process.pid}`;
   resolvedIdentity.source = 'delegate';
@@ -272,10 +356,8 @@ function updateRegistry(action = 'connect') {
   // they must never write the label->pid registry.
   if (DELEGATE_FOR) return;
   try {
-    let registry = {};
-    if (fs.existsSync(REGISTRY_FILE)) {
-      registry = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
-    }
+    withRegistryLock(() => {
+    let registry = readRegistry();
 
     if (action === 'connect') {
       registry[CLIENT_ID] = {
@@ -283,7 +365,9 @@ function updateRegistry(action = 'connect') {
         started: new Date().toISOString(),
         cwd: process.cwd(),
         relayUrl: RELAY_URL,
-        source: CLIENT_ID_SOURCE
+        source: CLIENT_ID_SOURCE,
+        // Exact owning Codex conversation, when unambiguously resolvable.
+        ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {})
       };
     } else if (action === 'release') {
       // Deliberate abandonment (relay_rename away from a wrong identity):
@@ -302,9 +386,8 @@ function updateRegistry(action = 'connect') {
       }
     }
 
-    const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(registry, null, 2));
-    fs.renameSync(tmpFile, REGISTRY_FILE);
+    writeRegistryAtomic(registry);
+    });
   } catch (err) {
     // Non-fatal: don't interrupt MCP operation for registry issues
   }
@@ -317,6 +400,10 @@ function updateRegistry(action = 'connect') {
  * server round-trip is needed and this works while disconnected.
  */
 function clearRegistrySessions() {
+  return withRegistryLock(() => clearRegistrySessionsLocked());
+}
+
+function clearRegistrySessionsLocked() {
   const registry = readRegistry();
   const online = new Set(peers);
   online.add(CLIENT_ID);
@@ -347,9 +434,7 @@ function clearRegistrySessions() {
     // Backup is best-effort; still proceed with the clear
   }
 
-  const tmpFile = `${REGISTRY_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(kept, null, 2));
-  fs.renameSync(tmpFile, REGISTRY_FILE);
+  writeRegistryAtomic(kept);
 
   return { removed, kept: Object.keys(kept), backup };
 }
@@ -1115,11 +1200,56 @@ function handleToolCall(requestId, toolName, args) {
  * Used on socket open and by relay_rename (the server treats a register from
  * an already-registered socket as a rename and drops the old identity).
  */
+// Owner capabilities live outside the shared registry, one 0600 file per
+// label, so a label's authority is never readable from a file peers share.
+const OWNERS_DIR = path.join(SESSIONS_DIR, 'owners');
+
+function ownerSecretPath(label) {
+  return path.join(OWNERS_DIR, `${label}.secret`);
+}
+
+function readOwnerSecret(label) {
+  try {
+    return fs.readFileSync(ownerSecretPath(label), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeOwnerSecret(label, secret) {
+  try {
+    fs.mkdirSync(OWNERS_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(ownerSecretPath(label), secret, { mode: 0o600 });
+  } catch (err) {
+    console.error(`[Claude Relay MCP] Could not persist owner capability for ${label}: ${err.message}`);
+  }
+}
+
+// The wake hook hands the single-use job capability over in a 0600 file
+// rather than an env value, so it never appears in `ps` output.
+function readJobToken() {
+  const file = process.env.RELAY_JOB_TOKEN_FILE;
+  if (!file) return null;
+  try {
+    const token = fs.readFileSync(file, 'utf8').trim();
+    try { fs.unlinkSync(file); } catch { /* best effort */ }
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+const JOB_TOKEN = readJobToken();
+
 function registerWithServer(idOverride) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const claimedId = DELEGATE_FOR || idOverride || CLIENT_ID;
   const registration = {
     type: 'register',
-    clientId: DELEGATE_FOR || idOverride || CLIENT_ID,
+    clientId: claimedId,
+    ...(DELEGATE_FOR
+      ? (JOB_TOKEN ? { jobToken: JOB_TOKEN } : {})
+      : (readOwnerSecret(claimedId) ? { ownerSecret: readOwnerSecret(claimedId) } : {})),
+    ...(process.env.RELAY_ENROLL_SECRET ? { enrollSecret: process.env.RELAY_ENROLL_SECRET } : {}),
     meta: {
       pid: process.pid,
       started: STARTED_AT,
@@ -1157,6 +1287,10 @@ function connectToRelay() {
       switch (msg.type) {
         case 'registered':
           peers = msg.peers || [];
+          // A newly enrolled label's owner capability arrives exactly once.
+          if (msg.ownerSecret && msg.clientId) {
+            writeOwnerSecret(msg.clientId, msg.ownerSecret);
+          }
           if (pendingRename && msg.clientId === pendingRename.newId) {
             // Server confirmed the rename: commit identity + registry now.
             commitRename(pendingRename);

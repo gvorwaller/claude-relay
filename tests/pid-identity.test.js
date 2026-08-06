@@ -78,6 +78,38 @@ async function deadPid() {
   return pid;
 }
 
+
+// Obtain a real job capability the way a delegate does: the server's notify
+// path mints one and writes it to a 0600 file for the spawned wake. The test
+// hook simply copies that file somewhere readable, so the whole minting chain
+// is exercised rather than bypassed.
+function notifyConfigForTokens(root) {
+  const configPath = path.join(root, 'notify.json');
+  const outDir = path.join(root, 'tokens');
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({
+    '*': [{
+      type: 'exec',
+      command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"`
+    }]
+  }));
+  return { configPath, outDir };
+}
+
+async function mintJobToken(outDir, sender, base) {
+  const tokenPath = path.join(outDir, `${base}.token`);
+  try { fs.unlinkSync(tokenPath); } catch {}
+  sender.send(JSON.stringify({ type: 'message', to: base, content: 'wake trigger' }));
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const token = fs.readFileSync(tokenPath, 'utf8').trim();
+      if (token) return token;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`job capability never appeared for ${base}`);
+}
+
 test('orphaned label (dead pid, socket still open) is reassigned to a newcomer', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
   const port = startServer(t, root);
@@ -124,8 +156,9 @@ test('pid-less holder keeps legacy newest-wins takeover (remote/old-client path)
 });
 
 test('delegate reads and speaks as its base label without ever owning it', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
-  const port = startServer(t, root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   const base = await connectWithRetry(port, 'CODEXD', { pid: process.pid });
   const sender = await connect(port, 'A', { pid: process.pid });
@@ -134,6 +167,7 @@ test('delegate reads and speaks as its base label without ever owning it', async
   const baseGotFirst = nextMessage(base, 'message');
   sender.send(JSON.stringify({ type: 'message', to: 'CODEXD', content: 'before delegate' }));
   await baseGotFirst;
+  const jobToken = await mintJobToken(outDir, sender, 'CODEXD');
 
   // Delegate registers: derived visible ID, no contest with the base.
   const delegate = await open(port);
@@ -143,6 +177,7 @@ test('delegate reads and speaks as its base label without ever owning it', async
     type: 'register',
     clientId: 'CODEXD',
     delegate: true,
+    jobToken,
     meta: { pid: 424242 }
   }));
   const registration = await delegateRegistered;
@@ -154,7 +189,11 @@ test('delegate reads and speaks as its base label without ever owning it', async
   // It reads with the base's visibility.
   const history = nextMessage(delegate, 'history');
   delegate.send(JSON.stringify({ type: 'get_history', count: 10 }));
-  assert.deepEqual((await history).messages.map(m => m.content), ['before delegate']);
+  const seen = (await history).messages.map(m => m.content);
+  // Least authority: scoped to the job's inbound message onward, so the
+  // earlier 'before delegate' mail is NOT visible to it.
+  assert.equal(seen.includes('wake trigger'), true);
+  assert.equal(seen.includes('before delegate'), false);
 
   // Its sends are stored and delivered as the base label.
   const senderGot = nextMessage(sender, 'message');
@@ -182,11 +221,16 @@ test('delegate reads and speaks as its base label without ever owning it', async
 });
 
 test('bridge spawned under codex exec self-selects delegate mode (ancestry fallback)', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
-  const port = startServer(t, root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
+
+  const token = await mintJobToken(outDir, observer, 'CODEXW');
+  const tokenFile = path.join(root, 'codexw.token');
+  fs.writeFileSync(tokenFile, token, { mode: 0o600 });
 
   // Fake `codex` whose argv looks like a headless run; it launches the bridge
   // as a child (no exec, so the parent's args stay "codex exec resume ...").
@@ -205,7 +249,8 @@ test('bridge spawned under codex exec self-selects delegate mode (ancestry fallb
       HOME: root,
       CLAUDE_RELAY_SESSION_ID: '',
       RELAY_DELEGATE_FOR: '',
-      RELAY_CLIENT_ID: 'CODEXW'
+      RELAY_CLIENT_ID: 'CODEXW',
+      RELAY_JOB_TOKEN_FILE: tokenFile
     },
     stdio: ['pipe', 'pipe', 'pipe']
   });
@@ -308,11 +353,16 @@ test('clean exit keeps the label->cwd mapping (marked ended) for later reclaim',
 });
 
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
-  const port = startServer(t, root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
+
+  const token = await mintJobToken(outDir, observer, 'CODEXD');
+  const tokenFile = path.join(root, 'codexd.token');
+  fs.writeFileSync(tokenFile, token, { mode: 0o600 });
 
   const joined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && /^CODEXD~wake-[0-9a-f]{8}$/.test(msg.clientId), 10000);
@@ -323,7 +373,8 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
       HOME: root,
       CLAUDE_RELAY_SESSION_ID: '',
       RELAY_CLIENT_ID: '',
-      RELAY_DELEGATE_FOR: 'CODEXD'
+      RELAY_DELEGATE_FOR: 'CODEXD',
+      RELAY_JOB_TOKEN_FILE: tokenFile
     },
     stdio: ['pipe', 'pipe', 'pipe']
   });
@@ -378,22 +429,29 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
 });
 
 test('identity mode cannot be switched on a live socket (primary<->delegate)', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
-  const port = startServer(t, root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   // Primary -> delegate: rejected.
   const primary = await connectWithRetry(port, 'MODEA', { pid: process.pid });
   t.after(() => primary.close());
+  const modeAToken = await mintJobToken(outDir, primary, 'MODEA');
   const primaryRefused = waitForMessage(primary, msg =>
     msg.type === 'error' && /delegate registration requires a fresh connection/.test(msg.message));
-  primary.send(JSON.stringify({ type: 'register', clientId: 'MODEA', delegate: true, meta: { pid: 111 } }));
+  primary.send(JSON.stringify({
+    type: 'register', clientId: 'MODEA', delegate: true, jobToken: modeAToken, meta: { pid: 111 }
+  }));
   await primaryRefused;
 
   // Delegate -> primary: rejected.
   const delegate = await open(port);
   t.after(() => delegate.close());
+  const modeToken = await mintJobToken(outDir, primary, 'MODEB');
   const delegateRegistered = waitForMessage(delegate, msg => msg.type === 'registered');
-  delegate.send(JSON.stringify({ type: 'register', clientId: 'MODEB', delegate: true, meta: { pid: 222 } }));
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'MODEB', delegate: true, jobToken: modeToken, meta: { pid: 222 }
+  }));
   await delegateRegistered;
   const delegateRefused = waitForMessage(delegate, msg =>
     msg.type === 'error' && /primary registration requires a fresh connection/.test(msg.message));
@@ -402,8 +460,9 @@ test('identity mode cannot be switched on a live socket (primary<->delegate)', a
 });
 
 test('hostile client IDs and message targets are refused at the boundary', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-grammar-'));
-  const port = startServer(t, root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-grammar-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   const good = await connectWithRetry(port, 'GRAMOK', { pid: process.pid });
   t.after(() => good.close());
@@ -447,8 +506,11 @@ test('hostile client IDs and message targets are refused at the boundary', async
   // A live server-minted delegate ID stays addressable despite containing '~'.
   const delegate = await open(port);
   t.after(() => delegate.close());
+  const gramToken = await mintJobToken(outDir, good, 'GRAMOK');
   const delegateReg = waitForMessage(delegate, msg => msg.type === 'registered');
-  delegate.send(JSON.stringify({ type: 'register', clientId: 'GRAMOK', delegate: true, meta: { pid: 9911 } }));
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'GRAMOK', delegate: true, jobToken: gramToken, meta: { pid: 9911 }
+  }));
   const delegateId = (await delegateReg).clientId;
   const delegateGot = waitForMessage(delegate, msg => msg.type === 'message');
   good.send(JSON.stringify({ type: 'message', to: delegateId, content: 'direct to delegate' }));
@@ -457,21 +519,28 @@ test('hostile client IDs and message targets are refused at the boundary', async
 
 test('a delegate connection is immutable: no re-registration under another base', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
-  const port = startServer(t, root);
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
 
   // Wait for the server to be listening before opening a raw socket.
   const observer = await connectWithRetry(port, 'OBS', { pid: process.pid });
   t.after(() => observer.close());
 
+  const immutToken = await mintJobToken(outDir, observer, 'IMMUT');
+  const otherToken = await mintJobToken(outDir, observer, 'OTHERBASE');
   const delegate = await open(port);
   t.after(() => delegate.close());
   const registered = waitForMessage(delegate, msg => msg.type === 'registered');
-  delegate.send(JSON.stringify({ type: 'register', clientId: 'IMMUT', delegate: true, meta: { pid: 4242 } }));
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'IMMUT', delegate: true, jobToken: immutToken, meta: { pid: 4242 }
+  }));
   const firstId = (await registered).clientId;
 
   const refused = waitForMessage(delegate, msg =>
     msg.type === 'error' && /delegates are immutable/.test(msg.message));
-  delegate.send(JSON.stringify({ type: 'register', clientId: 'OTHERBASE', delegate: true, meta: { pid: 4242 } }));
+  delegate.send(JSON.stringify({
+    type: 'register', clientId: 'OTHERBASE', delegate: true, jobToken: otherToken, meta: { pid: 4242 }
+  }));
   await refused;
 
   // The original delegate identity is untouched and still the only mapping.
@@ -480,4 +549,108 @@ test('a delegate connection is immutable: no re-registration under another base'
   const peerList = (await peersMsg).peers;
   assert.ok(peerList.includes(firstId));
   assert.equal(peerList.some(id => id.startsWith('OTHERBASE')), false);
+});
+
+test('delegate registration requires a valid job capability', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-cap-')));
+  const port = startServer(t, root);
+
+  const owner = await connectWithRetry(port, 'CAPBASE', { pid: process.pid });
+  t.after(() => owner.close());
+
+  // No token at all.
+  const rogue = await open(port);
+  t.after(() => rogue.close());
+  const refused = waitForMessage(rogue, msg =>
+    msg.type === 'error' && /valid, unexpired job capability/.test(msg.message));
+  rogue.send(JSON.stringify({ type: 'register', clientId: 'CAPBASE', delegate: true, meta: { pid: 1 } }));
+  await refused;
+
+  // Fabricated token.
+  const rogue2 = await open(port);
+  t.after(() => rogue2.close());
+  const refused2 = waitForMessage(rogue2, msg =>
+    msg.type === 'error' && /valid, unexpired job capability/.test(msg.message));
+  rogue2.send(JSON.stringify({
+    type: 'register', clientId: 'CAPBASE', delegate: true, jobToken: 'fabricated', meta: { pid: 1 }
+  }));
+  await refused2;
+
+  // The owner's own registration is untouched by the failed attempts.
+  const pong = nextMessage(owner, 'pong');
+  owner.send(JSON.stringify({ type: 'ping' }));
+  await pong;
+});
+
+test('an enrolled label refuses claims without its owner capability', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-cap-')));
+  const port = startServer(t, root, { RELAY_REQUIRE_OWNER_CAPABILITY: '1' });
+
+  // First claim enrolls the label and returns its capability exactly once.
+  await connectWithRetry(port, 'WARMUP', { pid: process.pid }).then(ws => ws.close());
+  const first = await open(port);
+  const enrolledReply = waitForMessage(first, msg => msg.type === 'registered');
+  first.send(JSON.stringify({ type: 'register', clientId: 'OWNED2', meta: { pid: process.pid } }));
+  const enrolled = await enrolledReply;
+  const secret = enrolled.ownerSecret;
+  assert.ok(secret, 'enrollment returns the owner capability');
+
+  // Release the label so the contest is purely about authority, not liveness.
+  const gone = new Promise(resolve => first.once('close', resolve));
+  first.close();
+  await gone;
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // No capability -> refused, even though nobody holds the label.
+  const forger = await open(port);
+  t.after(() => forger.close());
+  const rejected = waitForMessage(forger, msg => msg.type === 'register_rejected');
+  forger.send(JSON.stringify({ type: 'register', clientId: 'OWNED2', meta: { pid: process.pid } }));
+  assert.match((await rejected).reason, /requires its owner capability/);
+
+  // Wrong capability -> refused.
+  const wrong = await open(port);
+  t.after(() => wrong.close());
+  const rejectedWrong = waitForMessage(wrong, msg => msg.type === 'register_rejected');
+  wrong.send(JSON.stringify({
+    type: 'register', clientId: 'OWNED2', ownerSecret: 'not-the-secret', meta: { pid: process.pid }
+  }));
+  assert.match((await rejectedWrong).reason, /invalid/);
+
+  // The real owner reclaims it.
+  const real = await open(port);
+  t.after(() => real.close());
+  const reseated = waitForMessage(real, msg => msg.type === 'registered');
+  real.send(JSON.stringify({
+    type: 'register', clientId: 'OWNED2', ownerSecret: secret, meta: { pid: process.pid }
+  }));
+  assert.equal((await reseated).clientId, 'OWNED2');
+});
+
+test('an owner capability never evicts a live holder', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-cap-')));
+  const port = startServer(t, root);
+
+  await connectWithRetry(port, 'WARMUP', { pid: process.pid }).then(ws => ws.close());
+  const holder = await open(port);
+  t.after(() => holder.close());
+  const enrolledReply = waitForMessage(holder, msg => msg.type === 'registered');
+  holder.send(JSON.stringify({ type: 'register', clientId: 'LIVEOWN', meta: { pid: process.pid } }));
+  const secret = (await enrolledReply).ownerSecret;
+  assert.ok(secret);
+
+  // A second process presenting the very same capability is still refused
+  // while the holder's pid is alive: the label is in use.
+  const duplicate = await open(port);
+  t.after(() => duplicate.close());
+  const rejected = waitForMessage(duplicate, msg => msg.type === 'register_rejected');
+  duplicate.send(JSON.stringify({
+    type: 'register', clientId: 'LIVEOWN', ownerSecret: secret, meta: { pid: 999999 }
+  }));
+  assert.match((await rejected).reason, /pid-anchored/);
+
+  // The holder never noticed.
+  const pong = nextMessage(holder, 'pong');
+  holder.send(JSON.stringify({ type: 'ping' }));
+  await pong;
 });

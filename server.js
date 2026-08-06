@@ -15,6 +15,7 @@ const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
 const { NotifyHooks } = require('./notify-hooks');
+const { CapabilityStore } = require('./capabilities');
 
 const PORT = parseInt(process.argv[2] || process.env.RELAY_PORT || '9999', 10);
 const MESSAGE_RETENTION_DAYS = parseInt(process.env.RELAY_MESSAGE_RETENTION_DAYS || '7', 10);
@@ -39,9 +40,25 @@ const logger = new OperationalLogger({
   maxTotalBytes: parseInt(process.env.RELAY_LOG_MAX_TOTAL_MB || '50', 10) * 1024 * 1024,
   maxFileBytes: parseInt(process.env.RELAY_LOG_MAX_FILE_MB || '10', 10) * 1024 * 1024
 });
+const capabilities = new CapabilityStore({
+  dataDir: process.env.RELAY_MESSAGE_DIR
+    ? path.dirname(process.env.RELAY_MESSAGE_DIR)
+    : path.join(__dirname, 'data'),
+  logger
+});
+// Enrollment policy for a label's FIRST claim (a first-come rule would let a
+// squatter on the open port receive a label's durable authority):
+//   loopback  -> auto-enroll (the local machine is the trusted channel)
+//   remote    -> requires RELAY_ENROLL_SECRET
+// Labels already enrolled always require their owner capability from remote
+// clients; a local client may still fall back to the pid rules (migration).
+const ENROLL_SECRET = process.env.RELAY_ENROLL_SECRET || null;
+const REQUIRE_OWNER_CAPABILITY = process.env.RELAY_REQUIRE_OWNER_CAPABILITY === '1';
+
 const notifyHooks = new NotifyHooks({
   configPath: process.env.RELAY_NOTIFY_CONFIG || path.join(__dirname, 'data', 'notify.json'),
-  logger
+  logger,
+  capabilities
 });
 
 // Connected clients: Map<clientId, WebSocket>
@@ -125,9 +142,29 @@ wss.on('connection', (ws, req) => {
               return;
             }
             const delegateBase = String(requestedClientId);
+            // Loopback is necessary but NOT sufficient (review finding #3):
+            // any local process could otherwise impersonate a label, read its
+            // mail, and suppress its wakes. A delegate must present the
+            // single-use capability the notify path minted when it spawned
+            // the wake.
+            const job = capabilities.consumeJob(msg.jobToken, delegateBase);
+            if (!job) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Delegate registration requires a valid, unexpired job capability'
+              }));
+              logger.warn('delegate_capability_rejected', {
+                delegateOf: delegateBase,
+                remoteAddress: req.socket.remoteAddress
+              });
+              return;
+            }
             // Suffix is a server-generated nonce: no client-supplied text
             // (previously meta.pid) may appear in a minted identity.
             const delegateId = `${delegateBase}~wake-${randomUUID().slice(0, 8)}`;
+            // Least authority: the delegate may read only mail from its
+            // inbound message onward, never the label's full history.
+            ws.delegateJob = job;
             clientId = delegateId;
             ws.clientId = delegateId;
             ws.delegateOf = delegateBase;
@@ -172,6 +209,64 @@ wss.on('connection', (ws, req) => {
               ? clientId
               : null;
 
+          // ---- Owner capability gate -------------------------------------
+          // Decides whether this connection may claim/reseat the label at
+          // all, BEFORE any contest with a current holder.
+          const fromLoopback = isLoopback(req.socket.remoteAddress);
+          const ownerEnrolled = capabilities.hasOwner(requestedClientId);
+          const presentedSecret = typeof msg.ownerSecret === 'string' ? msg.ownerSecret : null;
+          const ownerProven = ownerEnrolled
+            && presentedSecret
+            && capabilities.verifyOwner(requestedClientId, presentedSecret);
+          let mintedOwnerSecret = null;
+
+          if (ownerEnrolled && !ownerProven) {
+            // Wrong secret is always fatal. A missing secret is tolerated
+            // only for a local client during migration (and never when
+            // RELAY_REQUIRE_OWNER_CAPABILITY=1) — it then still has to win
+            // the pid contest below.
+            const tolerated = !presentedSecret && fromLoopback && !REQUIRE_OWNER_CAPABILITY;
+            if (!tolerated) {
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                clientId: requestedClientId,
+                reason: presentedSecret
+                  ? `Owner capability for "${requestedClientId}" is invalid.`
+                  : `"${requestedClientId}" is enrolled and requires its owner capability.`
+              }));
+              logger.warn('owner_capability_rejected', {
+                clientId: requestedClientId,
+                presented: Boolean(presentedSecret),
+                remoteAddress: req.socket.remoteAddress
+              });
+              return;
+            }
+            logger.warn('owner_capability_missing', {
+              clientId: requestedClientId,
+              remoteAddress: req.socket.remoteAddress,
+              note: 'local client without capability; falling back to pid rules'
+            });
+          }
+
+          if (!ownerEnrolled) {
+            // First claim = enrollment.
+            if (!fromLoopback && (!ENROLL_SECRET || msg.enrollSecret !== ENROLL_SECRET)) {
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                clientId: requestedClientId,
+                reason: 'Enrolling a new label from a remote host requires the enrollment secret.'
+              }));
+              logger.warn('enrollment_rejected', {
+                clientId: requestedClientId,
+                remoteAddress: req.socket.remoteAddress
+              });
+              return;
+            }
+            mintedOwnerSecret = capabilities.mintOwner(requestedClientId, {
+              host: msg.meta && msg.meta.host ? msg.meta.host : null
+            }).secret;
+          }
+
           const existingClient = clients.get(requestedClientId);
           if (existingClient && existingClient !== ws && existingClient.readyState === 1) {
             // Pid-anchored ownership (2026-08-05): a label belongs to the
@@ -183,7 +278,18 @@ wss.on('connection', (ws, req) => {
             //   - holder pid dead                -> label was orphaned; reassign
             //   - holder pid verifiably alive    -> REJECT the newcomer
             //   - holder remote / pid unknown    -> legacy newest-wins
-            const verdict = contestLabel(requestedClientId, existingClient, msg.meta);
+            // The capability and the pid answer DIFFERENT questions, and both
+            // must pass: the capability gates "may this connection claim the
+            // label at all" (above), while the pid contest decides "is a live
+            // process already using it". A capability must never evict a
+            // running session — two processes holding the same owner secret
+            // means the newcomer is a duplicate, not the true owner. It does
+            // authorize taking over a holder whose liveness is unverifiable
+            // (remote), which is the case pid rules cannot decide.
+            const contest = contestLabel(requestedClientId, existingClient, msg.meta);
+            const verdict = contest.action === 'takeover' && !ownerProven && REQUIRE_OWNER_CAPABILITY
+              ? { action: 'reject', holderPid: contest.holderPid }
+              : contest;
             if (verdict.action === 'reject') {
               logger.warn('register_rejected_label_owned', {
                 clientId: requestedClientId,
@@ -253,11 +359,14 @@ wss.on('connection', (ws, req) => {
           });
           logger.info('client_registered', { clientId, remoteAddress: req.socket.remoteAddress });
 
-          // Send registration confirmation
+          // Send registration confirmation. A freshly minted owner secret is
+          // returned exactly once, here; the client persists it privately and
+          // presents it on every later claim of this label.
           ws.send(JSON.stringify({
             type: 'registered',
             clientId,
-            peers: Array.from(clients.keys()).filter(id => id !== clientId)
+            peers: Array.from(clients.keys()).filter(id => id !== clientId),
+            ...(mintedOwnerSecret ? { ownerSecret: mintedOwnerSecret } : {})
           }));
 
           // Broadcast peer update to others. On a rename, first announce the
@@ -410,9 +519,12 @@ wss.on('connection', (ws, req) => {
             return;
           }
           // A delegate reads with its base label's visibility — that is the
-          // entire reason it exists (mail is addressed to the base).
+          // entire reason it exists (mail is addressed to the base) — but
+          // least authority applies: it sees only its assigned inbound
+          // message onward, never the label's full seven-day mailbox.
           const result = messageStore.query({
             requester: ws.delegateOf || clientId,
+            floorId: ws.delegateJob ? ws.delegateJob.messageId : undefined,
             count: msg.count,
             from: msg.from,
             to: msg.to,
@@ -427,6 +539,10 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'clear_history':
+          if (ws.delegateJob) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegates may not clear history' }));
+            return;
+          }
           const clearedCount = messageStore.clearCache();
           ws.send(JSON.stringify({
             type: 'history_cleared',
@@ -437,7 +553,7 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'purge_history':
-          if (!clientId || !ADMIN_CLIENT_IDS.has(clientId)) {
+          if (ws.delegateJob || !clientId || !ADMIN_CLIENT_IDS.has(clientId)) {
             ws.send(JSON.stringify({ type: 'error', message: 'Durable history purge is not authorized' }));
             logger.warn('history_purge_rejected', { clientId: clientId || 'unregistered' });
             return;
@@ -457,6 +573,12 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'get_sessions':
+          if (ws.delegateJob) {
+            // Session enumeration exposes every peer's pid/cwd; a job
+            // delegate has no need for it (least authority).
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegates may not enumerate sessions' }));
+            return;
+          }
           // Return every currently-connected session with its metadata, so any
           // peer can render the whole cluster (not just its local registry.json).
           const sessions = {};

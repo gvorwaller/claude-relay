@@ -43,9 +43,26 @@ class MessageStore {
     return envelope;
   }
 
-  query({ requester, count = 10, from, to, after } = {}) {
+  query({ requester, count = 10, from, to, after, floorId } = {}) {
     if (!requester) return { messages: [], cursor: null };
     const limit = Math.max(1, Math.min(Number(count) || 10, this.maxQueryCount));
+    // floorId confines a least-authority reader (a job delegate) to the
+    // message it was woken for and everything after it — never the whole
+    // mailbox. Enforced here so no caller can forget it.
+    if (floorId) {
+      const all = this.readAll();
+      const index = all.findIndex(message => message.id === floorId);
+      const floorTime = index >= 0 ? Date.parse(all[index].timestamp) : null;
+      if (floorTime === null) return { messages: [], cursor: null, unknownCursor: true };
+      const scoped = all.filter(message => Date.parse(message.timestamp) >= floorTime);
+      const result = this.filterMessages(scoped, { requester, from, to, after });
+      const messages = result.messages.slice(-limit);
+      return {
+        messages,
+        cursor: messages.length ? messages[messages.length - 1].id : null,
+        unknownCursor: result.unknownCursor || undefined
+      };
+    }
     const cachedResult = this.filterMessages(this.cache, { requester, from, to, after });
     const afterIsCovered = !after
       || this.cache.some(message => message.id === after)
