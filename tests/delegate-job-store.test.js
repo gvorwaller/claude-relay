@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const { DelegateJobStore } = require('/Users/gaylonvorwaller/claude-relay/delegate-job-store');
+const { DelegateJobStore } = require('../delegate-job-store');
 
 function makeStore(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-jobs-'));

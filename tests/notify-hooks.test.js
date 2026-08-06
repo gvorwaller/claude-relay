@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { NotifyHooks } = require('/Users/gaylonvorwaller/claude-relay/notify-hooks');
+const { NotifyHooks } = require('../notify-hooks');
 
 function makeHooks(t, config, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notify-'));

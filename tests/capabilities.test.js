@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { CapabilityStore } = require('/Users/gaylonvorwaller/claude-relay/capabilities');
+const { CapabilityStore } = require('../capabilities');
 
 function store(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-caps-'));

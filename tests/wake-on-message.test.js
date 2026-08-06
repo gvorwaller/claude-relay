@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const WebSocket = require('/Users/gaylonvorwaller/claude-relay/node_modules/ws');
+const WebSocket = require('ws');
 
 function waitForMessage(ws, predicate, timeout = 3000) {
   return new Promise((resolve, reject) => {
@@ -44,7 +44,7 @@ function startServer(t, root, extraEnv = {}) {
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js'), String(port)], {
     env: {
       ...process.env,
-      NODE_PATH: '/Users/gaylonvorwaller/claude-relay/node_modules',
+      NODE_PATH: path.join(__dirname, '..', 'node_modules'),
       RELAY_MESSAGE_DIR: path.join(root, 'messages'),
       RELAY_LOG_DIR: path.join(root, 'logs'),
       ...extraEnv

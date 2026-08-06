@@ -4,14 +4,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, execFileSync } = require('child_process');
-const WebSocket = require('/Users/gaylonvorwaller/claude-relay/node_modules/ws');
+const WebSocket = require('ws');
 
 function startServer(t, root, extraEnv = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js'), String(port)], {
     env: {
       ...process.env,
-      NODE_PATH: '/Users/gaylonvorwaller/claude-relay/node_modules',
+      NODE_PATH: path.join(__dirname, '..', 'node_modules'),
       RELAY_MESSAGE_DIR: path.join(root, 'messages'),
       RELAY_LOG_DIR: path.join(root, 'logs'),
       ...extraEnv
@@ -62,7 +62,7 @@ test('the hook pair injects receipts, blocks an unreported turn, then closes the
   // The server loads its job store at startup, so the finished delegate work
   // must exist before it boots (in production the server creates these
   // itself, from its own notify path).
-  const { DelegateJobStore } = require('/Users/gaylonvorwaller/claude-relay/delegate-job-store');
+  const { DelegateJobStore } = require('../delegate-job-store');
   const store = new DelegateJobStore({ dataDir: path.join(root, 'jobs') }).initialize();
   const job = store.create({ owner: 'HOOKOWNER', inboundMessageId: 'in-1', from: 'CC6' });
   store.transition(job.jobId, 'running', { spawnPid: process.pid });
