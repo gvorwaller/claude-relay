@@ -146,3 +146,71 @@ test('retention never prunes a job the human has not been told about', t => {
   assert.ok(store.get(unreported.jobId), 'unreported work is never silently dropped');
   assert.equal(store.get(reported.jobId), null, 'reported work ages out normally');
 });
+
+test('terminal and reported receipts are immutable', t => {
+  const { store } = makeStore(t);
+  const job = store.create({ owner: 'CODEX3', inboundMessageId: 'i1', from: 'CC6' });
+  store.transition(job.jobId, 'running');
+  store.transition(job.jobId, 'completed');
+
+  // A late send cannot mutate a finished receipt.
+  assert.equal(store.recordOutbound(job.jobId, { to: 'CC6', messageId: 'late', delivered: true }), null);
+  assert.deepEqual(store.get(job.jobId).outbound, []);
+
+  // A late registration cannot restart it.
+  assert.equal(store.transition(job.jobId, 'running'), null);
+
+  // A replayed acknowledgement cannot rewrite who reported it.
+  store.transition(job.jobId, 'reported', { reportedTurnId: 'turn-1' });
+  store.transition(job.jobId, 'reported', { reportedTurnId: 'turn-2' });
+  assert.equal(store.get(job.jobId).reportedTurnId, 'turn-1');
+});
+
+test('a wake that exits without a delegate is distinct from a completed one', t => {
+  const { store } = makeStore(t);
+  const bare = store.create({ owner: 'CODEX3', inboundMessageId: 'i2', from: 'CC6' });
+  assert.ok(store.transition(bare.jobId, 'exited_no_delegate', { exitCode: 0 }));
+  assert.equal(store.get(bare.jobId).status, 'exited_no_delegate');
+  // It is still reportable — the human is owed the fact that nothing happened.
+  assert.ok(store.pending('CODEX3').some(j => j.jobId === bare.jobId));
+  // But it can never be dressed up as a completed run.
+  assert.equal(store.transition(bare.jobId, 'completed'), null);
+});
+
+test('pruning never removes a job that is running or unreported', t => {
+  let clock = Date.parse('2026-08-06T00:00:00.000Z');
+  const { store } = makeStore(t, { now: () => clock, maxJobs: 1, retentionDays: 7 });
+  const running = store.create({ owner: 'CODEX3', inboundMessageId: 'r1', from: 'CC6' });
+  store.transition(running.jobId, 'running');
+  const finished = store.create({ owner: 'CODEX3', inboundMessageId: 'r2', from: 'CC6' });
+  store.transition(finished.jobId, 'running');
+  store.transition(finished.jobId, 'completed');
+
+  clock += 60 * 24 * 60 * 60 * 1000;
+  store.prune();
+  assert.ok(store.get(running.jobId), 'an in-flight job is never pruned under count pressure');
+  assert.ok(store.get(finished.jobId), 'a finished-but-unreported job is never pruned');
+});
+
+test('invalid or misnamed records are quarantined, not silently dropped', t => {
+  const { store, dir } = makeStore(t);
+  const job = store.create({ owner: 'CODEX3', inboundMessageId: 'q1', from: 'CC6' });
+  // Corrupt the record's identity so it no longer matches its filename.
+  const file = path.join(dir, `${job.jobId}.json`);
+  fs.writeFileSync(file, JSON.stringify({ jobId: 'wake_../escape', owner: 'X', status: 'spawned', requestedAt: new Date().toISOString(), outbound: [] }));
+
+  const reopened = new DelegateJobStore({ dataDir: dir }).initialize();
+  assert.equal(reopened.get(job.jobId), null);
+  assert.ok(fs.existsSync(`${file}.quarantined`), 'bad records are kept for recovery, not deleted');
+});
+
+test('jobs from a previous server instance are interrupted, not resurrected by pid reuse', t => {
+  const { store, dir } = makeStore(t, { instanceId: 'run-1' });
+  const job = store.create({ owner: 'CODEX3', inboundMessageId: 'p1', from: 'CC6' });
+  // A pid that is definitely alive — this test process.
+  store.transition(job.jobId, 'running', { spawnPid: process.pid });
+
+  const nextRun = new DelegateJobStore({ dataDir: dir, instanceId: 'run-2' }).initialize();
+  assert.equal(nextRun.get(job.jobId).status, 'interrupted',
+    'a job whose capability died with the old server cannot be considered alive');
+});

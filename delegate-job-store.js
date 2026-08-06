@@ -13,19 +13,22 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // client rendered it — that would be `surfaced`, which only exists if a real
 // client acknowledgement channel is ever built.
 const TRANSITIONS = {
-  // 'completed' is reachable straight from 'spawned': a wake process can
-  // exit cleanly without its delegate ever registering (it had nothing to
-  // do, or it never got that far). That is still a terminal outcome the
-  // human is owed — an empty `outbound` list tells the real story.
-  spawned: ['running', 'completed', 'failed', 'interrupted'],
+  // A wake that exits without its delegate ever registering gets its own
+  // terminal state: an empty outbound list cannot distinguish "chose to send
+  // nothing" from "died before doing anything", and a bare shell exit 0
+  // proves no summary, changes, or verification. `completed` stays reserved
+  // for a run whose delegate actually connected.
+  spawned: ['running', 'exited_no_delegate', 'failed', 'interrupted'],
   running: ['completed', 'failed', 'interrupted'],
   completed: ['reported'],
+  exited_no_delegate: ['reported'],
   failed: ['reported'],
   interrupted: ['reported'],
-  reported: ['surfaced'],
-  surfaced: []
+  // `surfaced` intentionally does not exist yet: it would mean a client
+  // acknowledged rendering, and no such channel is built.
+  reported: []
 };
-const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'interrupted']);
+const TERMINAL_RUN_STATES = new Set(['completed', 'exited_no_delegate', 'failed', 'interrupted']);
 
 /**
  * Durable record of every delegated wake: why it started, what it did, what
@@ -44,19 +47,31 @@ class DelegateJobStore {
     this.retentionDays = options.retentionDays || 7;
     this.maxJobs = options.maxJobs || 500;
     this.jobs = new Map();
+    // Identifies THIS server run; jobs from earlier runs cannot resume.
+    this.instanceId = options.instanceId || randomUUID();
   }
 
   initialize() {
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.dataDir, 0o700);
     for (const file of this.jobFiles()) {
+      let job = null;
       try {
-        const job = JSON.parse(fs.readFileSync(file.path, 'utf8'));
-        if (job && job.jobId) this.jobs.set(job.jobId, job);
+        job = JSON.parse(fs.readFileSync(file.path, 'utf8'));
       } catch {
-        // A crash can leave one partial file; the rest of the store stands.
-        this.logger.warn('job_record_unreadable', { path: file.path });
+        job = null;
       }
+      const expectedId = path.basename(file.path, '.json');
+      if (!this.isValidRecord(job) || job.jobId !== expectedId) {
+        // Losing an unreported receipt silently is the failure this store
+        // exists to prevent: quarantine loudly instead of skipping.
+        try {
+          fs.renameSync(file.path, `${file.path}.quarantined`);
+        } catch { /* best effort */ }
+        this.logger.error('job_record_invalid_quarantined', { path: file.path });
+        continue;
+      }
+      this.jobs.set(job.jobId, job);
     }
     this.recoverOrphans();
     this.prune();
@@ -71,7 +86,12 @@ class DelegateJobStore {
   recoverOrphans() {
     for (const job of this.jobs.values()) {
       if (TERMINAL_RUN_STATES.has(job.status) || job.status === 'reported') continue;
-      const alive = job.spawnPid ? this.pidAlive(job.spawnPid) : false;
+      // A job from a PREVIOUS server instance can never resume: its job
+      // capability lived in memory and died with that instance, so the
+      // delegate could not authenticate even if its pid were somehow alive.
+      // Treating a reused pid as "still running" would strand it forever.
+      const sameInstance = job.serverInstance === this.instanceId;
+      const alive = sameInstance && job.spawnPid ? this.pidAlive(job.spawnPid) : false;
       if (!alive) {
         job.status = 'interrupted';
         job.completedAt = new Date(this.now()).toISOString();
@@ -81,6 +101,20 @@ class DelegateJobStore {
         this.logger.warn('job_recovered_as_interrupted', { jobId: job.jobId, owner: job.owner });
       }
     }
+  }
+
+  // Canonical shape only. jobId is checked against a strict pattern so a
+  // crafted value can never steer persist() outside dataDir.
+  isValidRecord(job) {
+    return Boolean(job)
+      && typeof job === 'object'
+      && typeof job.jobId === 'string'
+      && /^wake_[0-9a-f-]{36}$/.test(job.jobId)
+      && typeof job.owner === 'string'
+      && Object.prototype.hasOwnProperty.call(TRANSITIONS, job.status)
+      && typeof job.requestedAt === 'string'
+      && !Number.isNaN(Date.parse(job.requestedAt))
+      && Array.isArray(job.outbound);
   }
 
   pidAlive(pid) {
@@ -99,6 +133,7 @@ class DelegateJobStore {
       inboundMessageId: inboundMessageId || null,
       from: from || null,
       status: 'spawned',
+      serverInstance: this.instanceId,
       requestedAt: new Date(this.now()).toISOString(),
       startedAt: null,
       completedAt: null,
@@ -115,6 +150,7 @@ class DelegateJobStore {
     };
     this.jobs.set(job.jobId, job);
     this.persist(job);
+    this.prune();
     this.logger.info('job_created', { jobId: job.jobId, owner, inboundMessageId });
     return job;
   }
@@ -128,9 +164,12 @@ class DelegateJobStore {
     const job = this.jobs.get(jobId);
     if (!job) return null;
     if (job.status === status) {
+      // Idempotent, but never rewritable: a replayed ack must not overwrite
+      // the turn that actually reported it (re-check #10).
+      if (status === 'reported') return job;
       Object.assign(job, patch);
       this.persist(job);
-      return job; // idempotent
+      return job;
     }
     const allowed = TRANSITIONS[job.status] || [];
     if (!allowed.includes(status)) {
@@ -151,6 +190,17 @@ class DelegateJobStore {
   recordOutbound(jobId, { to, messageId, delivered }) {
     const job = this.jobs.get(jobId);
     if (!job) return null;
+    // Receipt facts are frozen once the job ends: a late send must never
+    // mutate a receipt that has already been reported, or the human was
+    // told something that is no longer true (re-check #2).
+    if (job.status !== 'spawned' && job.status !== 'running') {
+      this.logger.warn('job_outbound_after_terminal', { jobId, status: job.status, to });
+      return null;
+    }
+    if (job.outbound.length >= 50) {
+      this.logger.warn('job_outbound_capped', { jobId });
+      return null;
+    }
     job.outbound.push({
       to,
       messageId,
@@ -188,6 +238,10 @@ class DelegateJobStore {
       fs.closeSync(handle);
     }
     fs.renameSync(tmp, target);
+    try {
+      const dirFd = fs.openSync(this.dataDir, 'r');
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch { /* directory fsync unsupported */ }
   }
 
   jobFiles() {
@@ -206,23 +260,35 @@ class DelegateJobStore {
       .sort((a, b) => a.mtimeMs - b.mtimeMs);
   }
 
+  /**
+   * Only REPORTED jobs are ever removed. Anything still running, or finished
+   * but not yet told to the human, is retained regardless of age or count —
+   * the previous version could delete an in-flight job under maxJobs
+   * pressure (re-check #5). If the store fills with unreported work, that is
+   * a condition to alert on, not to silently discard.
+   */
   prune() {
     const cutoff = this.now() - this.retentionDays * DAY_MS;
     for (const job of Array.from(this.jobs.values())) {
-      const at = Date.parse(job.completedAt || job.requestedAt || '');
-      // Never prune a job the human has not been told about yet.
-      const unreported = TERMINAL_RUN_STATES.has(job.status);
-      if (Number.isFinite(at) && at < cutoff && !unreported) this.remove(job.jobId);
+      if (job.status !== 'reported') continue;
+      const at = Date.parse(job.reportedAt || job.completedAt || job.requestedAt || '');
+      if (Number.isFinite(at) && at < cutoff) this.remove(job.jobId);
     }
-    const files = this.jobFiles();
-    let excess = files.length - this.maxJobs;
-    for (const file of files) {
+    const removable = Array.from(this.jobs.values())
+      .filter(job => job.status === 'reported')
+      .sort((a, b) => String(a.reportedAt).localeCompare(String(b.reportedAt)));
+    let excess = this.jobs.size - this.maxJobs;
+    for (const job of removable) {
       if (excess <= 0) break;
-      const jobId = path.basename(file.path, '.json');
-      const job = this.jobs.get(jobId);
-      if (job && TERMINAL_RUN_STATES.has(job.status)) continue; // keep unreported
-      this.remove(jobId);
+      this.remove(job.jobId);
       excess -= 1;
+    }
+    if (this.jobs.size > this.maxJobs) {
+      this.logger.error('job_store_over_capacity_unreported', {
+        size: this.jobs.size,
+        maxJobs: this.maxJobs,
+        note: 'unreported jobs are never dropped; investigate why they are not being reported'
+      });
     }
   }
 

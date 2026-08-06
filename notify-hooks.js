@@ -121,6 +121,12 @@ class NotifyHooks {
     // fire instead: a delegate that was live at arrival may exit without
     // reading this message, and a debounced message needs a wake once the
     // window closes.
+    if (entry.type === 'exec' && job.target === 'all') {
+      // "Wake everyone" has no owner to attribute a job to; concrete targets
+      // already get their own entries (re-check #11).
+      this.logger.info('notify_exec_skipped_broadcast', { from: context.from });
+      return;
+    }
     if (entry.type === 'exec' && deliveredToDelegate) {
       this.scheduleTrailing(key, entry, index, job, context, debounceMs || 15000);
       return;
@@ -241,11 +247,19 @@ class NotifyHooks {
         } catch (err) {
           this.logger.error('job_capability_mint_failed', { target, error: err.message });
           if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+          if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+          if (jobRecord && this.jobStore) {
+            this.jobStore.transition(jobRecord.jobId, 'failed', {
+              reason: `setup failed: ${err.message}`
+            });
+          }
           onOutcome({ ok: false, error: `job capability unavailable: ${err.message}` });
           return;
         }
       }
-      const child = spawn(entry.command, {
+      let child;
+      try {
+        child = spawn(entry.command, {
         shell: true,
         detached: true,
         stdio: 'ignore',
@@ -259,6 +273,15 @@ class NotifyHooks {
           ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {})
         }
       });
+      } catch (err) {
+        if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+        if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+        if (jobRecord && this.jobStore) {
+          this.jobStore.transition(jobRecord.jobId, 'failed', { reason: `spawn threw: ${err.message}` });
+        }
+        onOutcome({ ok: false, error: err.message });
+        return;
+      }
       // Bind the capability to this process tree: registration later requires
       // the connecting bridge to be a descendant of the wake we started.
       if (jobKey && child.pid) this.capabilities.setJobSpawnPid(jobKey, child.pid);
@@ -271,14 +294,23 @@ class NotifyHooks {
         if (settled) return;
         settled = true;
         if (jobRecord && this.jobStore) {
-          // Terminal state from the wake process itself. A nonzero exit or a
-          // spawn error is a FAILED job, and failures must surface exactly
-          // like successes.
-          this.jobStore.transition(
-            jobRecord.jobId,
-            outcome.ok ? 'completed' : 'failed',
-            { exitCode: outcome.code === undefined ? null : outcome.code }
-          );
+          // outcome.ok answers "should we retry the wake?", NOT "did the
+          // work succeed?" (re-check #3). Any nonzero exit is a failure; a
+          // clean exit whose delegate never registered gets its own state
+          // rather than claiming completion.
+          const exitCode = outcome.code === undefined ? null : outcome.code;
+          const current = this.jobStore.get(jobRecord.jobId);
+          const ranAsDelegate = current && current.status === 'running';
+          let terminal;
+          if (outcome.error || (exitCode !== null && exitCode !== 0)) {
+            terminal = 'failed';
+          } else {
+            terminal = ranAsDelegate ? 'completed' : 'exited_no_delegate';
+          }
+          this.jobStore.transition(jobRecord.jobId, terminal, {
+            exitCode,
+            reason: outcome.error || null
+          });
         }
         if (!outcome.ok) {
           // A wake that never really ran must leave nothing usable behind:

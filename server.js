@@ -252,7 +252,30 @@ wss.on('connection', (ws, req) => {
             // inbound message onward, never the label's full history.
             ws.delegateJob = job;
             if (job.jobId) {
-              jobStore.transition(job.jobId, 'running', { delegateId, spawnPid: job.spawnPid });
+              const started = jobStore.transition(job.jobId, 'running', {
+                delegateId,
+                spawnPid: job.spawnPid
+              });
+              if (!started) {
+                // Its job already ended (late registration after the wake
+                // exited). Accepting it would let a terminal receipt acquire
+                // new sends afterwards (re-check #2).
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  message: 'This delegate job has already ended; registration refused'
+                }));
+                logger.warn('delegate_rejected_job_not_startable', {
+                  delegateOf: delegateBase,
+                  jobId: job.jobId
+                });
+                clients.delete(delegateId);
+                clientMeta.delete(delegateId);
+                clientId = null;
+                ws.delegateOf = null;
+                ws.delegateJob = null;
+                if (ws.delegateLease) { clearTimeout(ws.delegateLease); ws.delegateLease = null; }
+                return;
+              }
             }
             // Bounded lease: a consumed token must not grant an indefinite
             // session. The socket is closed when the job's session window
@@ -555,6 +578,16 @@ wss.on('connection', (ws, req) => {
             delivered
           });
 
+          if (ws.delegateJob && ws.delegateJob.jobId) {
+            // Recorded BEFORE delivery: evidence must never lag the fact it
+            // attests (re-check #8).
+            jobStore.recordOutbound(ws.delegateJob.jobId, {
+              to,
+              messageId: envelope.id,
+              delivered
+            });
+          }
+
           if (msg.to && msg.to !== 'all') {
             for (const peer of directSockets) {
               peer.send(JSON.stringify(envelope));
@@ -573,13 +606,6 @@ wss.on('connection', (ws, req) => {
             to,
             delivered
           }));
-          if (ws.delegateJob && ws.delegateJob.jobId) {
-            jobStore.recordOutbound(ws.delegateJob.jobId, {
-              to,
-              messageId: envelope.id,
-              delivered
-            });
-          }
           logger.info('message_recorded', {
             messageId: envelope.id,
             from: fromId,
@@ -651,14 +677,23 @@ wss.on('connection', (ws, req) => {
           }
           const pending = jobStore.pending(clientId).map(job => ({
             jobId: job.jobId,
-            status: job.status,
+            inboundMessageId: job.inboundMessageId,
             from: job.from,
+            status: job.status,
+            reason: job.recovered ? 'process ended without reporting' : null,
             requestedAt: job.requestedAt,
+            startedAt: job.startedAt,
             completedAt: job.completedAt,
+            delegateId: job.delegateId,
             exitCode: job.exitCode,
+            // Delegate-authored, explicitly untrusted, populated only by an
+            // authenticated wrapper result (not yet implemented).
             summary: job.summary,
+            changes: job.changes,
+            verification: job.verification,
             // Server-attested: what this delegate actually sent, and whether
-            // it was delivered live or queued.
+            // it was delivered live or queued. "delivered" means a live
+            // socket accepted it — never that anyone read it.
             outbound: job.outbound
           }));
           ws.send(JSON.stringify({ type: 'receipts', receipts: pending }));
@@ -671,15 +706,20 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'error', message: 'Register as a primary session to acknowledge receipts' }));
             return;
           }
-          const requested = Array.isArray(msg.jobIds) ? msg.jobIds : [];
+          const requested = [...new Set(
+            (Array.isArray(msg.jobIds) ? msg.jobIds : [])
+              .filter(id => typeof id === 'string' && id.length <= 64)
+              .slice(0, 100)
+          )];
+          const turnId = typeof msg.turnId === 'string' ? msg.turnId.slice(0, 128) : null;
           // Only this owner's jobs may be marked, whatever ids were sent.
           const own = requested.filter(id => {
             const job = jobStore.get(id);
             return job && job.owner === clientId;
           });
-          const marked = jobStore.markReported(own, msg.turnId);
+          const marked = jobStore.markReported(own, turnId);
           ws.send(JSON.stringify({ type: 'receipts_acked', jobIds: marked }));
-          logger.info('receipts_reported', { clientId, count: marked.length, turnId: msg.turnId || null });
+          logger.info('receipts_reported', { clientId, count: marked.length, turnId });
           break;
         }
 

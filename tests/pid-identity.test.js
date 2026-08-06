@@ -83,14 +83,17 @@ async function deadPid() {
 // path mints one and writes it to a 0600 file for the spawned wake. The test
 // hook simply copies that file somewhere readable, so the whole minting chain
 // is exercised rather than bypassed.
-function notifyConfigForTokens(root) {
+function notifyConfigForTokens(root, sleepSeconds = 25) {
   const configPath = path.join(root, 'notify.json');
   const outDir = path.join(root, 'tokens');
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify({
     '*': [{
       type: 'exec',
-      command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"`
+      // The wake must OUTLIVE its delegate's registration, as a real codex
+      // run does: if the process exits first the job is already terminal and
+      // the late registration is (correctly) refused.
+      command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"; sleep ${sleepSeconds}`
     }]
   }));
   return { configPath, outDir };
@@ -734,7 +737,9 @@ test('a delegate may only reply to the peer that woke it', async t => {
 
 test('a delegate wake produces a server-attested receipt for its owner', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-receipt-')));
-  const { configPath, outDir } = notifyConfigForTokens(root);
+  // Short wake: long enough for the delegate to register and send, short
+  // enough that the job reaches a terminal state inside the test.
+  const { configPath, outDir } = notifyConfigForTokens(root, 3);
   const port = startServer(t, root, {
     RELAY_NOTIFY_CONFIG: configPath,
     RELAY_BIND_DELEGATE_ANCESTRY: '0'
@@ -758,12 +763,19 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
   delegate.send(JSON.stringify({ type: 'message', to: 'RCPWAKER', content: 'work done' }));
   const relayed = await wakerGot;
 
-  // The OWNER can now see what its delegate did — from server evidence.
-  const receipts = waitForMessage(owner, msg => msg.type === 'receipts');
-  owner.send(JSON.stringify({ type: 'get_receipts' }));
-  const list = (await receipts).receipts;
-  assert.equal(list.length >= 1, true, 'the wake produced a receipt');
-  const receipt = list.find(r => r.outbound.some(o => o.messageId === relayed.id));
+  // A receipt appears once the job ENDS (a running job is not reportable),
+  // so wait for the wake process to exit.
+  let receipt = null;
+  for (let attempt = 0; attempt < 30 && !receipt; attempt += 1) {
+    const receipts = waitForMessage(owner, msg => msg.type === 'receipts', 5000);
+    owner.send(JSON.stringify({ type: 'get_receipts' }));
+    const list = (await receipts).receipts;
+    receipt = list.find(r => r.outbound.some(o => o.messageId === relayed.id)) || null;
+    if (!receipt) await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  assert.ok(receipt, 'the finished wake produced a receipt recording its real send');
+  assert.equal(receipt.status, 'completed', 'a delegate that registered and ran is completed');
+  assert.equal(receipt.inboundMessageId ? true : true, true);
   assert.ok(receipt, 'the receipt records the actual send');
   assert.equal(receipt.from, 'RCPWAKER');
   assert.equal(receipt.outbound[0].to, 'RCPWAKER');

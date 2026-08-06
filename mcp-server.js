@@ -1654,6 +1654,18 @@ function connectToRelay() {
     // Attempt reconnect after delay — unless displaced (reconnecting under a
     // taken-over ID just re-seizes it and starts an endless takeover fight)
     // or rejected (the label's live owner would refuse us again forever).
+    if (DELEGATE_FOR && !shuttingDown) {
+      // Its job capability was consumed at registration and cannot be reused,
+      // so reconnecting would produce a connected-but-unregistered zombie
+      // whose relay_receive never resolves. End the delegate instead.
+      console.error(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: 'delegate_socket_closed',
+        clientId: CLIENT_ID,
+        action: 'exiting; a delegate job capability is single-use'
+      }));
+      process.exit(0);
+    }
     if (!shuttingDown && !displaced && !rejectedReason) {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
