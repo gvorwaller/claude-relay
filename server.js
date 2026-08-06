@@ -166,13 +166,20 @@ wss.on('connection', (ws, req) => {
             // Authorize-and-consume atomically: a failed attempt must NOT
             // spend the capability, or a thief could deny the real delegate
             // by trying once (re-check #2). Every factor is checked first.
-            const claimantPid = msg.meta && Number(msg.meta.pid);
+            // OBSERVED, not asserted: ask the kernel which process owns this
+            // socket. A same-user thief who reads the bearer file cannot
+            // fake this — it would have to actually be inside the wake's
+            // process tree.
+            const observedPid = BIND_DELEGATE_ANCESTRY
+              ? peerPidForPort(req.socket.remotePort)
+              : null;
             const authorized = capabilities.authorizeJob(msg.jobToken, delegateBase, jobRecord => {
               if (!BIND_DELEGATE_ANCESTRY) return true;
-              // Fail closed when the binding cannot be evaluated: a wake with
-              // no recorded pid must not silently downgrade to bearer-only.
-              if (!jobRecord.spawnPid) return false;
-              return isDescendantOf(claimantPid, jobRecord.spawnPid);
+              // Fail closed when the binding cannot be evaluated: neither a
+              // wake with no recorded pid nor an unidentifiable peer may
+              // downgrade to bearer-only.
+              if (!jobRecord.spawnPid || !observedPid) return false;
+              return isDescendantOf(observedPid, jobRecord.spawnPid);
             });
             if (!authorized.ok) {
               ws.send(JSON.stringify({
@@ -184,7 +191,7 @@ wss.on('connection', (ws, req) => {
               logger.warn('delegate_capability_rejected', {
                 delegateOf: delegateBase,
                 reason: authorized.reason,
-                claimantPid: claimantPid || null,
+                observedPid: observedPid || null,
                 remoteAddress: req.socket.remoteAddress
               });
               return;
@@ -703,6 +710,40 @@ wss.on('close', () => clearInterval(retentionInterval));
 
 function isLoopback(address) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+/**
+ * The pid that actually owns the other end of a loopback TCP connection,
+ * read from the kernel's socket table.
+ *
+ * This is the difference between defense and theater: every previous version
+ * of the delegate binding trusted `meta.pid`, which a thief simply quotes
+ * from the wake's own process tree. The peer's real pid cannot be asserted —
+ * only observed.
+ */
+function peerPidForPort(port) {
+  if (!port) return null;
+  try {
+    const out = execFileSync(
+      'lsof',
+      ['-nP', '-a', `-iTCP:${port}`, '-sTCP:ESTABLISHED', '-Fpn'],
+      { encoding: 'utf8', timeout: 3000 }
+    );
+    let pid = null;
+    for (const line of out.split('\n')) {
+      if (line.startsWith('p')) {
+        pid = Number(line.slice(1)) || null;
+      } else if (line.startsWith('n') && pid) {
+        // "n<local>-><remote>": the peer is the socket whose LOCAL side is
+        // the port we saw as remote.
+        const [local] = line.slice(1).split('->');
+        if (local && local.endsWith(`:${port}`)) return pid;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 // Is `pid` inside the process tree rooted at `ancestorPid`? Used to bind a

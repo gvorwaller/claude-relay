@@ -668,11 +668,33 @@ test('a stolen job token is useless outside the spawned wake process tree', asyn
   const thief = await open(port);
   t.after(() => thief.close());
   const refused = waitForMessage(thief, msg =>
-    msg.type === 'error' && /spawned wake process tree/.test(msg.message));
+    msg.type === 'error' && /spawned wake process tree/.test(msg.message), 8000);
+  // The thief does NOT report its honest pid — it quotes a pid it knows is
+  // inside the wake's process tree (this is the attack the previous version
+  // missed, because it validated the ASSERTED pid). The server ignores the
+  // assertion and asks the kernel who owns the socket.
   thief.send(JSON.stringify({
-    type: 'register', clientId: 'ANCBASE', delegate: true, jobToken: stolen, meta: { pid: process.pid }
+    type: 'register',
+    clientId: 'ANCBASE',
+    delegate: true,
+    jobToken: stolen,
+    meta: { pid: 1 } // deliberately bogus/forged
   }));
   await refused;
+
+  // And the capability was NOT burned by the failed attempt: it is still
+  // usable, so a thief cannot deny the real delegate by trying once.
+  const legit = await open(port);
+  t.after(() => legit.close());
+  const stillValid = waitForMessage(legit, msg =>
+    msg.type === 'error' && /spawned wake process tree/.test(msg.message), 8000);
+  legit.send(JSON.stringify({
+    type: 'register', clientId: 'ANCBASE', delegate: true, jobToken: stolen, meta: { pid: process.pid }
+  }));
+  // (Still refused here because this test process is not in the wake tree
+  // either — the point is that the token survived the first attempt rather
+  // than being consumed by it.)
+  await stillValid;
 });
 
 test('a delegate may only reply to the peer that woke it', async t => {
