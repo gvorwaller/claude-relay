@@ -32,7 +32,7 @@ const eventArg = (() => {
 
 const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:9999';
 const REGISTRY = path.join(os.homedir(), 'claude-relay', 'sessions', 'registry.json');
-const MARKER = /<!--\s*relay-delegate-receipts:\s*([^>]*?)\s*-->/;
+const MARKER = /<!--\s*relay-delegate-receipts:\s*([0-9a-f]{64})\s*-->/;
 // Pending state between the two halves of one turn, keyed by session.
 const stateDir = path.join(os.tmpdir(), 'claude-relay-receipts');
 
@@ -59,7 +59,7 @@ function emit(output) {
  * the registry — the same mechanism the Claude Code stop hook uses — so no
  * per-session configuration is needed.
  */
-function resolveOwner() {
+function resolveOwner(input = {}) {
   if (process.env.RELAY_DELEGATE_FOR) return null; // a delegate must never report on itself
   // Explicit override for harnesses and for sessions whose ancestry cannot
   // be resolved. Possession of the owner capability is still required.
@@ -69,6 +69,13 @@ function resolveOwner() {
     registry = JSON.parse(fs.readFileSync(REGISTRY, 'utf8'));
   } catch {
     return null;
+  }
+  if (input.session_id) {
+    const exact = Object.entries(registry)
+      .filter(([, info]) => info && info.codexSessionId === input.session_id)
+      .map(([label]) => label);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) return null;
   }
   const { execFileSync } = require('child_process');
   const ppid = pid => {
@@ -148,42 +155,53 @@ function describe(receipt) {
   return lines.join('\n');
 }
 
+function writeStateAtomic(file, value) {
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
 async function onUserPromptSubmit(input) {
-  const owner = resolveOwner();
+  const owner = resolveOwner(input);
   if (!owner) emit({});
   const receipts = await withRelay(owner, (ws, finish) => {
     ws.handler = (msg, done) => {
-      if (msg.type === 'receipts') done(msg.receipts || []);
+      if (msg.type === 'receipts') done({ receipts: msg.receipts || [], digest: msg.digest });
       if (msg.type === 'error') done(null);
     };
     ws.send(JSON.stringify({ type: 'get_receipts', owner, ownerSecret: readOwnerSecret(owner) }));
   });
-  if (!receipts || receipts.length === 0) emit({});
+  if (!receipts || receipts.receipts.length === 0 || !receipts.digest) emit({});
 
-  // At most five in detail; the rest are counted but every id is still
-  // acknowledged, so nothing is silently dropped.
-  const shown = receipts.slice(0, 5);
-  const ids = receipts.map(r => r.jobId);
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(stateFile(input.session_id), JSON.stringify({ owner, ids }), { mode: 0o600 });
-
-  const extra = receipts.length > shown.length
-    ? `\n(and ${receipts.length - shown.length} more delegated run(s) — acknowledge all of them)`
-    : '';
+  // The server already limits one batch to five. Only those complete facts
+  // are eligible for acknowledgement; later receipts remain pending.
+  const shown = receipts.receipts;
+  const ids = shown.map(r => r.jobId);
+  const reportLines = shown.map(r => r.reportLine);
+  const turnId = input.turn_id || input.prompt_id || null;
+  writeStateAtomic(stateFile(input.session_id), {
+    owner,
+    sessionId: input.session_id || null,
+    turnId,
+    ids,
+    digest: receipts.digest,
+    reportLines,
+    correctionRequested: false
+  });
 
   const context = [
-    `While you were away, ${receipts.length} delegated wake(s) ran for "${owner}" and have not been reported yet.`,
+    `While you were away, ${shown.length} delegated wake(s) ran for "${owner}" and have not been reported yet.`,
     '',
     shown.map(describe).join('\n'),
-    extra,
     '',
-    'Before finishing this turn you MUST tell the user what these runs did, leading with any',
-    'relay replies they sent (recipient and delivered-or-queued state come from server records,',
-    'not from the run\'s own prose — state them as fact). Write it naturally; do not paste ids at',
-    'the user. Then include this exact marker somewhere in your final message so the receipt can',
-    'be closed out:',
+    'Before finishing this turn, include each following server-generated sentence verbatim in',
+    'your visible final message. You may add a natural explanation around them. Then include the',
+    'exact marker. The Stop hook acknowledges only facts that are visibly present:',
     '',
-    `<!-- relay-delegate-receipts: ${ids.join(',')} -->`
+    reportLines.join('\n'),
+    '',
+    `<!-- relay-delegate-receipts: ${receipts.digest} -->`
   ].join('\n');
 
   emit({
@@ -195,8 +213,6 @@ async function onUserPromptSubmit(input) {
 }
 
 async function onStop(input) {
-  // A correction pass is already running: do not loop.
-  if (input.stop_hook_active) emit({});
   const file = stateFile(input.session_id);
   let pending;
   try {
@@ -207,19 +223,26 @@ async function onStop(input) {
   const injected = pending.ids || [];
   if (injected.length === 0) emit({});
 
+  if (pending.sessionId && pending.sessionId !== input.session_id) emit({});
+  const stopTurnId = input.turn_id || input.prompt_id || null;
+  if (pending.turnId && stopTurnId && pending.turnId !== stopTurnId) emit({});
+
   const message = input.last_assistant_message || '';
   const match = MARKER.exec(message);
-  const covered = match ? match[1].split(',').map(s => s.trim()).filter(Boolean) : [];
-  const missing = injected.filter(id => !covered.includes(id));
+  const markerMatches = match && match[1] === pending.digest;
+  const missingFacts = (pending.reportLines || []).filter(line => !message.includes(line));
 
-  if (missing.length > 0) {
+  if (!markerMatches || missingFacts.length > 0) {
+    // On the corrective stop_hook_active pass, do not create a loop and do
+    // not acknowledge. The same receipts remain pending for the next turn.
+    if (input.stop_hook_active || pending.correctionRequested) emit({});
+    pending.correctionRequested = true;
+    writeStateAtomic(file, pending);
     // Enforcement: the turn does not end until the work is reported.
     emit({
       decision: 'block',
-      reason: `You have not reported ${missing.length} delegated run(s) that completed while you were away. `
-        + 'Describe what they did — including any relay replies they sent, with recipient and '
-        + 'delivered-or-queued state — and include the marker '
-        + `<!-- relay-delegate-receipts: ${injected.join(',')} --> in your final message.`
+      reason: `You have not visibly reported ${missingFacts.length || injected.length} delegated run(s). `
+        + `Include every server-generated receipt sentence and the marker <!-- relay-delegate-receipts: ${pending.digest} -->.`
     });
   }
 
@@ -235,6 +258,7 @@ async function onStop(input) {
       owner: pending.owner,
       ownerSecret: readOwnerSecret(pending.owner),
       jobIds: injected,
+      digest: pending.digest,
       turnId: input.turn_id || null
     }));
   });

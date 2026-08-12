@@ -252,7 +252,9 @@ class CapabilityStore {
     return { ok: true, job };
   }
 
-  /** Verify a wake wrapper's authority to submit THIS job's result. */
+  /** Verify a wake wrapper's authority without spending it. Activity updates
+   * reuse the same job-bound credential; only an accepted final result spends
+   * it, so a transport failure remains retryable. */
   verifyResultSecret(jobId, secret) {
     const record = this.resultSecrets.get(jobId);
     if (!record || typeof secret !== 'string' || !secret) return false;
@@ -264,8 +266,11 @@ class CapabilityStore {
     const stored = Buffer.from(record.hash, 'hex');
     if (provided.length !== stored.length) return false;
     if (!timingSafeEqual(provided, stored)) return false;
-    this.resultSecrets.delete(jobId); // single use
     return true;
+  }
+
+  consumeResultSecret(jobId) {
+    return this.resultSecrets.delete(jobId);
   }
 
   revokeJobsFor(owner) {

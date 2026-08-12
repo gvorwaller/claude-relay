@@ -183,15 +183,25 @@ fi
 # submit the result.
 LAST_MESSAGE_FILE="$(mktemp -t relay-lastmsg)"
 chmod 600 "$LAST_MESSAGE_FILE"
-codex exec "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" resume "$SESSION_ID" "$PROMPT"
+node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
+  codex exec --json "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" \
+  resume "$SESSION_ID" "$PROMPT"
 CODEX_EXIT=$?
 
 if [[ -n "${RELAY_JOB_ID:-}" && -n "${RELAY_JOB_RESULT_SECRET_FILE:-}" ]]; then
-  node "$(dirname "${BASH_SOURCE[0]}")/submit-job-result.js" \
-    --job-id "$RELAY_JOB_ID" \
-    --secret-file "$RELAY_JOB_RESULT_SECRET_FILE" \
-    --last-message "$LAST_MESSAGE_FILE" \
-    --exit-code "$CODEX_EXIT" || echo "note: job result submission failed"
+  RESULT_RECORDED=0
+  for ATTEMPT in 1 2 3; do
+    if node "$(dirname "${BASH_SOURCE[0]}")/submit-job-result.js" \
+      --job-id "$RELAY_JOB_ID" \
+      --secret-file "$RELAY_JOB_RESULT_SECRET_FILE" \
+      --last-message "$LAST_MESSAGE_FILE" \
+      --exit-code "$CODEX_EXIT"; then
+      RESULT_RECORDED=1
+      break
+    fi
+    sleep "$ATTEMPT"
+  done
+  [[ "$RESULT_RECORDED" == "1" ]] || echo "note: job result submission failed; credential retained for retry"
 fi
 rm -f "$LAST_MESSAGE_FILE"
 exit $CODEX_EXIT

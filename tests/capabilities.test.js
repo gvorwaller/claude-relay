@@ -142,7 +142,7 @@ test('a failed authorization does not burn the capability', t => {
   assert.equal(caps.authorizeJob(token, 'CODEXB').ok, false);
 });
 
-test('result secrets are single-use, job-bound, and expiring', t => {
+test('result secrets are reusable for activity, explicitly consumed, job-bound, and expiring', t => {
   let clock = 2_000_000;
   const { store: caps } = store(t, { now: () => clock, jobSessionMaxMs: 1000 });
   caps.mintOwner('CODEXR');
@@ -152,7 +152,9 @@ test('result secrets are single-use, job-bound, and expiring', t => {
   assert.equal(caps.verifyResultSecret('wake_b', minted.resultSecret), false, 'job-bound');
   assert.equal(caps.verifyResultSecret('wake_a', 'wrong'), false);
   assert.equal(caps.verifyResultSecret('wake_a', minted.resultSecret), true);
-  assert.equal(caps.verifyResultSecret('wake_a', minted.resultSecret), false, 'single use');
+  assert.equal(caps.verifyResultSecret('wake_a', minted.resultSecret), true, 'activity does not spend it');
+  assert.equal(caps.consumeResultSecret('wake_a'), true);
+  assert.equal(caps.verifyResultSecret('wake_a', minted.resultSecret), false, 'final acceptance spends it');
 
   const later = caps.mintJob({ owner: 'CODEXR', messageId: 'm2', replyTo: 'CC6', jobId: 'wake_c' });
   clock += 5000;

@@ -52,9 +52,10 @@ function startServer(t, root, extraEnv = {}) {
       NODE_PATH: path.join(__dirname, '..', 'node_modules'),
       RELAY_MESSAGE_DIR: path.join(root, 'messages'),
       RELAY_LOG_DIR: path.join(root, 'logs'),
+      RELAY_DISABLE_NOTIFICATIONS: '1',
       ...extraEnv
     },
-    stdio: 'ignore'
+    stdio: process.env.RELAY_TEST_DEBUG ? 'inherit' : 'ignore'
   });
   t.after(() => child.kill('SIGTERM'));
   return port;
@@ -93,7 +94,9 @@ function notifyConfigForTokens(root, sleepSeconds = 25) {
       // The wake must OUTLIVE its delegate's registration, as a real codex
       // run does: if the process exits first the job is already terminal and
       // the late registration is (correctly) refused.
-      command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"; sleep ${sleepSeconds}`
+      command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"; `
+        + `for i in $(seq 1 ${sleepSeconds * 20}); do `
+        + `[ -f "${outDir}/$RELAY_FOR.release" ] && exit 0; sleep 0.05; done; exit 0`
     }]
   }));
   return { configPath, outDir };
@@ -111,6 +114,10 @@ async function mintJobToken(outDir, sender, base) {
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   throw new Error(`job capability never appeared for ${base}`);
+}
+
+function releaseWake(outDir, base) {
+  fs.writeFileSync(path.join(outDir, `${base}.release`), 'release');
 }
 
 
@@ -167,6 +174,12 @@ test('delegate reads and speaks as its base label without ever owning it', async
   const baseGotFirst = nextMessage(base, 'message');
   sender.send(JSON.stringify({ type: 'message', to: 'CODEXD', content: 'before delegate' }));
   await baseGotFirst;
+  // Wait until the first wake has copied its token before mintJobToken removes
+  // the file. Otherwise that older process can win the race and overwrite the
+  // second wake's token after the unlink.
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(path.join(outDir, 'CODEXD.token')); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
   const jobToken = await mintJobToken(outDir, sender, 'CODEXD');
 
   // Delegate registers: derived visible ID, no contest with the base.
@@ -762,15 +775,19 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
   const wakerGot = nextMessage(waker, 'message');
   delegate.send(JSON.stringify({ type: 'message', to: 'RCPWAKER', content: 'work done' }));
   const relayed = await wakerGot;
+  releaseWake(outDir, 'RCPOWNER');
 
   // A receipt appears once the job ENDS (a running job is not reportable),
   // so wait for the wake process to exit.
   let receipt = null;
+  let receiptDigest = null;
   for (let attempt = 0; attempt < 30 && !receipt; attempt += 1) {
     const receipts = waitForMessage(owner, msg => msg.type === 'receipts', 5000);
     owner.send(JSON.stringify({ type: 'get_receipts' }));
-    const list = (await receipts).receipts;
+    const response = await receipts;
+    const list = response.receipts;
     receipt = list.find(r => r.outbound.some(o => o.messageId === relayed.id)) || null;
+    if (receipt) receiptDigest = response.digest;
     if (!receipt) await new Promise(resolve => setTimeout(resolve, 500));
   }
   assert.ok(receipt, 'the finished wake produced a receipt recording its real send');
@@ -789,7 +806,9 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
 
   // Acknowledging clears it; a second read shows nothing pending.
   const acked = waitForMessage(owner, msg => msg.type === 'receipts_acked');
-  owner.send(JSON.stringify({ type: 'ack_receipts', jobIds: [receipt.jobId], turnId: 'turn-1' }));
+  owner.send(JSON.stringify({
+    type: 'ack_receipts', jobIds: [receipt.jobId], digest: receiptDigest, turnId: 'turn-1'
+  }));
   assert.deepEqual((await acked).jobIds, [receipt.jobId]);
 
   const after = waitForMessage(owner, msg => msg.type === 'receipts');

@@ -29,6 +29,11 @@ const TRANSITIONS = {
   reported: []
 };
 const TERMINAL_RUN_STATES = new Set(['completed', 'exited_no_delegate', 'failed', 'interrupted']);
+const ACTIVITY_TYPES = new Set([
+  'analyzing', 'reading_message', 'reading_files', 'running_command',
+  'using_tool', 'updating_files', 'sending_reply', 'preparing_response',
+  'waiting', 'finishing', 'error'
+]);
 
 /**
  * Durable record of every delegated wake: why it started, what it did, what
@@ -71,6 +76,7 @@ class DelegateJobStore {
         this.logger.error('job_record_invalid_quarantined', { path: file.path });
         continue;
       }
+      if (!Array.isArray(job.activity)) job.activity = [];
       this.jobs.set(job.jobId, job);
     }
     this.recoverOrphans();
@@ -127,6 +133,15 @@ class DelegateJobStore {
   }
 
   create({ owner, inboundMessageId, from }) {
+    this.prune();
+    if (this.jobs.size >= this.maxJobs) {
+      this.logger.error('job_store_rejecting_new_work', {
+        size: this.jobs.size,
+        maxJobs: this.maxJobs,
+        note: 'operator must report or investigate retained jobs'
+      });
+      throw new Error(`delegate job store is at capacity (${this.jobs.size}/${this.maxJobs})`);
+    }
     const job = {
       jobId: `wake_${randomUUID()}`,
       owner,
@@ -145,6 +160,10 @@ class DelegateJobStore {
       summary: null,
       changes: null,
       verification: [],
+      // Sanitized, allowlisted progress only. Raw Codex JSON, reasoning,
+      // commands, arguments, output, paths, and message text never enter the
+      // durable record read by relay-monitor.
+      activity: [],
       // Server-attested outbound sends. The delegate cannot write here.
       outbound: []
     };
@@ -207,6 +226,18 @@ class DelegateJobStore {
       delivered: Boolean(delivered),
       at: new Date(this.now()).toISOString()
     });
+    this.persist(job);
+    return job;
+  }
+
+  recordActivity(jobId, { type }) {
+    const job = this.jobs.get(jobId);
+    if (!job || !ACTIVITY_TYPES.has(type)) return null;
+    if (job.status !== 'spawned' && job.status !== 'running') return null;
+    const previous = job.activity[job.activity.length - 1];
+    if (previous && previous.type === type) return job;
+    if (job.activity.length >= 100) job.activity.shift();
+    job.activity.push({ type, at: new Date(this.now()).toISOString() });
     this.persist(job);
     return job;
   }

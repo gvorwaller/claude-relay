@@ -35,7 +35,6 @@ if (!jobId || !secretFile) {
 let secret = null;
 try {
   secret = fs.readFileSync(secretFile, 'utf8').trim();
-  fs.unlinkSync(secretFile); // single use
 } catch {
   console.error('no result credential available');
   process.exit(2);
@@ -85,7 +84,10 @@ ws.on('open', () => {
 ws.on('message', data => {
   try {
     const msg = JSON.parse(data.toString());
-    if (msg.type === 'job_result_recorded') return done(0);
+    if (msg.type === 'job_result_recorded') {
+      try { fs.unlinkSync(secretFile); } catch {}
+      return done(0);
+    }
     if (msg.type === 'error') {
       console.error(`result rejected: ${msg.message}`);
       return done(1);

@@ -1,0 +1,27 @@
+{
+  "description": "Surface durable claude-relay delegate receipts in the owning Codex task.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/gaylonvorwaller/claude-relay/scripts/relay-receipts-hook.js --event userPromptSubmit",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/gaylonvorwaller/claude-relay/scripts/relay-receipts-hook.js --event stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

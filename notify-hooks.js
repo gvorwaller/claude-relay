@@ -5,8 +5,10 @@ const os = require('os');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
+const { notifyDelegate } = require('./delegate-notifier');
 
 const EXEC_TIMEOUT_MS = 30000;
+const NOT_APPLICABLE_EXIT = 64;
 // A nonzero exit sooner than this means the command never really ran
 // (missing binary -> shell exits 127, bad flags, etc).
 const EARLY_EXIT_MS = 5000;
@@ -43,6 +45,7 @@ class NotifyHooks {
     // Durable record of every delegated wake (accountability layer).
     this.jobStore = options.jobStore || null;
     this.runner = options.runner || this.defaultRunner.bind(this);
+    this.notifier = options.notifier || notifyDelegate;
     this.now = options.now || (() => Date.now());
     // Debounce state per config entry: `${configKey}:${entryIndex}` -> last-fired ms
     this.lastFired = new Map();
@@ -296,6 +299,7 @@ class NotifyHooks {
       if (jobKey && child.pid) this.capabilities.setJobSpawnPid(jobKey, child.pid);
       if (jobRecord && this.jobStore) {
         this.jobStore.transition(jobRecord.jobId, 'spawned', { spawnPid: child.pid || null });
+        this.notifier({ owner: target, state: 'started' });
       }
       // 'error' and 'exit' can both fire; the outcome must be reported once.
       let settled = false;
@@ -331,6 +335,7 @@ class NotifyHooks {
             exitCode,
             reason: outcome.error || null
           });
+          this.notifier({ owner: target, state: terminal === 'completed' ? 'completed' : 'failed' });
         }
         if (!outcome.ok) {
           // A wake that never really ran must leave nothing usable behind:

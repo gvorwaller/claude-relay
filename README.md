@@ -179,6 +179,34 @@ exports never arrive); as a fallback, a bridge that detects a `codex exec`
 process ancestor self-selects delegate mode, so headless one-offs never seize
 a label even without the flag.
 
+### Watching delegated Codex work
+
+Run `npm run monitor` in the relay checkout (or `node scripts/relay-monitor.js`)
+for a live terminal view of recent delegate jobs. Optional flags are
+`--owner CODEX3`, `--interval 500`, and `--once`. The monitor shows causal job
+state, a deliberately coarse current activity, relay replies and whether each
+was delivered live or queued.
+
+The activity feed is a strict allowlist projected from `codex exec --json`.
+It never stores or renders raw JSON, reasoning, prompts, message bodies,
+commands, command output, tool arguments, file paths, or secrets. macOS also
+shows content-minimized start and completion/failure notifications; set
+`RELAY_DISABLE_NOTIFICATIONS=1` to disable those notices.
+
+Completed jobs remain durable until the owning foreground Codex task visibly
+reports the server-generated receipt facts. `scripts/relay-receipts-hook.js`
+implements the `UserPromptSubmit`/`Stop` handshake. It processes at most five
+receipts per turn, binds the batch to the exact Codex session and fact digest,
+and never acknowledges facts omitted from the visible response. Install this
+hook only through a trusted local Codex hook configuration; delegates are
+explicitly excluded from reporting their own receipts.
+
+For this checkout, copy `codex-hooks.json.example` to `~/.codex/hooks.json`
+after deployment, then open `/hooks` in Codex CLI and review/trust both exact
+command definitions. Codex hashes command hooks and skips new or changed
+definitions until they are trusted; do not bypass that review for ordinary
+interactive use.
+
 **Background forks don't inherit identity.** Forked or background Claude sessions (`--fork-session` subagents, `--bg-pty-host` daemon resumes, scheduled runs) inherit `CLAUDE_RELAY_SESSION_ID`/`RELAY_CLIENT_ID` from the original session's environment. The MCP client detects that ancestry (or an explicit `RELAY_BACKGROUND_FORK=1`) and registers as `<ID>-bg<pid36>` instead of seizing the live session's identity. An explicit `--client-id` argument still wins — that's a deliberate choice by the spawner.
 
 ---

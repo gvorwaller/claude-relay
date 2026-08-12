@@ -6,6 +6,7 @@
   "scripts": {
     "server": "node server.js",
     "mcp": "node mcp-server.js",
+    "monitor": "node scripts/relay-monitor.js",
     "test-client": "node test-client.js",
     "test": "node --test tests/*.test.js"
   },

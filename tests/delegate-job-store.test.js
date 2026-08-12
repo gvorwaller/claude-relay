@@ -177,19 +177,29 @@ test('a wake that exits without a delegate is distinct from a completed one', t 
   assert.equal(store.transition(bare.jobId, 'completed'), null);
 });
 
-test('pruning never removes a job that is running or unreported', t => {
+test('backpressure rejects new work rather than pruning running or unreported jobs', t => {
   let clock = Date.parse('2026-08-06T00:00:00.000Z');
   const { store } = makeStore(t, { now: () => clock, maxJobs: 1, retentionDays: 7 });
   const running = store.create({ owner: 'CODEX3', inboundMessageId: 'r1', from: 'CC6' });
   store.transition(running.jobId, 'running');
-  const finished = store.create({ owner: 'CODEX3', inboundMessageId: 'r2', from: 'CC6' });
-  store.transition(finished.jobId, 'running');
-  store.transition(finished.jobId, 'completed');
+  assert.throws(
+    () => store.create({ owner: 'CODEX3', inboundMessageId: 'r2', from: 'CC6' }),
+    /at capacity/
+  );
 
   clock += 60 * 24 * 60 * 60 * 1000;
   store.prune();
   assert.ok(store.get(running.jobId), 'an in-flight job is never pruned under count pressure');
-  assert.ok(store.get(finished.jobId), 'a finished-but-unreported job is never pruned');
+});
+
+test('activity accepts only allowlisted categories and suppresses duplicates', t => {
+  const { store } = makeStore(t);
+  const job = store.create({ owner: 'CODEX3', inboundMessageId: 'a1', from: 'CC6' });
+  store.recordActivity(job.jobId, { type: 'running_command', command: 'cat /secret' });
+  store.recordActivity(job.jobId, { type: 'running_command' });
+  assert.equal(store.recordActivity(job.jobId, { type: 'raw_tool_output' }), null);
+  assert.deepEqual(store.get(job.jobId).activity.map(a => Object.keys(a).sort()), [['at', 'type']]);
+  assert.equal(store.get(job.jobId).activity[0].type, 'running_command');
 });
 
 test('invalid or misnamed records are quarantined, not silently dropped', t => {

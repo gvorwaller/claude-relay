@@ -97,7 +97,9 @@ test('the hook pair injects receipts, blocks an unreported turn, then closes the
   assert.ok(context, 'pending receipts are injected');
   assert.match(context, /Reviewed the branch\./);
   assert.match(context, /SERVER-ATTESTED: replied to CC6, message msg-42, delivered live/);
-  assert.match(context, new RegExp(`relay-delegate-receipts: ${job.jobId}`));
+  const digest = context.match(/relay-delegate-receipts: ([0-9a-f]{64})/)[1];
+  const reportLine = 'Background delegate woken by CC6: completed; relay replies: CC6 (delivered live).';
+  assert.match(context, new RegExp(reportLine.replace(/[().]/g, '\\$&')));
 
   // Injection alone must NOT mark it reported.
   const midCheck = new DelegateJobStore({ dataDir: path.join(root, 'jobs') }).initialize();
@@ -109,14 +111,15 @@ test('the hook pair injects receipts, blocks an unreported turn, then closes the
     last_assistant_message: 'Here is an answer that says nothing about the delegate.'
   }, env);
   assert.equal(blocked.decision, 'block');
-  assert.match(blocked.reason, /have not reported 1 delegated run/);
+  assert.match(blocked.reason, /have not visibly reported 1 delegated run/);
 
   // Phase 2b: a turn that reports it is allowed, and the receipt closes.
   const accepted = runHook('Stop', {
     session_id: 's1',
     turn_id: 'turn-77',
+    stop_hook_active: true,
     last_assistant_message:
-      `While you were away I reviewed the branch and replied to CC6 (delivered).\n\n<!-- relay-delegate-receipts: ${job.jobId} -->`
+      `${reportLine}\n\n<!-- relay-delegate-receipts: ${digest} -->`
   }, env);
   assert.ok(!accepted.decision, 'a reported turn is not blocked');
 

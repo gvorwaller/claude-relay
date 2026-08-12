@@ -10,7 +10,7 @@
  */
 
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { execFileSync, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
@@ -97,6 +97,38 @@ const CLIENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const RESERVED_CLIENT_IDS = new Set(['all']);
 
 const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
+
+function cleanReceiptValue(value, fallback = 'unknown') {
+  return typeof value === 'string' && value.trim()
+    ? value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100)
+    : fallback;
+}
+
+function receiptReportLine(job) {
+  const sender = cleanReceiptValue(job.from, 'an unknown peer');
+  const state = cleanReceiptValue(job.status);
+  const sends = job.outbound.length
+    ? job.outbound.map(out => `${cleanReceiptValue(out.to)} (${out.delivered ? 'delivered live' : 'queued'})`).join(', ')
+    : 'none';
+  return `Background delegate woken by ${sender}: ${state}; relay replies: ${sends}.`;
+}
+
+function receiptDigest(jobs) {
+  const canonical = jobs.map(job => ({
+    id: job.jobId,
+    status: job.status,
+    completedAt: job.completedAt,
+    reportLine: receiptReportLine(job)
+  }));
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+function sendAttested(peer, payload) {
+  return new Promise(resolve => {
+    if (!peer || peer.readyState !== 1) return resolve(false);
+    peer.send(payload, err => resolve(!err));
+  });
+}
 
 logger.info('server_starting', { port: PORT });
 
@@ -566,35 +598,34 @@ wss.on('connection', (ws, req) => {
               }
             }
           }
-          const deliveredToDelegate = directSockets.some(peer => peer.delegateOf === to);
-          const delivered = to === 'all'
-            ? Array.from(clients.entries()).some(([id, peer]) => id !== clientId && peer.readyState === 1)
-            : directSockets.length > 0;
+          const deliverySockets = to === 'all'
+            ? Array.from(clients.entries())
+              .filter(([id, peer]) => id !== clientId && peer.readyState === 1)
+              .map(([, peer]) => peer)
+            : directSockets;
           const envelope = messageStore.append({
             type: 'message',
             from: fromId,
             to,
             content: msg.content,
-            delivered
+            delivered: deliverySockets.length > 0
           });
+          const encodedEnvelope = JSON.stringify(envelope);
+          const deliveryResults = await Promise.all(
+            deliverySockets.map(peer => sendAttested(peer, encodedEnvelope))
+          );
+          const delivered = deliveryResults.some(Boolean);
+          const deliveredToDelegate = deliverySockets.some((peer, index) =>
+            deliveryResults[index] && peer.delegateOf === to);
 
           if (ws.delegateJob && ws.delegateJob.jobId) {
-            // Recorded BEFORE delivery: evidence must never lag the fact it
-            // attests (re-check #8).
+            // Delivery is recorded only after a WebSocket callback attests
+            // acceptance. false means the durable message is queued.
             jobStore.recordOutbound(ws.delegateJob.jobId, {
               to,
               messageId: envelope.id,
               delivered
             });
-          }
-
-          if (msg.to && msg.to !== 'all') {
-            for (const peer of directSockets) {
-              peer.send(JSON.stringify(envelope));
-            }
-          } else {
-            // Broadcast to all except sender
-            broadcast(envelope, clientId);
           }
           // Always acknowledge honestly. An offline target used to get an
           // 'error' reply even though the message WAS durably stored and will
@@ -697,9 +728,33 @@ wss.on('connection', (ws, req) => {
           }
           // Attach the narrative without moving the state machine: the
           // process exit decides the terminal state, not the prose.
-          jobStore.attachResult(jobId, patch);
+          const attached = jobStore.attachResult(jobId, patch);
+          if (!attached) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Job result could not be attached' }));
+            return;
+          }
+          capabilities.consumeResultSecret(jobId);
           ws.send(JSON.stringify({ type: 'job_result_recorded', jobId }));
           logger.info('job_result_recorded', { jobId, owner: job.owner });
+          break;
+        }
+
+        case 'submit_job_activity': {
+          if (!isLoopback(req.socket.remoteAddress)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Job activity is local-only' }));
+            return;
+          }
+          const jobId = typeof msg.jobId === 'string' ? msg.jobId : '';
+          if (!capabilities.verifyResultSecret(jobId, msg.resultSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid job activity credential' }));
+            return;
+          }
+          const updated = jobStore.recordActivity(jobId, { type: msg.activityType });
+          if (!updated) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Activity rejected' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'job_activity_recorded', jobId }));
           break;
         }
 
@@ -715,7 +770,9 @@ wss.on('connection', (ws, req) => {
             }));
             return;
           }
-          const pending = jobStore.pending(readOwner).map(job => ({
+          const pendingJobs = jobStore.pending(readOwner).slice(0, 5);
+          const batchDigest = receiptDigest(pendingJobs);
+          const pending = pendingJobs.map(job => ({
             jobId: job.jobId,
             inboundMessageId: job.inboundMessageId,
             from: job.from,
@@ -734,9 +791,10 @@ wss.on('connection', (ws, req) => {
             // Server-attested: what this delegate actually sent, and whether
             // it was delivered live or queued. "delivered" means a live
             // socket accepted it — never that anyone read it.
-            outbound: job.outbound
+            outbound: job.outbound,
+            reportLine: receiptReportLine(job)
           }));
-          ws.send(JSON.stringify({ type: 'receipts', receipts: pending }));
+          ws.send(JSON.stringify({ type: 'receipts', receipts: pending, digest: batchDigest }));
           break;
         }
 
@@ -761,6 +819,12 @@ wss.on('connection', (ws, req) => {
             const job = jobStore.get(id);
             return job && job.owner === ackOwner;
           });
+          const ownJobs = own.map(id => jobStore.get(id));
+          const suppliedDigest = typeof msg.digest === 'string' ? msg.digest : '';
+          if (!ownJobs.length || suppliedDigest !== receiptDigest(ownJobs)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Receipt facts changed or digest is invalid' }));
+            return;
+          }
           const marked = jobStore.markReported(own, turnId);
           ws.send(JSON.stringify({ type: 'receipts_acked', jobIds: marked }));
           logger.info('receipts_reported', { owner: ackOwner, count: marked.length, turnId });
