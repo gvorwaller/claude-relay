@@ -7,6 +7,8 @@
     "server": "node server.js",
     "mcp": "node mcp-server.js",
     "monitor": "node scripts/relay-monitor.js",
+    "health": "node scripts/relay-health.js",
+    "owner": "node scripts/relay-owner.js",
     "test-client": "node test-client.js",
     "test": "node --test tests/*.test.js"
   },

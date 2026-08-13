@@ -79,12 +79,36 @@ async function deadPid() {
   return pid;
 }
 
+test('default relay listener accepts loopback but refuses the host LAN address', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-loopback-')));
+  const port = startServer(t, root);
+  const local = await connectWithRetry(port, 'LOOPBACKCHECK', { pid: process.pid });
+  local.close();
+
+  const lanAddress = Object.values(os.networkInterfaces())
+    .flat()
+    .find(address => address && address.family === 'IPv4' && !address.internal)?.address;
+  if (!lanAddress) {
+    t.skip('No non-loopback IPv4 address is available on this host');
+    return;
+  }
+
+  const exposed = new WebSocket(`ws://${lanAddress}:${port}`);
+  const outcome = await new Promise(resolve => {
+    const timer = setTimeout(() => resolve('timeout'), 1500);
+    exposed.once('open', () => { clearTimeout(timer); resolve('open'); });
+    exposed.once('error', () => { clearTimeout(timer); resolve('refused'); });
+  });
+  exposed.terminate();
+  assert.equal(outcome, 'refused', `relay unexpectedly accepted a LAN connection on ${lanAddress}`);
+});
+
 
 // Obtain a real job capability the way a delegate does: the server's notify
 // path mints one and writes it to a 0600 file for the spawned wake. The test
 // hook simply copies that file somewhere readable, so the whole minting chain
 // is exercised rather than bypassed.
-function notifyConfigForTokens(root, sleepSeconds = 25) {
+function notifyConfigForTokens(root) {
   const configPath = path.join(root, 'notify.json');
   const outDir = path.join(root, 'tokens');
   fs.mkdirSync(outDir, { recursive: true });
@@ -92,24 +116,31 @@ function notifyConfigForTokens(root, sleepSeconds = 25) {
     '*': [{
       type: 'exec',
       // The wake must OUTLIVE its delegate's registration, as a real codex
-      // run does: if the process exits first the job is already terminal and
-      // the late registration is (correctly) refused.
+      // run does. It exits on an explicit state signal from the test; the
+      // bounded loop is only a leak guard after a catastrophically failed
+      // test, never the synchronization mechanism.
       command: `cp "$RELAY_JOB_TOKEN_FILE" "${outDir}/$RELAY_FOR.token"; `
-        + `for i in $(seq 1 ${sleepSeconds * 20}); do `
+        + 'for i in $(seq 1 2400); do '
         + `[ -f "${outDir}/$RELAY_FOR.release" ] && exit 0; sleep 0.05; done; exit 0`
     }]
   }));
   return { configPath, outDir };
 }
 
-async function mintJobToken(outDir, sender, base) {
+async function mintJobToken(t, outDir, sender, base) {
   const tokenPath = path.join(outDir, `${base}.token`);
   try { fs.unlinkSync(tokenPath); } catch {}
   sender.send(JSON.stringify({ type: 'message', to: base, content: 'wake trigger' }));
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       const token = fs.readFileSync(tokenPath, 'utf8').trim();
-      if (token) return token;
+      if (token) {
+        // Always release the fake wake, including when a later assertion
+        // fails. Releasing is idempotent and applies to every wake for this
+        // base label, including a debounce predecessor still winding down.
+        t.after(() => releaseWake(outDir, base));
+        return token;
+      }
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 50));
   }
@@ -180,7 +211,7 @@ test('delegate reads and speaks as its base label without ever owning it', async
   for (let attempt = 0; attempt < 100 && !fs.existsSync(path.join(outDir, 'CODEXD.token')); attempt += 1) {
     await new Promise(resolve => setTimeout(resolve, 25));
   }
-  const jobToken = await mintJobToken(outDir, sender, 'CODEXD');
+  const jobToken = await mintJobToken(t, outDir, sender, 'CODEXD');
 
   // Delegate registers: derived visible ID, no contest with the base.
   const delegate = await open(port);
@@ -241,7 +272,7 @@ test('bridge spawned under codex exec self-selects delegate mode (ancestry fallb
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
 
-  const token = await mintJobToken(outDir, observer, 'CODEXW');
+  const token = await mintJobToken(t, outDir, observer, 'CODEXW');
   const tokenFile = path.join(root, 'codexw.token');
   fs.writeFileSync(tokenFile, token, { mode: 0o600 });
 
@@ -373,7 +404,7 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
 
-  const token = await mintJobToken(outDir, observer, 'CODEXD');
+  const token = await mintJobToken(t, outDir, observer, 'CODEXD');
   const tokenFile = path.join(root, 'codexd.token');
   fs.writeFileSync(tokenFile, token, { mode: 0o600 });
 
@@ -449,7 +480,7 @@ test('identity mode cannot be switched on a live socket (primary<->delegate)', a
   // Primary -> delegate: rejected.
   const primary = await connectWithRetry(port, 'MODEA', { pid: process.pid });
   t.after(() => primary.close());
-  const modeAToken = await mintJobToken(outDir, primary, 'MODEA');
+  const modeAToken = await mintJobToken(t, outDir, primary, 'MODEA');
   const primaryRefused = waitForMessage(primary, msg =>
     msg.type === 'error' && /delegate registration requires a fresh connection/.test(msg.message));
   primary.send(JSON.stringify({
@@ -460,7 +491,7 @@ test('identity mode cannot be switched on a live socket (primary<->delegate)', a
   // Delegate -> primary: rejected.
   const delegate = await open(port);
   t.after(() => delegate.close());
-  const modeToken = await mintJobToken(outDir, primary, 'MODEB');
+  const modeToken = await mintJobToken(t, outDir, primary, 'MODEB');
   const delegateRegistered = waitForMessage(delegate, msg => msg.type === 'registered');
   delegate.send(JSON.stringify({
     type: 'register', clientId: 'MODEB', delegate: true, jobToken: modeToken, meta: { pid: 222 }
@@ -519,7 +550,7 @@ test('hostile client IDs and message targets are refused at the boundary', async
   // A live server-minted delegate ID stays addressable despite containing '~'.
   const delegate = await open(port);
   t.after(() => delegate.close());
-  const gramToken = await mintJobToken(outDir, good, 'GRAMOK');
+  const gramToken = await mintJobToken(t, outDir, good, 'GRAMOK');
   const delegateReg = waitForMessage(delegate, msg => msg.type === 'registered');
   delegate.send(JSON.stringify({
     type: 'register', clientId: 'GRAMOK', delegate: true, jobToken: gramToken, meta: { pid: 9911 }
@@ -539,8 +570,8 @@ test('a delegate connection is immutable: no re-registration under another base'
   const observer = await connectWithRetry(port, 'OBS', { pid: process.pid });
   t.after(() => observer.close());
 
-  const immutToken = await mintJobToken(outDir, observer, 'IMMUT');
-  const otherToken = await mintJobToken(outDir, observer, 'OTHERBASE');
+  const immutToken = await mintJobToken(t, outDir, observer, 'IMMUT');
+  const otherToken = await mintJobToken(t, outDir, observer, 'OTHERBASE');
   const delegate = await open(port);
   t.after(() => delegate.close());
   const registered = waitForMessage(delegate, msg => msg.type === 'registered');
@@ -668,6 +699,61 @@ test('an owner capability never evicts a live holder', async t => {
   await pong;
 });
 
+test('local owner rotation refuses a live holder then rotates it offline', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-owner-rotate-')));
+  const port = startServer(t, root, { RELAY_REQUIRE_OWNER_CAPABILITY: '1' });
+  await connectWithRetry(port, 'ROTATEWARM', { pid: process.pid }).then(ws => ws.close());
+
+  const holder = await open(port);
+  t.after(() => holder.close());
+  const registered = waitForMessage(holder, msg => msg.type === 'registered');
+  holder.send(JSON.stringify({ type: 'register', clientId: 'ROTATE1', meta: { pid: process.pid } }));
+  const oldSecret = (await registered).ownerSecret;
+  assert.ok(oldSecret);
+
+  const adminSecretPath = path.join(root, 'admin.secret');
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(adminSecretPath); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const adminSecret = fs.readFileSync(adminSecretPath, 'utf8').trim();
+  const admin = await open(port);
+  t.after(() => admin.close());
+
+  const refused = waitForMessage(admin, msg => msg.type === 'owner_rotation_refused');
+  admin.send(JSON.stringify({ type: 'rotate_owner', clientId: 'ROTATE1', adminSecret }));
+  assert.match((await refused).reason, /Owner is live/);
+
+  const closed = new Promise(resolve => holder.once('close', resolve));
+  holder.close();
+  await closed;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const probe = waitForMessage(admin, msg =>
+      msg.type === 'owner_rotated' || msg.type === 'owner_rotation_refused');
+    admin.send(JSON.stringify({ type: 'rotate_owner', clientId: 'ROTATE1', adminSecret }));
+    const result = await probe;
+    if (result.type === 'owner_rotated') break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const replacement = fs.readFileSync(path.join(root, 'owners', 'ROTATE1.secret'), 'utf8').trim();
+  assert.notEqual(replacement, oldSecret);
+
+  const oldClaim = await open(port);
+  t.after(() => oldClaim.close());
+  const rejected = waitForMessage(oldClaim, msg => msg.type === 'register_rejected');
+  oldClaim.send(JSON.stringify({
+    type: 'register', clientId: 'ROTATE1', ownerSecret: oldSecret, meta: { pid: process.pid }
+  }));
+  assert.match((await rejected).reason, /invalid/);
+
+  const recovered = await open(port);
+  t.after(() => recovered.close());
+  const recoveredRegistration = waitForMessage(recovered, msg => msg.type === 'registered');
+  recovered.send(JSON.stringify({
+    type: 'register', clientId: 'ROTATE1', ownerSecret: replacement, meta: { pid: process.pid }
+  }));
+  assert.equal((await recoveredRegistration).clientId, 'ROTATE1');
+});
+
 test('a stolen job token is useless outside the spawned wake process tree', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-anc-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
@@ -680,7 +766,7 @@ test('a stolen job token is useless outside the spawned wake process tree', asyn
   // Steal the bearer exactly as a same-user attacker could: read the handoff
   // file. The token is valid, but this process is not a descendant of the
   // wake the server spawned.
-  const stolen = await mintJobToken(outDir, sender, 'ANCBASE');
+  const stolen = await mintJobToken(t, outDir, sender, 'ANCBASE');
   const thief = await open(port);
   t.after(() => thief.close());
   const refused = waitForMessage(thief, msg =>
@@ -722,7 +808,7 @@ test('a delegate may only reply to the peer that woke it', async t => {
   const bystander = await connect(port, 'BYSTANDER', { pid: process.pid });
   t.after(() => [waker, bystander].forEach(ws => ws.close()));
 
-  const token = await mintJobToken(outDir, waker, 'SCOPED');
+  const token = await mintJobToken(t, outDir, waker, 'SCOPED');
   const delegate = await open(port);
   t.after(() => delegate.close());
   const registered = waitForMessage(delegate, msg => msg.type === 'registered');
@@ -752,7 +838,7 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-receipt-')));
   // Short wake: long enough for the delegate to register and send, short
   // enough that the job reaches a terminal state inside the test.
-  const { configPath, outDir } = notifyConfigForTokens(root, 3);
+  const { configPath, outDir } = notifyConfigForTokens(root);
   const port = startServer(t, root, {
     RELAY_NOTIFY_CONFIG: configPath,
     RELAY_BIND_DELEGATE_ANCESTRY: '0'
@@ -762,7 +848,7 @@ test('a delegate wake produces a server-attested receipt for its owner', async t
   const owner = await connect(port, 'RCPOWNER', { pid: process.pid });
   t.after(() => [waker, owner].forEach(ws => ws.close()));
 
-  const token = await mintJobToken(outDir, waker, 'RCPOWNER');
+  const token = await mintJobToken(t, outDir, waker, 'RCPOWNER');
   const delegate = await open(port);
   t.after(() => delegate.close());
   const registered = waitForMessage(delegate, msg => msg.type === 'registered');

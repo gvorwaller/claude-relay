@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -51,6 +51,7 @@ class DelegateJobStore {
     this.now = options.now || (() => Date.now());
     this.retentionDays = options.retentionDays || 7;
     this.maxJobs = options.maxJobs || 500;
+    this.onCapacity = options.onCapacity || null;
     this.jobs = new Map();
     // Identifies THIS server run; jobs from earlier runs cannot resume.
     this.instanceId = options.instanceId || randomUUID();
@@ -140,6 +141,7 @@ class DelegateJobStore {
         maxJobs: this.maxJobs,
         note: 'operator must report or investigate retained jobs'
       });
+      this.notifyCapacity();
       throw new Error(`delegate job store is at capacity (${this.jobs.size}/${this.maxJobs})`);
     }
     const job = {
@@ -279,6 +281,58 @@ class DelegateJobStore {
     return marked;
   }
 
+  stats() {
+    return {
+      size: this.jobs.size,
+      maxJobs: this.maxJobs,
+      unreported: Array.from(this.jobs.values()).filter(job => job.status !== 'reported').length,
+      atCapacity: this.jobs.size >= this.maxJobs
+    };
+  }
+
+  terminalSelection(owner = 'all') {
+    return Array.from(this.jobs.values())
+      .filter(job => owner === 'all' || job.owner === owner)
+      .filter(job => TERMINAL_RUN_STATES.has(job.status) || job.status === 'reported')
+      .sort((a, b) => a.jobId.localeCompare(b.jobId));
+  }
+
+  previewTerminalPurge(owner = 'all') {
+    const jobs = this.terminalSelection(owner);
+    const byStatus = {};
+    const byOwner = {};
+    for (const job of jobs) {
+      byStatus[job.status] = (byStatus[job.status] || 0) + 1;
+      byOwner[job.owner] = (byOwner[job.owner] || 0) + 1;
+    }
+    const confirmation = createHash('sha256')
+      .update(JSON.stringify({ owner, jobIds: jobs.map(job => job.jobId) }))
+      .digest('hex');
+    return { owner, count: jobs.length, byStatus, byOwner, confirmation };
+  }
+
+  purgeTerminal(owner, confirmation) {
+    const preview = this.previewTerminalPurge(owner);
+    if (!confirmation || confirmation !== preview.confirmation) {
+      return { ...preview, purged: 0, confirmed: false };
+    }
+    let purged = 0;
+    for (const job of this.terminalSelection(owner)) {
+      if (this.remove(job.jobId)) purged += 1;
+    }
+    this.logger.warn('delegate_jobs_purged', { owner, count: purged });
+    return { ...preview, purged, confirmed: true };
+  }
+
+  notifyCapacity() {
+    if (this.jobs.size < this.maxJobs || typeof this.onCapacity !== 'function') return;
+    try {
+      this.onCapacity(this.stats());
+    } catch (err) {
+      this.logger.error('job_store_capacity_callback_failed', { error: err.message });
+    }
+  }
+
   persist(job) {
     const tmp = path.join(this.dataDir, `${job.jobId}.tmp`);
     const target = path.join(this.dataDir, `${job.jobId}.json`);
@@ -320,6 +374,7 @@ class DelegateJobStore {
    * a condition to alert on, not to silently discard.
    */
   prune() {
+    const before = this.jobs.size;
     const cutoff = this.now() - this.retentionDays * DAY_MS;
     for (const job of Array.from(this.jobs.values())) {
       if (job.status !== 'reported') continue;
@@ -332,8 +387,7 @@ class DelegateJobStore {
     let excess = this.jobs.size - this.maxJobs;
     for (const job of removable) {
       if (excess <= 0) break;
-      this.remove(job.jobId);
-      excess -= 1;
+      if (this.remove(job.jobId)) excess -= 1;
     }
     if (this.jobs.size > this.maxJobs) {
       this.logger.error('job_store_over_capacity_unreported', {
@@ -342,6 +396,8 @@ class DelegateJobStore {
         note: 'unreported jobs are never dropped; investigate why they are not being reported'
       });
     }
+    this.notifyCapacity();
+    return { removed: before - this.jobs.size, ...this.stats() };
   }
 
   /**
@@ -356,14 +412,22 @@ class DelegateJobStore {
       this.logger.warn('job_discard_refused', { jobId, status: job.status });
       return false;
     }
-    this.remove(jobId);
+    if (!this.remove(jobId)) return false;
     this.logger.info('job_discarded_no_work', { jobId, owner: job.owner });
     return true;
   }
 
   remove(jobId) {
+    try {
+      fs.unlinkSync(path.join(this.dataDir, `${jobId}.json`));
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        this.logger.error('job_remove_failed', { jobId, error: err.message });
+        return false;
+      }
+    }
     this.jobs.delete(jobId);
-    try { fs.unlinkSync(path.join(this.dataDir, `${jobId}.json`)); } catch {}
+    return true;
   }
 }
 

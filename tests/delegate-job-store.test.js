@@ -179,17 +179,56 @@ test('a wake that exits without a delegate is distinct from a completed one', t 
 
 test('backpressure rejects new work rather than pruning running or unreported jobs', t => {
   let clock = Date.parse('2026-08-06T00:00:00.000Z');
-  const { store } = makeStore(t, { now: () => clock, maxJobs: 1, retentionDays: 7 });
+  const capacityEvents = [];
+  const { store } = makeStore(t, {
+    now: () => clock,
+    maxJobs: 1,
+    retentionDays: 7,
+    onCapacity: stats => capacityEvents.push(stats)
+  });
   const running = store.create({ owner: 'CODEX3', inboundMessageId: 'r1', from: 'CC6' });
+  assert.equal(capacityEvents.length, 1, 'reaching capacity is reported immediately');
+  assert.equal(capacityEvents[0].atCapacity, true);
   store.transition(running.jobId, 'running');
   assert.throws(
     () => store.create({ owner: 'CODEX3', inboundMessageId: 'r2', from: 'CC6' }),
     /at capacity/
   );
+  assert.ok(capacityEvents.length >= 2, 'rejected work refreshes the capacity signal');
 
   clock += 60 * 24 * 60 * 60 * 1000;
   store.prune();
   assert.ok(store.get(running.jobId), 'an in-flight job is never pruned under count pressure');
+});
+
+test('terminal job purge is owner-scoped, preview-confirmed, and preserves active work', t => {
+  const { store } = makeStore(t);
+  const one = store.create({ owner: 'CODEX1', inboundMessageId: 'p1', from: 'CC1' });
+  store.transition(one.jobId, 'running');
+  store.transition(one.jobId, 'completed');
+  const other = store.create({ owner: 'CODEX2', inboundMessageId: 'p2', from: 'CC2' });
+  store.transition(other.jobId, 'failed');
+  const active = store.create({ owner: 'CODEX1', inboundMessageId: 'p3', from: 'CC1' });
+  store.transition(active.jobId, 'running');
+
+  const preview = store.previewTerminalPurge('CODEX1');
+  assert.equal(preview.count, 1);
+  assert.deepEqual(preview.byStatus, { completed: 1 });
+  assert.deepEqual(preview.byOwner, { CODEX1: 1 });
+  assert.equal(store.purgeTerminal('CODEX1', 'wrong').confirmed, false);
+  assert.ok(store.get(one.jobId));
+
+  const result = store.purgeTerminal('CODEX1', preview.confirmation);
+  assert.equal(result.confirmed, true);
+  assert.equal(result.purged, 1);
+  assert.equal(store.get(one.jobId), null);
+  assert.ok(store.get(active.jobId), 'running work is never selected or removed');
+  assert.ok(store.get(other.jobId), 'another owner is outside the selection');
+
+  const all = store.previewTerminalPurge('all');
+  assert.equal(all.count, 1);
+  assert.equal(store.purgeTerminal('all', all.confirmation).purged, 1);
+  assert.ok(store.get(active.jobId));
 });
 
 test('activity accepts only allowlisted categories and suppresses duplicates', t => {

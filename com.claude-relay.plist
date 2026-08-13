@@ -23,6 +23,8 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>RELAY_HOST</key>
+        <string>127.0.0.1</string>
         <key>RELAY_MESSAGE_RETENTION_DAYS</key>
         <string>7</string>
         <key>RELAY_MESSAGE_MAX_DISK_MB</key>
@@ -38,7 +40,7 @@
         <key>RELAY_LOG_MAX_FILE_MB</key>
         <string>10</string>
         <key>RELAY_ADMIN_CLIENT_IDS</key>
-        <string>CODEX2,CC2</string>
+        <string>CODEX1,CC1</string>
     </dict>
 </dict>
 </plist>

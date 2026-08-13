@@ -6,6 +6,12 @@ const { randomBytes, createHash, timingSafeEqual } = require('crypto');
 
 const JOB_TOKEN_TTL_MS = 10 * 60 * 1000;      // window to CONSUME the token
 const JOB_SESSION_MAX_MS = 60 * 60 * 1000;    // max lifetime of the delegate session
+const TRANSIENT_OWNER_TTL_MS = 60 * 60 * 1000;
+const TRANSIENT_OWNER_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,40}-watch-\d+-[0-9a-f]{8}$/;
+
+function isTransientOwnerLabel(label) {
+  return TRANSIENT_OWNER_PATTERN.test(label);
+}
 
 function sha256(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -119,14 +125,17 @@ class CapabilityStore {
    * transient client (watchers, one-off tools) enrolls a label, so without
    * this the store grows without bound. Acknowledged owners are never pruned.
    */
-  pruneUnacknowledged(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
-    const cutoff = this.now() - maxAgeMs;
+  pruneUnacknowledged(
+    maxAgeMs = 7 * 24 * 60 * 60 * 1000,
+    transientMaxAgeMs = TRANSIENT_OWNER_TTL_MS
+  ) {
     let removed = 0;
     for (const label of Object.keys(this.owners)) {
       const record = this.owners[label];
       if (record.acknowledged) continue;
       const created = Date.parse(record.createdAt || '');
-      if (Number.isFinite(created) && created < cutoff) {
+      const retention = isTransientOwnerLabel(label) ? transientMaxAgeMs : maxAgeMs;
+      if (Number.isFinite(created) && created < this.now() - retention) {
         delete this.owners[label];
         removed += 1;
       }
@@ -139,12 +148,12 @@ class CapabilityStore {
   }
 
   /** Mint (or rotate) the owner capability for a label. Returns plaintext once. */
-  mintOwner(label, { host = null } = {}) {
+  mintOwner(label, { host = null, secret = null } = {}) {
     this.pruneUnacknowledged();
-    const secret = randomBytes(32).toString('base64url');
+    const nextSecret = secret || randomBytes(32).toString('base64url');
     const previous = this.hasOwner(label) ? this.owners[label] : null;
     this.owners[label] = {
-      hash: sha256(secret),
+      hash: sha256(nextSecret),
       generation: (previous ? previous.generation : 0) + 1,
       createdAt: new Date(this.now()).toISOString(),
       acknowledged: false,
@@ -156,7 +165,7 @@ class CapabilityStore {
       label,
       generation: this.owners[label].generation
     });
-    return { secret, generation: this.owners[label].generation };
+    return { secret: nextSecret, generation: this.owners[label].generation };
   }
 
   verifyOwner(label, secret) {
@@ -178,6 +187,23 @@ class CapabilityStore {
 
   ownerGeneration(label) {
     return this.hasOwner(label) ? this.owners[label].generation : 0;
+  }
+
+  stats() {
+    const entries = Object.entries(this.owners);
+    const pendingNamedLabels = entries
+      .filter(([label, record]) => record.acknowledged !== true && !isTransientOwnerLabel(label))
+      .map(([label]) => label)
+      .sort();
+    const pendingTransient = entries
+      .filter(([label, record]) => record.acknowledged !== true && isTransientOwnerLabel(label))
+      .length;
+    return {
+      total: entries.length,
+      pending: pendingNamedLabels.length,
+      pendingNamedLabels,
+      pendingTransient
+    };
   }
 
   /**
@@ -287,4 +313,7 @@ class CapabilityStore {
   }
 }
 
-module.exports = { CapabilityStore, sha256 };
+module.exports = {
+  CapabilityStore, sha256, TRANSIENT_OWNER_TTL_MS,
+  TRANSIENT_OWNER_PATTERN, isTransientOwnerLabel
+};

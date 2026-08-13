@@ -2,6 +2,9 @@
 
 Real-time communication between Claude Code instances across multiple machines via WebSocket + MCP.
 
+For the short operator workflow, including the detached-delegate activity
+monitor and one-time Codex hook activation, see [QUICKSTART.md](QUICKSTART.md).
+
 ## What This Does
 
 Enables Claude Code sessions on different machines to send messages to each other in real-time. Useful for:
@@ -45,7 +48,7 @@ npm install
 
 ```bash
 node server.js
-# [Claude Relay] Ready! Listening on ws://localhost:9999
+# [Claude Relay] Ready! Listening on ws://127.0.0.1:9999
 ```
 
 ### 2. Configure Claude Code (on each machine)
@@ -69,15 +72,23 @@ Add to your Claude Code MCP configuration (`~/.claude.json`):
 
 ### 3. Connect Remote Machines via SSH Tunnel
 
-If machines aren't on the same network, use SSH port forwarding:
+The relay intentionally listens only on loopback. Every remote machine uses an
+authenticated SSH local-forward; direct plaintext LAN WebSocket access is not
+supported:
 
 ```bash
 # On the remote machine, tunnel to the server host
-ssh -N -L 9999:localhost:9999 server-host &
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:9999:127.0.0.1:9999 server-host &
 
 # Or use autossh for auto-reconnecting
-autossh -M 0 -N -L 9999:localhost:9999 server-host &
+autossh -M 0 -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:9999:127.0.0.1:9999 server-host &
 ```
+
+The remote MCP bridge still uses `RELAY_URL=ws://127.0.0.1:9999`; traffic
+between machines is carried inside SSH. Because every supported client can use
+SSH, native WSS is intentionally not part of this deployment.
 
 ---
 
@@ -187,6 +198,20 @@ for a live terminal view of recent delegate jobs. Optional flags are
 state, a deliberately coarse current activity, relay replies and whether each
 was delivered live or queued.
 
+In an interactive terminal it is also the operator control center. Every
+available action is listed with its effect: activity, detailed health, a
+live peers/session-details view, a confirmed relay restart, and scoped,
+previewed cleanup of completed activity.
+It can also atomically clean durable message history for one identity or all
+identities after a count preview and a second confirmation. Arrow keys plus
+Return are sufficient; CLI and MCP operation names remain
+automation interfaces rather than required operator knowledge.
+
+The **Repair owner credentials** action handles identities left in the local
+migration fallback by older clients. It installs one atomic replacement secret
+at a time; a live session reconnects and confirms it automatically, while an
+offline session uses it at its next start.
+
 The activity feed is a strict allowlist projected from `codex exec --json`.
 It never stores or renders raw JSON, reasoning, prompts, message bodies,
 commands, command output, tool arguments, file paths, or secrets. macOS also
@@ -227,6 +252,19 @@ Once configured, Claude Code will have these tools:
 | `relay_clear_sessions` | Remove all offline sessions from the local registry (online sessions kept; registry backed up first) |
 | `relay_clear_history` | Clear the bounded memory cache; the durable journal remains intact |
 | `relay_purge_history` | Delete durable history; restricted by `RELAY_ADMIN_CLIENT_IDS` |
+| `relay_delegate_jobs` | Preview terminal detached-job records for one identity or all identities; admin-only |
+| `relay_purge_delegate_jobs` | Delete the exact previewed terminal-job selection; admin-only and confirmation-token protected; active work is preserved |
+
+Local operator commands are separate from MCP tools:
+
+```bash
+relay-health                         # post-restart fail-closed health gate
+npm run owner -- rotate CODEX3      # recover/rotate an offline owner label
+```
+
+Owner rotation is authenticated by a private loopback admin capability,
+refuses a live owner unless `--force` is explicit, revokes derived credentials,
+and writes the replacement directly to the private owner-secret directory.
 
 ### Example Usage
 
@@ -375,8 +413,23 @@ Use relay_clear_history to clear the in-memory cache while preserving the durabl
 
 To enable durable-history deletion, set a comma-separated admin allowlist in
 the relay server environment, for example
-`RELAY_ADMIN_CLIENT_IDS=CODEX2,CC2`, then use `relay_purge_history` from one of
+`RELAY_ADMIN_CLIENT_IDS=CODEX1,CC1`, then use `relay_purge_history` from one of
 those exact live client IDs. Without an allowlist, durable purge is disabled.
+
+**Clear detached delegate-job history:**
+
+Delegate-job records are stored separately under `data/jobs/` and power
+`relay-monitor`; clearing relay message history does not remove them. From an
+admin identity, preview an exact owner first:
+
+```text
+Call relay_delegate_jobs with owner="CODEX1"
+```
+
+The preview returns counts and a confirmation token. Pass that exact owner and
+token to `relay_purge_delegate_jobs`. Use owner `"all"` only when the preview
+shows the intended cross-owner selection. A changed selection invalidates the
+token, and spawned/running jobs are never selected or deleted.
 
 ---
 
@@ -432,6 +485,7 @@ launchctl load ~/Library/LaunchAgents/com.claude-relay.plist
 launchctl list | grep claude-relay
 # PID  Status  Label
 # 1234 0       com.claude-relay
+relay-health
 ```
 
 ### SSH Tunnel (on remote machines)
@@ -440,13 +494,18 @@ launchctl list | grep claude-relay
 # Install autossh
 brew install autossh
 
-# Copy and edit the tunnel LaunchAgent
+# Copy and edit the tunnel LaunchAgent on the remote Mac
 cp com.claude-relay-tunnel.plist ~/Library/LaunchAgents/
 
-# Edit to set your server hostname and paths
+# Edit the final ProgramArguments value (`m1` in the example) to the SSH host
+# alias for the relay-server Mac. The forward must remain bound to 127.0.0.1.
 
 # Load it
 launchctl load ~/Library/LaunchAgents/com.claude-relay-tunnel.plist
+
+# Verify the tunnel and remote bridge path
+launchctl print "gui/$(id -u)/com.claude-relay-tunnel" | grep 'state ='
+nc -z 127.0.0.1 9999
 ```
 
 ---
@@ -480,6 +539,7 @@ history
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RELAY_PORT` | `9999` | Port for relay server |
+| `RELAY_HOST` | `127.0.0.1` | Listener address; production remains loopback-only |
 | `CLAUDE_RELAY_SESSION_ID` | (none) | Human-readable session ID |
 | `RELAY_URL` | `ws://localhost:9999` | Relay server WebSocket URL |
 

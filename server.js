@@ -10,6 +10,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const { randomUUID, createHash } = require('crypto');
 const { execFileSync, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
@@ -18,8 +19,15 @@ const { OperationalLogger } = require('./operational-logger');
 const { NotifyHooks } = require('./notify-hooks');
 const { CapabilityStore } = require('./capabilities');
 const { DelegateJobStore } = require('./delegate-job-store');
+const { RuntimeStatus } = require('./runtime-status');
+const { runRetention } = require('./retention');
+const { OwnerAdmin, readOrCreateAdminSecret, verifySecret } = require('./owner-admin');
 
 const PORT = parseInt(process.argv[2] || process.env.RELAY_PORT || '9999', 10);
+const HOST = process.env.RELAY_HOST || '127.0.0.1';
+const DATA_ROOT = process.env.RELAY_MESSAGE_DIR
+  ? path.dirname(process.env.RELAY_MESSAGE_DIR)
+  : path.join(__dirname, 'data');
 const MESSAGE_RETENTION_DAYS = parseInt(process.env.RELAY_MESSAGE_RETENTION_DAYS || '7', 10);
 const MESSAGE_MAX_DISK_MB = parseInt(process.env.RELAY_MESSAGE_MAX_DISK_MB || '100', 10);
 const CACHE_MAX_MESSAGES = parseInt(process.env.RELAY_CACHE_MAX_MESSAGES || '500', 10);
@@ -43,11 +51,21 @@ const logger = new OperationalLogger({
   maxFileBytes: parseInt(process.env.RELAY_LOG_MAX_FILE_MB || '10', 10) * 1024 * 1024
 });
 const capabilities = new CapabilityStore({
-  dataDir: process.env.RELAY_MESSAGE_DIR
-    ? path.dirname(process.env.RELAY_MESSAGE_DIR)
-    : path.join(__dirname, 'data'),
+  dataDir: DATA_ROOT,
   logger
 });
+const adminSecretPath = path.join(DATA_ROOT, 'admin.secret');
+const adminSecret = readOrCreateAdminSecret(adminSecretPath);
+const ownerAdmin = new OwnerAdmin({
+  capabilities,
+  dataDir: DATA_ROOT,
+  ownerDir: process.env.RELAY_OWNER_SECRETS_DIR
+    || (process.env.RELAY_MESSAGE_DIR
+      ? path.join(DATA_ROOT, 'owners')
+      : path.join(__dirname, 'sessions', 'owners')),
+  logger
+});
+ownerAdmin.recover();
 // Enrollment policy for a label's FIRST claim (a first-come rule would let a
 // squatter on the open port receive a label's durable authority):
 //   loopback  -> auto-enroll (the local machine is the trusted channel)
@@ -63,7 +81,7 @@ const BIND_DELEGATE_ANCESTRY = process.env.RELAY_BIND_DELEGATE_ANCESTRY !== '0';
 
 const jobStore = new DelegateJobStore({
   dataDir: process.env.RELAY_MESSAGE_DIR
-    ? path.join(path.dirname(process.env.RELAY_MESSAGE_DIR), 'jobs')
+    ? path.join(DATA_ROOT, 'jobs')
     : path.join(__dirname, 'data', 'jobs'),
   logger
 }).initialize();
@@ -73,6 +91,9 @@ const notifyHooks = new NotifyHooks({
   logger,
   capabilities,
   jobStore
+});
+const runtimeStatus = new RuntimeStatus({
+  filePath: path.join(DATA_ROOT, 'runtime-status.json')
 });
 
 // Connected clients: Map<clientId, WebSocket>
@@ -96,7 +117,7 @@ const CLIENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 // delegate's reply scope become a broadcast permit (re-check #5).
 const RESERVED_CLIENT_IDS = new Set(['all']);
 
-const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
+const wss = new WebSocketServer({ host: HOST, port: PORT });
 
 function cleanReceiptValue(value, fallback = 'unknown') {
   return typeof value === 'string' && value.trim()
@@ -130,24 +151,65 @@ function sendAttested(peer, payload) {
   });
 }
 
-logger.info('server_starting', { port: PORT });
+logger.info('server_starting', { port: PORT, host: HOST });
+
+function refreshRuntimeStatus(ancestryBindingReady) {
+  const ownerStats = capabilities.stats();
+  const jobStats = jobStore.stats();
+  const previousReady = runtimeStatus.state
+    && runtimeStatus.state.checks
+    && runtimeStatus.state.checks.ancestryBindingReady;
+  const ready = ancestryBindingReady === undefined ? previousReady : ancestryBindingReady;
+  const status = {
+    checks: {
+      listenerLoopback: HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost',
+      ancestryBindingReady: BIND_DELEGATE_ANCESTRY && ready === true,
+      messageStore: true,
+      capabilityStore: true,
+      jobStore: true,
+      notifyConfig: notifyHooks.loadConfig() !== null
+    },
+    metrics: {
+      jobsTotal: jobStats.size,
+      jobsUnreported: jobStats.unreported,
+      jobsMax: jobStats.maxJobs,
+      ownersPending: ownerStats.pending,
+      ownersPendingLabels: ownerStats.pendingNamedLabels,
+      transientOwnersPendingCleanup: ownerStats.pendingTransient
+    },
+    alerts: jobStats.atCapacity ? [{ code: 'job_store_at_capacity', severity: 'error' }] : []
+  };
+  if (runtimeStatus.state) runtimeStatus.update(status);
+  else runtimeStatus.initialize({ host: HOST, port: PORT, ...status });
+}
+
+// Capacity is a control-plane fault, not merely a log line. Refresh the
+// bounded status file immediately so relay-monitor and relay-health surface it
+// without waiting for the hourly retention pass.
+jobStore.onCapacity = () => refreshRuntimeStatus();
 
 wss.on('listening', () => {
-  logger.info('server_listening', { port: PORT, host: '0.0.0.0' });
+  logger.info('server_listening', { port: PORT, host: HOST });
+  let ancestryReady = !BIND_DELEGATE_ANCESTRY;
   if (BIND_DELEGATE_ANCESTRY) {
     // A fail-closed control that cannot run is an outage, so say so at
     // startup instead of refusing every wake in silence.
     peerPidForPort(PORT).then(() => {
       try {
-        require('fs').accessSync(LSOF_PATH, require('fs').constants.X_OK);
+        fs.accessSync(LSOF_PATH, fs.constants.X_OK);
+        ancestryReady = true;
         logger.info('delegate_ancestry_binding_ready', { lsof: LSOF_PATH });
       } catch {
+        ancestryReady = false;
         logger.error('delegate_ancestry_binding_unavailable', {
           lsof: LSOF_PATH,
           impact: 'every delegate wake will be refused; set RELAY_BIND_DELEGATE_ANCESTRY=0 or fix PATH'
         });
       }
+      refreshRuntimeStatus(ancestryReady);
     });
+  } else {
+    refreshRuntimeStatus(false);
   }
 });
 
@@ -373,6 +435,7 @@ wss.on('connection', (ws, req) => {
           const ownerProven = ownerEnrolled
             && presentedSecret
             && capabilities.verifyOwner(requestedClientId, presentedSecret);
+          if (ownerProven) refreshRuntimeStatus();
           let mintedOwnerSecret = null;
 
           if (ownerEnrolled && !ownerProven) {
@@ -758,6 +821,105 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'rotate_owner': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Owner rotation requires local admin authority' }));
+            return;
+          }
+          const label = typeof msg.clientId === 'string' ? msg.clientId : '';
+          const live = clients.get(label);
+          if (live && live.readyState === 1 && msg.force !== true) {
+            ws.send(JSON.stringify({
+              type: 'owner_rotation_refused', clientId: label,
+              reason: 'Owner is live; stop it first or explicitly use --force'
+            }));
+            return;
+          }
+          const rotated = ownerAdmin.rotate(label, {
+            host: (clientMeta.get(label) || {}).host || null
+          });
+          if (live && live.readyState === 1) {
+            try { live.send(JSON.stringify({ type: 'error', message: 'Owner capability was rotated' })); } catch {}
+            live.terminate();
+          }
+          refreshRuntimeStatus();
+          ws.send(JSON.stringify({
+            type: 'owner_rotated', clientId: rotated.label,
+            generation: rotated.generation, secretPath: rotated.secretPath
+          }));
+          break;
+        }
+
+        case 'operator_preview_delegate_jobs': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Owner must be an exact client ID or "all"' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'delegate_jobs_preview', ...jobStore.previewTerminalPurge(owner) }));
+          break;
+        }
+
+        case 'operator_purge_delegate_jobs': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Owner must be an exact client ID or "all"' }));
+            return;
+          }
+          const result = jobStore.purgeTerminal(owner, msg.confirmation);
+          if (!result.confirmed) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Cleanup preview changed; review the current selection before confirming'
+            }));
+            return;
+          }
+          refreshRuntimeStatus();
+          ws.send(JSON.stringify({ type: 'delegate_jobs_purged', ...result }));
+          break;
+        }
+
+        case 'operator_preview_messages': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Identity must be an exact client ID or "all"' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'messages_preview', ...messageStore.previewPurge(owner) }));
+          break;
+        }
+
+        case 'operator_purge_messages': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Identity must be an exact client ID or "all"' }));
+            return;
+          }
+          const result = messageStore.purgePreviewed(owner, msg.confirmation);
+          if (!result.confirmed) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Message preview changed; review it again before confirming' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'messages_purged', ...result }));
+          break;
+        }
+
         case 'get_receipts': {
           // What did my delegates do while I was away? Owner-scoped: a
           // session sees only its own jobs, and a delegate may not ask at
@@ -843,6 +1005,7 @@ wss.on('connection', (ws, req) => {
           }
           if (capabilities.verifyOwner(clientId, msg.ownerSecret)) {
             logger.info('enrollment_acknowledged', { clientId });
+            refreshRuntimeStatus();
           } else {
             logger.warn('enrollment_ack_invalid', { clientId });
           }
@@ -902,6 +1065,45 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'history_purged', ...purgeResult }));
           logger.warn('history_purged', { clientId, ...purgeResult });
           break;
+
+        case 'preview_delegate_jobs': {
+          if (ws.delegateJob || !clientId || !ADMIN_CLIENT_IDS.has(clientId)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegate-job administration is not authorized' }));
+            logger.warn('delegate_job_admin_rejected', { clientId: clientId || 'unregistered' });
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegate-job owner must be an exact identity or "all"' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'delegate_jobs_preview', ...jobStore.previewTerminalPurge(owner) }));
+          break;
+        }
+
+        case 'purge_delegate_jobs': {
+          if (ws.delegateJob || !clientId || !ADMIN_CLIENT_IDS.has(clientId)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegate-job administration is not authorized' }));
+            logger.warn('delegate_job_admin_rejected', { clientId: clientId || 'unregistered' });
+            return;
+          }
+          const owner = typeof msg.owner === 'string' ? msg.owner : '';
+          if (owner !== 'all' && !CLIENT_ID_PATTERN.test(owner)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Delegate-job owner must be an exact identity or "all"' }));
+            return;
+          }
+          const result = jobStore.purgeTerminal(owner, msg.confirmation);
+          if (!result.confirmed) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Delegate-job selection changed or confirmation is invalid; preview again'
+            }));
+            return;
+          }
+          refreshRuntimeStatus();
+          ws.send(JSON.stringify({ type: 'delegate_jobs_purged', ...result }));
+          break;
+        }
 
         case 'get_peers':
           if (!clientId && !isLoopback(req.socket.remoteAddress)) {
@@ -1007,8 +1209,7 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 const retentionInterval = setInterval(() => {
-  messageStore.prune();
-  logger.prune();
+  runRetention({ messageStore, logger, capabilities, jobStore, refreshRuntimeStatus });
 }, 60 * 60 * 1000);
 wss.on('close', () => clearInterval(retentionInterval));
 

@@ -68,10 +68,11 @@ After a restart, confirm the fail-closed controls are actually operational —
 a control that cannot run is an outage, not security:
 
 ```bash
-grep -h "server_listening\|ancestry_binding" logs/$(ls -t logs | grep -v wake | head -1) | tail -2
+relay-health
 ```
 
-`delegate_ancestry_binding_ready` means delegate wakes can authenticate.
-`delegate_ancestry_binding_unavailable` means every Codex wake will be refused
-(this happened once because the launchd plist's PATH omitted `/usr/sbin`,
-where `lsof` lives).
+The command exits nonzero if the daemon is stale/dead, the listener is exposed
+beyond loopback, a store is unavailable, delegate ancestry binding cannot run,
+or retained delegate work has filled the job store. It also reports an absent
+or invalid notify configuration as a warning. The old log events remain useful
+for diagnosis, but log grepping is no longer the release gate.

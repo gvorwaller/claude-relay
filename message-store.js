@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -125,6 +125,61 @@ class MessageStore {
     }
     const cacheCleared = this.clearCache();
     return { filesDeleted, cacheCleared };
+  }
+
+  purgeSelection(owner = 'all') {
+    return this.readAll().filter(message => owner === 'all'
+      || message.from === owner || message.to === owner);
+  }
+
+  previewPurge(owner = 'all') {
+    const messages = this.purgeSelection(owner);
+    const byIdentity = {};
+    for (const message of messages) {
+      byIdentity[message.from] = (byIdentity[message.from] || 0) + 1;
+      if (message.to !== message.from) byIdentity[message.to] = (byIdentity[message.to] || 0) + 1;
+    }
+    const confirmation = createHash('sha256')
+      .update(JSON.stringify({ owner, messageIds: messages.map(message => message.id).sort() }))
+      .digest('hex');
+    return { owner, count: messages.length, byIdentity, confirmation };
+  }
+
+  purgePreviewed(owner, confirmation) {
+    const preview = this.previewPurge(owner);
+    if (!confirmation || confirmation !== preview.confirmation) {
+      return { ...preview, purged: 0, confirmed: false };
+    }
+    const selected = new Set(this.purgeSelection(owner).map(message => message.id));
+    let purged = 0;
+    let filesDeleted = 0;
+    let filesRewritten = 0;
+    for (const file of this.journalFiles()) {
+      const kept = [];
+      for (const line of fs.readFileSync(file.path, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const message = JSON.parse(line);
+          if (message?.id && selected.has(message.id)) { purged += 1; continue; }
+          kept.push(line);
+        } catch {
+          // A partial crash tail is not a valid durable message.
+        }
+      }
+      if (!kept.length) {
+        fs.unlinkSync(file.path);
+        filesDeleted += 1;
+      } else {
+        const tmp = `${file.path}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, `${kept.join('\n')}\n`, { mode: 0o600 });
+        fs.renameSync(tmp, file.path);
+        fs.chmodSync(file.path, 0o600);
+        filesRewritten += 1;
+      }
+    }
+    this.clearCache();
+    for (const message of this.readAll().slice(-this.maxCacheMessages)) this.addToCache(message);
+    return { ...preview, purged, filesDeleted, filesRewritten, confirmed: true };
   }
 
   prune() {

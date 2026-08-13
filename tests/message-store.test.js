@@ -51,6 +51,21 @@ test('cache clear preserves durable history and purge removes it', () => {
   assert.equal(store.query({ requester: 'B' }).messages.length, 0);
 });
 
+test('identity-scoped purge is preview-bound and atomically preserves unrelated messages', () => {
+  const store = new MessageStore({ dataDir: tempDir() });
+  store.initialize();
+  store.append({ from: 'CC1', to: 'CODEX1', content: 'remove one' });
+  store.append({ from: 'CODEX1', to: 'CC2', content: 'remove two' });
+  store.append({ from: 'CC3', to: 'CODEX3', content: 'keep' });
+  const preview = store.previewPurge('CODEX1');
+  assert.equal(preview.count, 2);
+  assert.equal(store.purgePreviewed('CODEX1', 'wrong').confirmed, false);
+  const result = store.purgePreviewed('CODEX1', preview.confirmation);
+  assert.equal(result.purged, 2);
+  assert.deepEqual(store.readAll().map(message => message.content), ['keep']);
+  assert.deepEqual(store.query({ requester: 'CODEX3' }).messages.map(message => message.content), ['keep']);
+});
+
 test('prunes files older than seven UTC days and tolerates a corrupt final line', () => {
   const dataDir = tempDir();
   const now = new Date('2026-07-12T12:00:00.000Z');

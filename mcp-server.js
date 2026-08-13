@@ -797,6 +797,38 @@ function handleMcpMessage(message) {
                 type: 'object',
                 properties: {}
               }
+            },
+            {
+              name: 'relay_delegate_jobs',
+              description: 'Preview terminal detached-delegate job records by exact owner or all owners. Restricted to configured admin client IDs; returns the confirmation token required by relay_purge_delegate_jobs.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  owner: {
+                    type: 'string',
+                    description: 'Exact relay identity (for example CODEX1), or "all"'
+                  }
+                },
+                required: ['owner']
+              }
+            },
+            {
+              name: 'relay_purge_delegate_jobs',
+              description: 'Delete terminal detached-delegate job records for one owner or all owners. Restricted to configured admin client IDs and requires the exact token from relay_delegate_jobs. Active jobs are never selected or deleted.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  owner: {
+                    type: 'string',
+                    description: 'Exact relay identity used in the preview, or "all"'
+                  },
+                  confirmation: {
+                    type: 'string',
+                    description: 'Exact confirmation token returned by relay_delegate_jobs'
+                  }
+                },
+                required: ['owner', 'confirmation']
+              }
             }
           ]
         }
@@ -1007,6 +1039,38 @@ function handleToolCall(requestId, toolName, args) {
         }
       }, 3000);
       break;
+
+    case 'relay_delegate_jobs':
+    case 'relay_purge_delegate_jobs': {
+      if (!connected) {
+        sendMcpResponse({
+          jsonrpc: '2.0', id: requestId,
+          result: { content: [{ type: 'text', text: 'Not connected to relay server. Unable to administer delegate jobs.' }] }
+        });
+        return;
+      }
+      const requestType = toolName === 'relay_delegate_jobs'
+        ? 'preview_delegate_jobs'
+        : 'purge_delegate_jobs';
+      const operationId = `${requestType}-${Date.now()}-${Math.random()}`;
+      pendingMessages.push({ requestId, type: requestType, id: operationId });
+      ws.send(JSON.stringify({
+        type: requestType,
+        owner: args.owner,
+        ...(requestType === 'purge_delegate_jobs' ? { confirmation: args.confirmation } : {})
+      }));
+      setTimeout(() => {
+        const idx = pendingMessages.findIndex(p => p.id === operationId);
+        if (idx !== -1) {
+          pendingMessages.splice(idx, 1);
+          sendMcpResponse({
+            jsonrpc: '2.0', id: requestId,
+            result: { content: [{ type: 'text', text: 'Timeout waiting for relay server to administer delegate jobs' }] }
+          });
+        }
+      }, 3000);
+      break;
+    }
 
     case 'relay_status':
       sendMcpResponse({
@@ -1559,6 +1623,42 @@ function connectToRelay() {
           }
           break;
 
+        case 'delegate_jobs_preview': {
+          const previewReq = pendingMessages.find(p => p.type === 'preview_delegate_jobs');
+          if (previewReq) {
+            pendingMessages = pendingMessages.filter(p => p !== previewReq);
+            const statuses = Object.entries(msg.byStatus || {})
+              .map(([status, count]) => `${status}=${count}`).join(', ') || 'none';
+            const owners = Object.entries(msg.byOwner || {})
+              .map(([owner, count]) => `${owner}=${count}`).join(', ') || 'none';
+            sendMcpResponse({
+              jsonrpc: '2.0', id: previewReq.requestId,
+              result: { content: [{
+                type: 'text',
+                text: msg.count
+                  ? `Preview: ${msg.count} terminal delegate-job record(s) for ${msg.owner}. Statuses: ${statuses}. Owners: ${owners}. To delete exactly this selection, call relay_purge_delegate_jobs with owner="${msg.owner}" and confirmation="${msg.confirmation}".`
+                  : `Preview: no terminal delegate-job records for ${msg.owner}; nothing to purge.`
+              }] }
+            });
+          }
+          break;
+        }
+
+        case 'delegate_jobs_purged': {
+          const purgeJobsReq = pendingMessages.find(p => p.type === 'purge_delegate_jobs');
+          if (purgeJobsReq) {
+            pendingMessages = pendingMessages.filter(p => p !== purgeJobsReq);
+            sendMcpResponse({
+              jsonrpc: '2.0', id: purgeJobsReq.requestId,
+              result: { content: [{
+                type: 'text',
+                text: `Purged ${msg.purged || 0} terminal delegate-job record(s) for ${msg.owner}. Active jobs were preserved.`
+              }] }
+            });
+          }
+          break;
+        }
+
         case 'peer_joined':
           peers = msg.peers || [];
           // Queue notification for next relay_receive
@@ -1619,7 +1719,9 @@ function connectToRelay() {
             }));
             break;
           }
-          const pendingPurge = pendingMessages.find(p => p.type === 'purge_history');
+          const pendingPurge = pendingMessages.find(p => [
+            'purge_history', 'preview_delegate_jobs', 'purge_delegate_jobs'
+          ].includes(p.type));
           if (pendingPurge) {
             pendingMessages = pendingMessages.filter(p => p !== pendingPurge);
             sendMcpResponse({

@@ -105,6 +105,41 @@ test('first successful use marks the capability acknowledged (migration closes)'
   assert.equal(reopened.isAcknowledged('CCM'), true);
 });
 
+test('an abandoned pending enrollment expires and can be reissued', t => {
+  let clock = Date.parse('2026-08-01T00:00:00Z');
+  const { store: caps } = store(t, { now: () => clock });
+  caps.mintOwner('ABANDONED');
+  assert.equal(caps.hasOwner('ABANDONED'), true);
+  assert.equal(caps.isAcknowledged('ABANDONED'), false);
+  clock += 8 * 24 * 60 * 60 * 1000;
+  assert.equal(caps.pruneUnacknowledged(), 1);
+  assert.equal(caps.hasOwner('ABANDONED'), false);
+  const replacement = caps.mintOwner('ABANDONED');
+  assert.ok(replacement.secret);
+  assert.equal(caps.verifyOwner('ABANDONED', replacement.secret), true);
+});
+
+test('health stats separate named owner credentials from ephemeral watchers', t => {
+  let clock = Date.parse('2026-08-13T12:00:00Z');
+  const { store: caps } = store(t, { now: () => clock });
+  caps.mintOwner('CODEX1');
+  caps.mintOwner('CC3-watch-12345-deadbeef');
+  const confirmed = caps.mintOwner('CC1');
+  caps.verifyOwner('CC1', confirmed.secret);
+
+  assert.deepEqual(caps.stats(), {
+    total: 3,
+    pending: 1,
+    pendingNamedLabels: ['CODEX1'],
+    pendingTransient: 1
+  });
+
+  clock += 61 * 60 * 1000;
+  assert.equal(caps.pruneUnacknowledged(), 1, 'hour-old watcher is pruned');
+  assert.equal(caps.hasOwner('CODEX1'), true, 'named enrollment retains seven-day window');
+  assert.equal(caps.hasOwner('CC3-watch-12345-deadbeef'), false);
+});
+
 test('job capability carries reply scope, spawn binding, and a session lease', t => {
   const { store: caps } = store(t);
   caps.mintOwner('CODEXJ');
