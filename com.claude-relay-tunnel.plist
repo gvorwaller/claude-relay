@@ -6,10 +6,10 @@
     <string>com.claude-relay-tunnel</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/autossh</string>
-        <string>-M</string>
-        <string>0</string>
+        <string>/usr/bin/ssh</string>
         <string>-N</string>
+        <string>-o</string>
+        <string>BatchMode=yes</string>
         <string>-o</string>
         <string>ServerAliveInterval=30</string>
         <string>-o</string>
@@ -18,7 +18,7 @@
         <string>ExitOnForwardFailure=yes</string>
         <string>-L</string>
         <string>127.0.0.1:9999:127.0.0.1:9999</string>
-        <string>m1</string>
+        <string>relay-m4</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -28,10 +28,5 @@
     <string>/Users/gaylonvorwaller/claude-relay/logs/tunnel.log</string>
     <key>StandardErrorPath</key>
     <string>/Users/gaylonvorwaller/claude-relay/logs/tunnel-error.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>AUTOSSH_GATETIME</key>
-        <string>0</string>
-    </dict>
 </dict>
 </plist>

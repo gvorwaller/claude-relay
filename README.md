@@ -81,9 +81,12 @@ supported:
 ssh -N -o ExitOnForwardFailure=yes \
   -L 127.0.0.1:9999:127.0.0.1:9999 server-host &
 
-# Or use autossh for auto-reconnecting
-autossh -M 0 -N -o ExitOnForwardFailure=yes \
-  -L 127.0.0.1:9999:127.0.0.1:9999 server-host &
+# For a persistent macOS tunnel, use the included LaunchAgent with a dedicated
+# `relay-m4` SSH host alias. It uses macOS's built-in /usr/bin/ssh; launchd
+# restarts it after a disconnect.
+cp com.claude-relay-tunnel.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.claude-relay-tunnel.plist
 ```
 
 The remote MCP bridge still uses `RELAY_URL=ws://127.0.0.1:9999`; traffic
@@ -491,17 +494,16 @@ relay-health
 ### SSH Tunnel (on remote machines)
 
 ```bash
-# Install autossh
-brew install autossh
-
-# Copy and edit the tunnel LaunchAgent on the remote Mac
+# Copy the tunnel LaunchAgent on the remote Mac. It uses /usr/bin/ssh, so no
+# Homebrew package or Node change is required.
 cp com.claude-relay-tunnel.plist ~/Library/LaunchAgents/
 
-# Edit the final ProgramArguments value (`m1` in the example) to the SSH host
-# alias for the relay-server Mac. The forward must remain bound to 127.0.0.1.
+# Add a `relay-m4` entry to ~/.ssh/config for the relay-server Mac. The forward
+# remains bound to 127.0.0.1 on both machines.
 
 # Load it
-launchctl load ~/Library/LaunchAgents/com.claude-relay-tunnel.plist
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.claude-relay-tunnel.plist
 
 # Verify the tunnel and remote bridge path
 launchctl print "gui/$(id -u)/com.claude-relay-tunnel" | grep 'state ='

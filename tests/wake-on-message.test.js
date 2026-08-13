@@ -6,6 +6,16 @@ const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
 
+test('Claude Stop hook honors an explicit existing Node executable', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'relay-stop-hook.sh'),
+    'utf8'
+  );
+  assert.match(source, /NODE_BIN="\$\{RELAY_NODE_BIN:-node\}"/);
+  assert.match(source, /"\$NODE_BIN" -e 'console\.log\(new Date\(\)\.toISOString\(\)\)'/);
+  assert.match(source, /"\$NODE_BIN" "\$WATCH" --for "\$ID"/);
+});
+
 function waitForMessage(ws, predicate, timeout = 3000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

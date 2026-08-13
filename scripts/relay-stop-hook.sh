@@ -21,6 +21,11 @@
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Remote Macs can run Claude without exposing their NVM directory through the
+# non-interactive hook PATH.  RELAY_NODE_BIN lets the operator point this hook
+# at one already-installed Node executable; it never invokes or changes NVM.
+NODE_BIN="${RELAY_NODE_BIN:-node}"
+
 REGISTRY="$HOME/claude-relay/sessions/registry.json"
 WATCH="$HOME/claude-relay/scripts/relay-watch.js"
 [[ -f "$REGISTRY" && -f "$WATCH" ]] || exit 0
@@ -119,12 +124,12 @@ trap release_lock EXIT
 # Millisecond precision matters: a whole-second cursor makes the freshly armed
 # watcher see the message this session JUST processed (stored with ms) as
 # "newer" and re-wake immediately (2026-08-05 review finding #8).
-SINCE="$(node -e 'console.log(new Date().toISOString())')"
+SINCE="$("$NODE_BIN" -e 'console.log(new Date().toISOString())')"
 while true; do
   if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
     exit 0
   fi
-  OUT="$(node "$WATCH" --for "$ID" --timeout 300 --since "$SINCE" 2>/dev/null)"
+  OUT="$("$NODE_BIN" "$WATCH" --for "$ID" --timeout 300 --since "$SINCE" 2>/dev/null)"
   case "$OUT" in
     new-message)
       echo "Relay mail is waiting for $ID. Run relay_receive now and act on what it says; reply to the sender via relay_send if a reply is warranted." >&2
