@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const { notifyDelegate } = require('../delegate-notifier');
 
 test('relay-monitor renders sanitized activity and never arbitrary job fields', t => {
@@ -32,4 +32,25 @@ test('delegate notifications use fixed AppleScript and content-minimized argv', 
   assert.equal(call[0], '/usr/bin/osascript');
   assert.match(call[1].join(' '), /CODEX3: completed/);
   assert.doesNotMatch(call[1].join(' '), /secret body/);
+});
+
+test('delegate runner forwards bounded child stderr for operator diagnosis', () => {
+  const runner = path.join(__dirname, '..', 'scripts', 'run-codex-delegate.js');
+  const result = spawnSync(process.execPath, [runner, '--', process.execPath, '-e',
+    'process.stderr.write("resume refused\\n"); process.exit(7)'], {
+    encoding: 'utf8',
+    env: { ...process.env, RELAY_JOB_RESULT_SECRET_FILE: '' }
+  });
+  assert.equal(result.status, 7);
+  assert.match(result.stderr, /resume refused/);
+});
+
+test('Desktop app-server wake path uses a fresh same-cwd delegate', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'wake-codex.sh'), 'utf8'
+  );
+  assert.match(source, /PARENT_ARGS.*app-server/);
+  assert.match(source, /FRESH_DELEGATE=1/);
+  assert.match(source, /codex exec --json.*-C "\$PEER_CWD"/s);
+  assert.match(source, /foreground app-server session stays attached/);
 });

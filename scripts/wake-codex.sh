@@ -57,6 +57,7 @@ PY
 # their own armed relay-watch-loop.sh — exec-ing anything for them is wrong.
 IS_CODEX=0
 PARENT_ARGS=""
+FRESH_DELEGATE=0
 if [[ "$PEER_PID" != "0" ]] && kill -0 "$PEER_PID" 2>/dev/null; then
   PARENT_PID="$(ps -o ppid= -p "$PEER_PID" 2>/dev/null | tr -d ' ')"
   PARENT_ARGS="$(ps -o command= -p "${PARENT_PID:-0}" 2>/dev/null)"
@@ -67,6 +68,16 @@ fi
 if [[ "$IS_CODEX" == "0" ]]; then
   [[ "$DRY_RUN" == "1" ]] && echo "$FOR -> not a codex peer; nothing to exec (wakes via its own watcher)"
   exit 64
+fi
+
+# Codex Desktop's app-server owns the live conversation and rejects a second
+# `codex exec resume` process for that same session. In that case launch a
+# fresh headless delegate in the registered working directory. Its job-scoped
+# relay credential still makes it speak as this peer, and it never takes over
+# the foreground socket. CLI sessions that are not app-server-owned continue
+# to use exact-session resume below.
+if [[ "$PARENT_ARGS" == *" app-server"* || "$PARENT_ARGS" == *" app-server "* ]]; then
+  FRESH_DELEGATE=1
 fi
 
 SESSION_ID=""
@@ -143,7 +154,7 @@ PY
   [[ -n "$SESSION_ID" ]] && echo "note: $FOR resolved by unique cwd match (no persisted session id)"
 fi
 
-if [[ -z "$SESSION_ID" ]]; then
+if [[ "$FRESH_DELEGATE" == "0" && -z "$SESSION_ID" ]]; then
   echo "error: no codex session found for $FOR (pid=$PEER_PID cwd=$PEER_CWD)"
   # Automation cannot reach this peer (e.g. an app conversation with no
   # CLI-resumable rollout) — fall back to telling the human, content-free.
@@ -160,7 +171,11 @@ if [[ -z "$SESSION_ID" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "$FOR -> codex session $SESSION_ID"
+  if [[ "$FRESH_DELEGATE" == "1" ]]; then
+    echo "$FOR -> fresh codex delegate in $PEER_CWD (foreground app-server session stays attached)"
+  else
+    echo "$FOR -> codex session $SESSION_ID"
+  fi
   exit 0
 fi
 
@@ -183,9 +198,15 @@ fi
 # submit the result.
 LAST_MESSAGE_FILE="$(mktemp -t relay-lastmsg)"
 chmod 600 "$LAST_MESSAGE_FILE"
-node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
-  codex exec --json "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" \
-  resume "$SESSION_ID" "$PROMPT"
+if [[ "$FRESH_DELEGATE" == "1" ]]; then
+  node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
+    codex exec --json "${CODEX_ARGS[@]}" -C "$PEER_CWD" \
+    --output-last-message "$LAST_MESSAGE_FILE" "$PROMPT"
+else
+  node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
+    codex exec --json "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" \
+    resume "$SESSION_ID" "$PROMPT"
+fi
 CODEX_EXIT=$?
 
 if [[ -n "${RELAY_JOB_ID:-}" && -n "${RELAY_JOB_RESULT_SECRET_FILE:-}" ]]; then

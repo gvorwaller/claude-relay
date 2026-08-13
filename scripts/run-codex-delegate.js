@@ -33,8 +33,9 @@ function submitActivity(activityType) {
   });
 }
 
-const child = spawn(command, commandArgs, { stdio: ['ignore', 'pipe', 'ignore'], env: process.env });
+const child = spawn(command, commandArgs, { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
 let buffer = '';
+let stderrBytes = 0;
 const pending = new Set();
 let submitted = 0;
 child.stdout.setEncoding('utf8');
@@ -53,6 +54,15 @@ child.stdout.on('data', chunk => {
       request.finally(() => pending.delete(request));
     }
   }
+});
+// The runner used to discard stderr, turning configuration and resume errors
+// into opaque exit-code-only jobs. Keep it out of the durable monitor record,
+// but forward a bounded amount to wake-codex.log for operator diagnosis.
+child.stderr.on('data', chunk => {
+  if (stderrBytes >= 65536) return;
+  const slice = chunk.subarray(0, 65536 - stderrBytes);
+  stderrBytes += slice.length;
+  process.stderr.write(slice);
 });
 child.on('error', () => process.exit(1));
 child.on('exit', code => {
