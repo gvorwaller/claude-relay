@@ -199,7 +199,11 @@ Run `npm run monitor` in the relay checkout (or `node scripts/relay-monitor.js`)
 for a live terminal view of recent delegate jobs. Optional flags are
 `--owner CODEX3`, `--interval 500`, and `--once`. The monitor shows causal job
 state, a deliberately coarse current activity, relay replies and whether each
-was delivered live or queued.
+was delivered live or queued. Select **Activity**, choose a run, and press
+Return for its audit report: the incoming request, independently observed
+reply and delivery facts, the delegate's structured summary/changes/checks,
+sanitized activity timeline, and bounded failure information. Press `C` there
+to copy the report.
 
 In an interactive terminal it is also the operator control center. Every
 available action is listed with its effect: activity, detailed health, a
@@ -215,9 +219,11 @@ migration fallback by older clients. It installs one atomic replacement secret
 at a time; a live session reconnects and confirms it automatically, while an
 offline session uses it at its next start.
 
-The activity feed is a strict allowlist projected from `codex exec --json`.
-It never stores or renders raw JSON, reasoning, prompts, message bodies,
-commands, command output, tool arguments, file paths, or secrets. macOS also
+The activity timeline is a strict allowlist projected from `codex exec --json`.
+It never stores or renders raw JSON, hidden reasoning, commands, command
+output, tool arguments, arbitrary file paths, or secrets. The explicit audit
+screen does show the durable incoming/outgoing relay message bodies relevant
+to the selected run, plus the delegate's constrained final report. macOS also
 shows content-minimized start and completion/failure notifications; set
 `RELAY_DISABLE_NOTIFICATIONS=1` to disable those notices.
 

@@ -11,6 +11,7 @@ class RelayWaiter {
     this.clearTimer = options.clearTimer || clearTimeout;
     this.now = options.now || (() => Date.now());
     this.recentLimit = options.recentLimit || 200;
+    this.onFinish = options.onFinish || (() => {});
     this.pending = null;
     this.recentIds = new Set();
   }
@@ -65,6 +66,12 @@ class RelayWaiter {
     waiter.settled = true;
     this.clearTimer(waiter.timer);
     this.pending = null;
+
+    this.onFinish({
+      requestId: waiter.requestId,
+      reason,
+      messageId: message?.id || null
+    });
 
     if (message) this.remember(message.id);
     const cursor = message?.id || waiter.after || null;

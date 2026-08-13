@@ -86,8 +86,11 @@ class MessageStore {
   filterMessages(source, { requester, from, to, after }) {
     let messages = source.filter(message => this.isVisibleTo(message, requester));
 
-    if (from) messages = messages.filter(message => message.from === from);
-    if (to) messages = messages.filter(message => message.to === to);
+    // Place an opaque cursor in the requester's whole visible conversation
+    // BEFORE applying sender/recipient filters. A normal request such as
+    // `after=<my outbound message>, from=<peer>` otherwise calls that valid
+    // cursor "foreign" merely because the cursor itself was not sent by the
+    // peer, breaking the most common request/reply wait pattern.
     let unknownCursor = false;
     if (after) {
       const index = messages.findIndex(message => message.id === after);
@@ -107,6 +110,8 @@ class MessageStore {
         }
       }
     }
+    if (from) messages = messages.filter(message => message.from === from);
+    if (to) messages = messages.filter(message => message.to === to);
     return { messages, unknownCursor };
   }
 

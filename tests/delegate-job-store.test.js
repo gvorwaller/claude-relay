@@ -147,21 +147,23 @@ test('retention never prunes a job the human has not been told about', t => {
   assert.equal(store.get(reported.jobId), null, 'reported work ages out normally');
 });
 
-test('terminal and reported receipts are immutable', t => {
+test('server evidence may arrive after process exit but reported receipts are immutable', t => {
   const { store } = makeStore(t);
   const job = store.create({ owner: 'CODEX3', inboundMessageId: 'i1', from: 'CC6' });
   store.transition(job.jobId, 'running');
   store.transition(job.jobId, 'completed');
 
-  // A late send cannot mutate a finished receipt.
-  assert.equal(store.recordOutbound(job.jobId, { to: 'CC6', messageId: 'late', delivered: true }), null);
-  assert.deepEqual(store.get(job.jobId).outbound, []);
+  // A send acknowledged just after child exit still belongs to this run and
+  // must not disappear from its operator-visible evidence.
+  assert.ok(store.recordOutbound(job.jobId, { to: 'CC6', messageId: 'late', delivered: true }));
+  assert.deepEqual(store.get(job.jobId).outbound.map(item => item.messageId), ['late']);
 
   // A late registration cannot restart it.
   assert.equal(store.transition(job.jobId, 'running'), null);
 
   // A replayed acknowledgement cannot rewrite who reported it.
   store.transition(job.jobId, 'reported', { reportedTurnId: 'turn-1' });
+  assert.equal(store.recordOutbound(job.jobId, { to: 'CC6', messageId: 'too-late', delivered: true }), null);
   store.transition(job.jobId, 'reported', { reportedTurnId: 'turn-2' });
   assert.equal(store.get(job.jobId).reportedTurnId, 'turn-1');
 });

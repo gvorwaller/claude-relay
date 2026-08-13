@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "changes", "verification"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "A concise operator-facing account of what the delegate did and how it responded. Do not include hidden reasoning, secrets, or raw tool output."
+    },
+    "changes": {
+      "type": "string",
+      "description": "Files or external state changed, or 'None' when no changes were made."
+    },
+    "verification": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "string" },
+      "description": "Checks performed and their outcomes."
+    }
+  }
+}

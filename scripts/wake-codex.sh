@@ -38,7 +38,7 @@ done
 [[ "$FOR" == "all" ]] && exit 64
 # NOTE: keep this text apostrophe-free; macOS bash 3.2 mis-parses quotes
 # inside ${var:-default}, which is also why the default lives in its own var.
-DEFAULT_PROMPT="[Automated wake from the relay notify hook - no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives."
+DEFAULT_PROMPT="[Automated wake from the relay notify hook - no human typed this.] You have unread claude-relay mail addressed to you ($FOR). Run relay_receive, act on what it says, and reply to the sender via relay_send if a reply is warranted. Then END your turn: do not hold relay_wait open, because this hook will wake you again whenever new mail arrives. Your final response is an operator audit report constrained by the supplied JSON schema: summarize what you did, identify changes or say None, and list verification performed. Do not include hidden reasoning, secrets, or raw tool output."
 PROMPT="${ARGS[1]:-$DEFAULT_PROMPT}"
 
 read -r PEER_PID PEER_SESSION PEER_CWD <<< "$(python3 - "$REGISTRY" "$FOR" <<'PY'
@@ -198,13 +198,16 @@ fi
 # submit the result.
 LAST_MESSAGE_FILE="$(mktemp -t relay-lastmsg)"
 chmod 600 "$LAST_MESSAGE_FILE"
+RESULT_SCHEMA="$(dirname "${BASH_SOURCE[0]}")/delegate-result-schema.json"
 if [[ "$FRESH_DELEGATE" == "1" ]]; then
   node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
     codex exec --json "${CODEX_ARGS[@]}" -C "$PEER_CWD" \
+    --output-schema "$RESULT_SCHEMA" \
     --output-last-message "$LAST_MESSAGE_FILE" "$PROMPT"
 else
   node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
-    codex exec --json "${CODEX_ARGS[@]}" --output-last-message "$LAST_MESSAGE_FILE" \
+    codex exec --json "${CODEX_ARGS[@]}" --output-schema "$RESULT_SCHEMA" \
+    --output-last-message "$LAST_MESSAGE_FILE" \
     resume "$SESSION_ID" "$PROMPT"
 fi
 CODEX_EXIT=$?

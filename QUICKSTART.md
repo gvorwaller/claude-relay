@@ -47,6 +47,12 @@ count, and each connection's reported host, client source, working directory,
 and process ID. Identities still using the local credential-migration fallback
 are labeled there as well.
 
+Select **Activity**, choose a delegated run, and press Return to inspect it.
+The detail screen separates relay-observed request/reply/delivery facts from
+the delegate's own structured summary, changes, and verification. It also
+shows the sanitized timeline and bounded failure information. Press `C` to
+copy the complete operator report, or Escape to return.
+
 Select **Repair owner credentials** to replace the credential for one of those
 pending identities. The screen distinguishes live from offline identities and
 defaults to Cancel. A live session briefly reconnects and confirms

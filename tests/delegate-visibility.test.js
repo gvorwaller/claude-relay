@@ -53,4 +53,9 @@ test('Desktop app-server wake path uses a fresh same-cwd delegate', () => {
   assert.match(source, /FRESH_DELEGATE=1/);
   assert.match(source, /codex exec --json.*-C "\$PEER_CWD"/s);
   assert.match(source, /foreground app-server session stays attached/);
+  assert.match(source, /--output-schema "\$RESULT_SCHEMA"/);
+  const schema = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'delegate-result-schema.json'), 'utf8'
+  ));
+  assert.deepEqual(schema.required, ['summary', 'changes', 'verification']);
 });

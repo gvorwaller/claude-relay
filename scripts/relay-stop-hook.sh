@@ -135,6 +135,9 @@ while true; do
       echo "Relay mail is waiting for $ID. Run relay_receive now and act on what it says; reply to the sender via relay_send if a reply is warranted." >&2
       exit 2
       ;;
+    timeout:*)
+      SINCE="${OUT#timeout:}"
+      ;;
     timeout)
       : # normal re-arm; SINCE stays pinned so gap mail still backfills a ping
       ;;

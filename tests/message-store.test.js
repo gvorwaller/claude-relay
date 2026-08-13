@@ -106,6 +106,18 @@ test('unknown opaque cursor returns nothing and flags it instead of replaying hi
   assert.equal(afterEpoch.unknownCursor, undefined);
 });
 
+test('opaque cursor is resolved before sender filtering for request-reply waits', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-store-filter-cursor-'));
+  const store = new MessageStore({ dataDir: root });
+  store.initialize();
+  const outbound = store.append({ from: 'CODEX', to: 'M2', content: 'request' });
+  store.append({ from: 'M2', to: 'CODEX', content: 'ACK' });
+
+  const result = store.query({ requester: 'CODEX', from: 'M2', after: outbound.id });
+  assert.deepEqual(result.messages.map(message => message.content), ['ACK']);
+  assert.equal(result.unknownCursor, undefined);
+});
+
 test('delegate floor slices by durable order, not wall clock', () => {
   const store = new MessageStore({ dataDir: tempDir(), now: () => new Date('2026-08-06T00:00:00.000Z') });
   store.initialize();

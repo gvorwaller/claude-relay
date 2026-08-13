@@ -4,10 +4,12 @@
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
+const { spawnSync } = require('child_process');
 const {
-  healthAssessment, messageOwnerChoices, operatorJobRequest, operatorMessageRequest,
+  delegateJobDetail, delegateJobReportLines, healthAssessment,
+  messageOwnerChoices, operatorJobRequest, operatorMessageRequest,
   operatorOwnerRepair, ownerChoices, pendingOwnerLabels,
-  readJobRecords, relayTopology, restartRelay, topologyLines
+  readJobRecords, relayTopology, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
 const args = process.argv.slice(2);
@@ -27,6 +29,24 @@ const labels = {
   sending_reply: 'Sending relay reply', preparing_response: 'Preparing response',
   waiting: 'Waiting', finishing: 'Finishing delegated run', error: 'Codex reported an error'
 };
+
+function wrapLine(line, width) {
+  if (!line || line.length <= width) return [line];
+  const wrapped = [];
+  let rest = line;
+  while (rest.length > width) {
+    let split = rest.lastIndexOf(' ', width);
+    if (split < Math.floor(width / 2)) split = width;
+    wrapped.push(rest.slice(0, split));
+    rest = rest.slice(split).trimStart();
+  }
+  wrapped.push(rest);
+  return wrapped;
+}
+
+function wrapped(lines, width = Math.max(40, (process.stdout.columns || 100) - 4)) {
+  return lines.flatMap(line => wrapLine(String(line), width));
+}
 
 function jobs(limit = 20) {
   return readJobRecords(dataRoot)
@@ -109,12 +129,53 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
     ['Clean completed activity', 'Remove old finished monitor entries; active work is always kept.'],
     ['Clean message history', 'Remove durable messages for one identity or for everyone.']
   ];
-  const state = { selected: 0, panel: 'activity', topology: null, dialog: null, notice: null };
+  const state = {
+    selected: 0, panel: 'activity', topology: null, dialog: null, notice: null,
+    activityBrowsing: false, activitySelected: 0, detail: null, detailScroll: 0
+  };
 
   function clear() { process.stdout.write('\x1b[2J\x1b[H'); }
   function crop(lines) {
     const height = Math.max(8, (process.stdout.rows || 30) - 12);
     return lines.slice(0, height);
+  }
+  function detailHeight() {
+    // Warp renders this process inside a command block but reports the full
+    // terminal height. A bounded internal viewport keeps arrow scrolling
+    // deterministic instead of incorrectly deciding the whole report fits.
+    return Math.max(8, Math.min(16, (process.stdout.rows || 30) - 16));
+  }
+  function activityListLines() {
+    const records = jobs(100);
+    if (!records.length) return ['No delegate activity recorded.'];
+    state.activitySelected = Math.min(state.activitySelected, records.length - 1);
+    const lines = [];
+    records.forEach((job, index) => {
+      lines.push(`${state.activityBrowsing && index === state.activitySelected ? '>' : ' '} ${job.owner}  ${job.status}  ${age(job.requestedAt)} ago  from ${job.from || 'unknown'}`);
+      const latest = Array.isArray(job.activity) && job.activity.length
+        ? labels[job.activity[job.activity.length - 1].type] || 'Working' : null;
+      if (latest && (job.status === 'spawned' || job.status === 'running')) lines.push(`    ${latest}`);
+      for (const outbound of (job.outbound || [])) lines.push(`    Reply to ${outbound.to}: ${outbound.delivered ? 'delivered live' : 'queued'}`);
+    });
+    return lines;
+  }
+  function detailLines() {
+    if (!state.detail) return ['Delegate job detail is unavailable.'];
+    try { state.detail = delegateJobDetail(dataRoot, state.detail.job.jobId); } catch {}
+    return wrapped(delegateJobReportLines(state.detail));
+  }
+  function detailWindow() {
+    const window = scrollWindow(detailLines(), state.detailScroll, detailHeight());
+    state.detailScroll = window.offset;
+    return window;
+  }
+  function copyDetail() {
+    if (!state.detail) return;
+    const report = `${delegateJobReportLines(state.detail).join('\n')}\n`;
+    const copied = spawnSync('pbcopy', [], { input: report, encoding: 'utf8' });
+    state.notice = copied.error || copied.status !== 0
+      ? 'Could not copy the report to the clipboard.'
+      : 'Copied this delegate report to the clipboard.';
   }
   function renderDialog(lines, options) {
     return ['', ...lines, '', ...options.map((option, index) =>
@@ -176,18 +237,35 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
       ], ['Remove the previewed entries', 'Cancel']));
     } else {
       const title = state.panel === 'health' ? 'HEALTH DETAILS'
-        : state.panel === 'topology' ? 'PEERS AND LIVE SESSIONS' : 'DELEGATE ACTIVITY';
+        : state.panel === 'topology' ? 'PEERS AND LIVE SESSIONS'
+          : state.panel === 'detail' ? 'DELEGATE DETAILS' : 'DELEGATE ACTIVITY';
+      const detailView = state.panel === 'detail' ? detailWindow() : null;
       const content = state.panel === 'health' ? healthLines()
         : state.panel === 'topology'
           ? (state.topology?.error ? [`Could not load live sessions: ${state.topology.error}`] : topologyLines(state.topology))
-          : activityLines();
-      lines.push(title, '', ...crop(content));
-      lines.push('', 'Use ↑/↓ to choose an action and Return to open it. Press Q to close.');
+          : state.panel === 'detail' ? detailView.lines
+            : activityListLines();
+      lines.push(title, '', ...(state.panel === 'detail' ? content : crop(content)));
+      if (state.panel === 'activity' && state.activityBrowsing) lines.push('', 'Use ↑/↓ to select a run and Return to inspect it. Escape returns to actions. Press Q to close.');
+      else if (state.panel === 'detail') lines.push('',
+        `Lines ${detailView.first}-${detailView.last} of ${detailView.total}`,
+        'Use ↑/↓ to scroll. Press C to copy this report or Escape to return to Activity.');
+      else lines.push('', 'Use ↑/↓ to choose an action and Return to open it. Press Q to close.');
     }
     process.stdout.write(`${lines.join('\n')}\n`);
   }
 
   function move(delta) {
+    if (!state.dialog && state.panel === 'detail') {
+      const current = detailWindow();
+      state.detailScroll = Math.max(0, Math.min(current.maximum, current.offset + delta));
+      return;
+    }
+    if (!state.dialog && state.panel === 'activity' && state.activityBrowsing) {
+      const length = jobs(100).length;
+      if (length) state.activitySelected = (state.activitySelected + delta + length) % length;
+      return;
+    }
     const target = state.dialog || state;
     const length = state.dialog ? state.dialog.options.length : actions.length;
     target.selected = (target.selected + delta + length) % length;
@@ -259,7 +337,18 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
       state.dialog = null;
       return;
     }
-    if (state.selected === 0) state.panel = 'activity';
+    if (!state.dialog && state.panel === 'activity' && state.activityBrowsing) {
+      const selected = jobs(100)[state.activitySelected];
+      if (selected?.jobId) {
+        try {
+          state.detail = delegateJobDetail(dataRoot, selected.jobId);
+          state.detailScroll = 0;
+          state.panel = 'detail';
+        } catch (error) { state.notice = error.message; }
+      }
+      return;
+    }
+    if (state.selected === 0) { state.panel = 'activity'; state.activityBrowsing = true; }
     if (state.selected === 1) state.panel = 'health';
     if (state.selected === 2) {
       state.panel = 'topology';
@@ -295,10 +384,16 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
   process.stdin.resume();
   process.stdin.on('keypress', (_text, key = {}) => {
     if (key.ctrl && key.name === 'c' || key.name === 'q') process.exit(0);
-    if (key.name === 'up') move(-1);
+    if (state.panel === 'detail' && key.name === 'c') copyDetail();
+    else if (key.name === 'up') move(-1);
     else if (key.name === 'down') move(1);
     else if (key.name === 'return') void choose().then(render);
-    else if (key.name === 'escape') { state.dialog = null; state.notice = null; }
+    else if (key.name === 'escape') {
+      if (state.notice) state.notice = null;
+      else if (state.dialog) state.dialog = null;
+      else if (state.panel === 'detail') { state.panel = 'activity'; state.activityBrowsing = true; state.detail = null; state.detailScroll = 0; }
+      else if (state.panel === 'activity' && state.activityBrowsing) state.activityBrowsing = false;
+    }
     render();
   });
   process.on('exit', () => { try { process.stdin.setRawMode(false); } catch {} });

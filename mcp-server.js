@@ -611,6 +611,19 @@ function sendToolText(requestId, text) {
 
 const relayWaiter = new RelayWaiter({
   respond: sendToolText,
+  onFinish: ({ requestId }) => {
+    const waitHistory = pendingMessages.find(p =>
+      p.type === 'wait_history' && p.requestId === requestId);
+    if (waitHistory) {
+      waitHistory.settled = true;
+      if (!waitHistory.historyRequested) {
+        pendingMessages = pendingMessages.filter(p => p !== waitHistory);
+      }
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'attention_wait_cancel', waitId: String(requestId) }));
+    }
+  },
   log: fields => console.error(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: 'relay_wait_completed',
@@ -910,14 +923,24 @@ function handleToolCall(requestId, toolName, args) {
         return;
       }
 
-      // Register the waiter before asking for history. Push and history then
-      // race through RelayWaiter.finish(), whose first settlement wins.
-      pendingMessages.push({ requestId, type: 'wait_history' });
-      ws.send(JSON.stringify({
-        type: 'get_history',
-        count: 100,
+      // Tell the relay that this foreground tool owns the next matching
+      // attention event BEFORE asking for history. WebSocket ordering makes
+      // the claim visible before the history request, so a newly arriving
+      // message cannot also wake the detached delegate and Stop-hook watcher.
+      pendingMessages.push({
+        requestId,
+        type: 'wait_history',
+        waitId: String(requestId),
+        historyRequested: false,
+        settled: false,
         from: args.from,
         after: args.after
+      });
+      ws.send(JSON.stringify({
+        type: 'attention_wait',
+        waitId: String(requestId),
+        from: args.from || null,
+        after: args.after || null
       }));
       break;
 
@@ -1552,6 +1575,21 @@ function connectToRelay() {
             });
           }
           break;
+
+        case 'attention_waiting': {
+          const waitReq = pendingMessages.find(p =>
+            p.type === 'wait_history' && p.waitId === String(msg.waitId || ''));
+          if (waitReq && !waitReq.settled && !waitReq.historyRequested) {
+            waitReq.historyRequested = true;
+            ws.send(JSON.stringify({
+              type: 'get_history',
+              count: 100,
+              from: waitReq.from,
+              after: waitReq.after
+            }));
+          }
+          break;
+        }
 
         case 'history':
           const histReq = pendingMessages.find(p => p.type === 'history' || p.type === 'wait_history');

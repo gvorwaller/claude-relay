@@ -11,6 +11,13 @@ const { TERMINAL_RUN_STATES } = require('./delegate-job-store');
 const { isTransientOwnerLabel } = require('./capabilities');
 
 const CLIENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const ACTIVITY_LABELS = {
+  analyzing: 'Analyzing request', reading_message: 'Reading relay message',
+  reading_files: 'Reading files', running_command: 'Running a command',
+  using_tool: 'Using a tool', updating_files: 'Updating files',
+  sending_reply: 'Sending relay reply', preparing_response: 'Preparing response',
+  waiting: 'Waiting', finishing: 'Finishing delegated run', error: 'Codex reported an error'
+};
 
 function readJobRecords(dataRoot) {
   const jobsDir = path.join(dataRoot, 'jobs');
@@ -26,6 +33,94 @@ function readJobRecords(dataRoot) {
       return null;
     }
   }).filter(Boolean);
+}
+
+function readMessageRecords(dataRoot) {
+  const dir = path.join(dataRoot, 'messages');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter(name => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)).sort(); } catch {}
+  const messages = [];
+  for (const name of names) {
+    for (const line of fs.readFileSync(path.join(dir, name), 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const message = JSON.parse(line);
+        if (message?.id && message?.from && message?.to && message?.timestamp) messages.push(message);
+      } catch { /* ignore a partial journal tail */ }
+    }
+  }
+  return messages;
+}
+
+function delegateJobDetail(dataRoot, jobId) {
+  if (!/^wake_[0-9a-f-]{36}$/.test(jobId || '')) throw new Error('Invalid delegate job');
+  const job = readJobRecords(dataRoot).find(record => record.jobId === jobId && record._recordName === jobId);
+  if (!job) throw new Error('Delegate job is no longer available');
+  const messages = readMessageRecords(dataRoot);
+  const byId = new Map(messages.map(message => [message.id, message]));
+  return {
+    job,
+    inbound: job.inboundMessageId ? byId.get(job.inboundMessageId) || null : null,
+    outbound: (job.outbound || []).map(evidence => ({
+      evidence,
+      message: evidence.messageId ? byId.get(evidence.messageId) || null : null
+    }))
+  };
+}
+
+function formatClock(input) {
+  if (!input || Number.isNaN(Date.parse(input))) return 'unknown';
+  return new Date(input).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+}
+
+function delegateJobReportLines(detail) {
+  const { job, inbound, outbound } = detail;
+  const start = Date.parse(job.startedAt || job.requestedAt);
+  const end = Date.parse(job.completedAt || job.reportedAt || new Date().toISOString());
+  const duration = Number.isFinite(start) && Number.isFinite(end)
+    ? `${Math.max(0, Math.round((end - start) / 1000))}s` : 'unknown';
+  const lines = [
+    `${job.owner} ← ${job.from || 'unknown'}  ${String(job.status || 'unknown').toUpperCase()}`,
+    `Started: ${formatClock(job.startedAt || job.requestedAt)}  Duration: ${duration}`,
+    '', 'INCOMING REQUEST',
+    inbound?.content || '(The originating relay message is no longer retained.)',
+    '', 'RELAY-OBSERVED RESULT'
+  ];
+  if (!outbound.length) lines.push('No outbound reply was attributed to this delegate job.');
+  for (const { evidence, message } of outbound) {
+    lines.push(`Reply to ${evidence.to}: ${message?.content || '(message text no longer retained)'}`);
+    lines.push(`Delivery: ${evidence.delivered ? 'Delivered live' : 'Queued'} at ${formatClock(evidence.at || message?.timestamp)}`);
+  }
+  lines.push('', 'DELEGATE REPORT', job.summary || '(No final delegate report was captured.)');
+  if (job.changes) lines.push('', 'CHANGES', job.changes);
+  lines.push('', 'VERIFICATION');
+  if (Array.isArray(job.verification) && job.verification.length) {
+    for (const item of job.verification) lines.push(`• ${item}`);
+  } else lines.push('(No verification was reported.)');
+  lines.push('', 'SANITIZED ACTIVITY TIMELINE');
+  if (!Array.isArray(job.activity) || !job.activity.length) lines.push('(No activity events were captured.)');
+  else for (const event of job.activity) lines.push(`${formatClock(event.at)}  ${ACTIVITY_LABELS[event.type] || 'Working'}`);
+  if (['failed', 'interrupted', 'exited_no_delegate'].includes(job.status)) {
+    lines.push('', 'FAILURE DIAGNOSTIC',
+      `Status: ${job.status}${job.exitCode === null || job.exitCode === undefined ? '' : `; exit code ${job.exitCode}`}`,
+      job.reason || 'No bounded failure reason was captured.');
+  }
+  return lines;
+}
+
+function scrollWindow(lines, offset, height) {
+  const safeLines = Array.isArray(lines) ? lines : [];
+  const safeHeight = Math.max(1, Number(height) || 1);
+  const maximum = Math.max(0, safeLines.length - safeHeight);
+  const start = Math.max(0, Math.min(maximum, Number(offset) || 0));
+  return {
+    lines: safeLines.slice(start, start + safeHeight),
+    offset: start,
+    maximum,
+    first: safeLines.length ? start + 1 : 0,
+    last: Math.min(safeLines.length, start + safeHeight),
+    total: safeLines.length
+  };
 }
 
 function selectableJobs(dataRoot, owner = 'all') {
@@ -245,6 +340,8 @@ function operatorRequest(dataRoot, type, details = {}, options = {}, responseTyp
 }
 
 module.exports = {
+  delegateJobDetail,
+  delegateJobReportLines,
   healthAssessment,
   operatorJobRequest,
   operatorMessageRequest,
@@ -255,8 +352,10 @@ module.exports = {
   previewJobCleanup,
   purgeJobCleanup,
   readJobRecords,
+  readMessageRecords,
   relayTopology,
   restartRelay,
+  scrollWindow,
   selectableJobs,
   topologyLines
 };

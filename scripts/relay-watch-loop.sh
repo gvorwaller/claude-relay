@@ -56,6 +56,10 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
       echo "new-message"
       exit 0
       ;;
+    timeout:*)
+      SINCE="${OUT#timeout:}"
+      FAILURES=0
+      ;;
     timeout)
       FAILURES=0
       ;;

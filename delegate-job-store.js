@@ -211,10 +211,12 @@ class DelegateJobStore {
   recordOutbound(jobId, { to, messageId, delivered }) {
     const job = this.jobs.get(jobId);
     if (!job) return null;
-    // Receipt facts are frozen once the job ends: a late send must never
-    // mutate a receipt that has already been reported, or the human was
-    // told something that is no longer true (re-check #2).
-    if (job.status !== 'spawned' && job.status !== 'running') {
+    // A relay send can finish just after the wake child exits: the message is
+    // already in the relay's durable journal while the process-exit callback
+    // marks the job completed. Keep accepting SERVER evidence until the owner
+    // has actually reported the receipt. `reported` remains immutable, so the
+    // human can never be told a fact which changes later.
+    if (job.status === 'reported') {
       this.logger.warn('job_outbound_after_terminal', { jobId, status: job.status, to });
       return null;
     }

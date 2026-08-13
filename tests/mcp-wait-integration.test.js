@@ -122,6 +122,65 @@ test('relay_wait catches durable and pushed messages through MCP and rejects ove
   assert.match(pushed.result.content[0].text, /CC2: pushed/);
 });
 
+test('foreground relay_wait claims one message and suppresses duplicate watcher and exec wakes', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-mcp-claim-'));
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const marker = path.join(root, 'exec-wake-fired');
+  const notifyConfig = path.join(root, 'notify.json');
+  fs.writeFileSync(notifyConfig, JSON.stringify({
+    CLAIMED: [{ type: 'exec', command: `printf fired > "${marker}"` }]
+  }));
+  const env = {
+    ...process.env,
+    RELAY_MESSAGE_DIR: path.join(root, 'messages'),
+    RELAY_LOG_DIR: path.join(root, 'logs'),
+    RELAY_NOTIFY_CONFIG: notifyConfig
+  };
+  const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js'), String(port)], {
+    env, stdio: 'ignore'
+  });
+  t.after(() => server.kill('SIGTERM'));
+
+  let peer;
+  for (let attempt = 0; attempt < 100 && !peer; attempt += 1) {
+    try { peer = await connect(port, 'SENDER'); } catch { await new Promise(resolve => setTimeout(resolve, 25)); }
+  }
+  assert.ok(peer);
+  t.after(() => peer.close());
+  const watcher = await connect(port, 'CLAIMED-watch-test');
+  t.after(() => watcher.close());
+  const watcherReady = wsMessage(watcher, msg => msg.type === 'watching');
+  watcher.send(JSON.stringify({ type: 'watch', for: 'CLAIMED' }));
+  await watcherReady;
+
+  const joined = wsMessage(peer, msg => msg.type === 'peer_joined' && msg.clientId === 'CLAIMED');
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    '--client-id=CLAIMED', `--relay-url=ws://127.0.0.1:${port}`], {
+    env: { ...env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  const next = lines(mcp.stdout);
+  const send = value => mcp.stdin.write(`${JSON.stringify(value)}\n`);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await next(msg => msg.id === 1);
+  await joined;
+
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'relay_wait', arguments: { from: 'SENDER', timeoutSeconds: 2 }
+  }});
+  // The history response proves the server accepted the attention claim and
+  // the MCP bridge moved into its waiting state before the message is sent.
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const claimed = wsMessage(watcher, msg => msg.type === 'message_claimed');
+  peer.send(JSON.stringify({ type: 'message', to: 'CLAIMED', content: 'only once' }));
+  const response = await next(msg => msg.id === 2);
+  assert.match(response.result.content[0].text, /SENDER: only once/);
+  assert.equal((await claimed).for, 'CLAIMED');
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(fs.existsSync(marker), false, 'exec wake was suppressed');
+});
+
 test('relay-coordinate skill defines timeout loop and exact stop token', () => {
   const text = fs.readFileSync(path.join(__dirname, '..', 'skills', 'relay-coordinate', 'SKILL.md'), 'utf8');
   assert.match(text, /RELAY_DONE/);

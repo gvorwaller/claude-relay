@@ -86,7 +86,7 @@ class NotifyHooks {
     }
   }
 
-  fire({ to, from, messageId, delivered, deliveredToDelegate }) {
+  fire({ to, from, messageId, delivered, deliveredToDelegate, attentionClaimedTargets }) {
     try {
       const config = this.loadConfig();
       if (!config) return;
@@ -102,6 +102,12 @@ class NotifyHooks {
         if (config['*']) jobs.push({ key: '*', target: to });
       }
       for (const job of jobs) {
+        if (attentionClaimedTargets && attentionClaimedTargets.has(job.target)) {
+          this.logger.info('notify_hooks_skipped_attention_claimed', {
+            to: job.target, from, messageId
+          });
+          continue;
+        }
         const entries = Array.isArray(config[job.key]) ? config[job.key] : [];
         entries.forEach((entry, index) =>
           this.fireEntry(entry, index, job, { from, messageId, delivered, deliveredToDelegate }));

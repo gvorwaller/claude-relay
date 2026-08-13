@@ -17,6 +17,7 @@ const timeoutSeconds = Math.max(1, Math.min(Number(value('--timeout', '240')) ||
 // immediately at subscribe time if mail for the target already arrived after
 // this point — covers the deaf gap between watcher re-arms.
 const since = value('--since');
+let advancedCursor = since || '';
 
 if (!target) {
   console.error('Usage: relay-watch.js --for CLIENT_ID [--timeout 240] [--since ISO_OR_MSG_ID] [--relay-url ws://localhost:9999]');
@@ -36,7 +37,7 @@ function finish(output, code) {
   process.exitCode = code;
 }
 
-const timer = setTimeout(() => finish('timeout', 0), timeoutSeconds * 1000);
+const timer = setTimeout(() => finish(advancedCursor ? `timeout:${advancedCursor}` : 'timeout', 0), timeoutSeconds * 1000);
 
 ws.on('open', () => ws.send(JSON.stringify({
   type: 'register',
@@ -52,6 +53,11 @@ ws.on('message', data => {
     ws.send(JSON.stringify(watchRequest));
   } else if (message.type === 'new_message' && message.for === target) {
     finish('new-message', 0);
+  } else if (message.type === 'message_claimed' && message.for === target) {
+    // Foreground relay_wait already accepted this message. Stay asleep, but
+    // carry the durable cursor through the next watcher re-arm so backfill
+    // cannot report it again.
+    advancedCursor = message.messageId || message.at || advancedCursor;
   } else if (message.type === 'error') {
     finish(`error: ${message.message}`, 2);
   }
