@@ -167,6 +167,13 @@ function ownerChoices(dataRoot) {
   return [...new Set(readJobRecords(dataRoot).map(job => job.owner).filter(Boolean))].sort();
 }
 
+function activeJobChoices(dataRoot) {
+  return readJobRecords(dataRoot)
+    .filter(job => ['spawned', 'running'].includes(job.status))
+    .filter(job => /^wake_[0-9a-f-]{36}$/.test(job.jobId || '') && job.jobId === job._recordName)
+    .sort((a, b) => String(a.requestedAt).localeCompare(String(b.requestedAt)));
+}
+
 function messageOwnerChoices(dataRoot) {
   const identities = new Set();
   const dir = path.join(dataRoot, 'messages');
@@ -304,6 +311,14 @@ function operatorOwnerRepair(dataRoot, clientId, options = {}) {
   }, options, ['owner_rotated']);
 }
 
+function operatorTerminateDelegate(dataRoot, jobId, options = {}) {
+  if (!/^wake_[0-9a-f-]{36}$/.test(jobId || '')) {
+    return Promise.reject(new Error('Choose one exact active delegate job.'));
+  }
+  return operatorRequest(dataRoot, 'operator_terminate_delegate', { jobId }, options,
+    ['delegate_termination_requested']);
+}
+
 function pendingOwnerLabels(dataRoot) {
   const status = readRuntimeStatus(path.join(dataRoot, 'runtime-status.json'));
   return Array.isArray(status?.metrics?.ownersPendingLabels)
@@ -340,12 +355,14 @@ function operatorRequest(dataRoot, type, details = {}, options = {}, responseTyp
 }
 
 module.exports = {
+  activeJobChoices,
   delegateJobDetail,
   delegateJobReportLines,
   healthAssessment,
   operatorJobRequest,
   operatorMessageRequest,
   operatorOwnerRepair,
+  operatorTerminateDelegate,
   pendingOwnerLabels,
   messageOwnerChoices,
   ownerChoices,

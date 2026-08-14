@@ -6,9 +6,9 @@ const fs = require('fs');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 const {
-  delegateJobDetail, delegateJobReportLines, healthAssessment,
+  activeJobChoices, delegateJobDetail, delegateJobReportLines, healthAssessment,
   messageOwnerChoices, operatorJobRequest, operatorMessageRequest,
-  operatorOwnerRepair, ownerChoices, pendingOwnerLabels,
+  operatorOwnerRepair, operatorTerminateDelegate, ownerChoices, pendingOwnerLabels,
   readJobRecords, relayTopology, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
@@ -125,6 +125,7 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
     ['Health', 'See whether the relay and its safety checks are working.'],
     ['Peers and sessions', 'See connected identities and details for their live connections.'],
     ['Repair owner credentials', 'Install a credential for an identity still using local fallback.'],
+    ['Stop stuck delegate', 'Terminate one active delegated run and all of its child processes.'],
     ['Restart or repair', 'Restart only the relay service; no history is deleted.'],
     ['Clean completed activity', 'Remove old finished monitor entries; active work is always kept.'],
     ['Clean message history', 'Remove durable messages for one identity or for everyone.']
@@ -222,6 +223,18 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
           : 'This identity is offline. Its replacement credential will be ready for its next start.',
         'Messages, activity, and the identity name are not deleted.'
       ], ['Repair this identity', 'Cancel']));
+    } else if (state.dialog?.type === 'terminate_scope') {
+      lines.push(...renderDialog([
+        'Choose the active delegated run that appears stuck.',
+        'Only that run and its child processes will be stopped.'
+      ], state.dialog.options));
+    } else if (state.dialog?.type === 'terminate_confirm') {
+      const item = state.dialog.item;
+      lines.push(...renderDialog([
+        `Stop ${item.owner}'s delegated run?`,
+        `Started ${age(item.requestedAt)} ago${item.spawnPid ? ` • process ${item.spawnPid}` : ''}.`,
+        'Its activity record is retained as interrupted, and queued mail remains durable.'
+      ], ['Stop this delegate', 'Cancel']));
     } else if (state.dialog?.type === 'cleanup') {
       const preview = state.dialog.preview;
       const owners = Object.entries(preview.byOwner || preview.byIdentity || {})
@@ -319,6 +332,28 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
       state.dialog = null;
       return;
     }
+    if (state.dialog?.type === 'terminate_scope') {
+      const item = state.dialog.items[state.dialog.selected];
+      if (!item) { state.dialog = null; return; }
+      state.dialog = {
+        type: 'terminate_confirm', item, selected: 1,
+        options: ['Stop this delegate', 'Cancel']
+      };
+      return;
+    }
+    if (state.dialog?.type === 'terminate_confirm') {
+      const item = state.dialog.item;
+      if (state.dialog.selected === 0) {
+        try {
+          await operatorTerminateDelegate(dataRoot, item.jobId);
+          state.notice = `Stopped ${item.owner}'s delegated run. Its record was retained as interrupted.`;
+        } catch (error) {
+          state.notice = `Could not stop delegate: ${error.message}`;
+        }
+      }
+      state.dialog = null;
+      return;
+    }
     if (state.dialog?.type === 'cleanup') {
       if (state.dialog.selected === 0) {
         const preview = state.dialog.preview;
@@ -370,9 +405,21 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
         };
       }
     }
-    if (state.selected === 4) state.dialog = { type: 'restart', selected: 1, options: ['Restart relay now', 'Cancel'] };
-    if (state.selected === 5 || state.selected === 6) {
-      const kind = state.selected === 5 ? 'jobs' : 'messages';
+    if (state.selected === 4) {
+      const items = activeJobChoices(dataRoot);
+      if (!items.length) {
+        state.notice = 'No delegated runs are currently active.';
+      } else {
+        const labels = items.map(item => `${item.owner} • ${age(item.requestedAt)} • ${item.status}${item.spawnPid ? ` • pid ${item.spawnPid}` : ''}`);
+        state.dialog = {
+          type: 'terminate_scope', items: [...items, null], selected: labels.length,
+          options: [...labels, 'Cancel']
+        };
+      }
+    }
+    if (state.selected === 5) state.dialog = { type: 'restart', selected: 1, options: ['Restart relay now', 'Cancel'] };
+    if (state.selected === 6 || state.selected === 7) {
+      const kind = state.selected === 6 ? 'jobs' : 'messages';
       const owners = kind === 'jobs' ? ownerChoices(dataRoot) : messageOwnerChoices(dataRoot);
       const optionLabels = [...owners.map(name => `${name} only`), 'All identities', 'Cancel'];
       state.dialog = { type: 'scope', kind, selected: optionLabels.length - 1, options: optionLabels, values: [...owners, 'all', null] };

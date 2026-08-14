@@ -58,7 +58,9 @@ PY
 IS_CODEX=0
 PARENT_ARGS=""
 FRESH_DELEGATE=0
+PEER_LIVE=0
 if [[ "$PEER_PID" != "0" ]] && kill -0 "$PEER_PID" 2>/dev/null; then
+  PEER_LIVE=1
   PARENT_PID="$(ps -o ppid= -p "$PEER_PID" 2>/dev/null | tr -d ' ')"
   PARENT_ARGS="$(ps -o command= -p "${PARENT_PID:-0}" 2>/dev/null)"
 fi
@@ -70,13 +72,14 @@ if [[ "$IS_CODEX" == "0" ]]; then
   exit 64
 fi
 
-# Codex Desktop's app-server owns the live conversation and rejects a second
-# `codex exec resume` process for that same session. In that case launch a
-# fresh headless delegate in the registered working directory. Its job-scoped
-# relay credential still makes it speak as this peer, and it never takes over
-# the foreground socket. CLI sessions that are not app-server-owned continue
-# to use exact-session resume below.
-if [[ "$PARENT_ARGS" == *" app-server"* || "$PARENT_ARGS" == *" app-server "* ]]; then
+# Every live Codex conversation has an active thread-store writer. That is true
+# for both Desktop app-server sessions and interactive CLI sessions; attempting
+# `codex exec resume` against either one fails immediately with an active-writer
+# conflict. Launch a fresh headless delegate in the registered working
+# directory whenever the peer is live. Its job-scoped relay credential still
+# makes it speak as this peer, and it never takes over the foreground session.
+# Exact-session resume remains useful only after the registered peer is offline.
+if [[ "$IS_CODEX" == "1" && "$PEER_LIVE" == "1" ]]; then
   FRESH_DELEGATE=1
 fi
 
@@ -172,7 +175,7 @@ fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   if [[ "$FRESH_DELEGATE" == "1" ]]; then
-    echo "$FOR -> fresh codex delegate in $PEER_CWD (foreground app-server session stays attached)"
+    echo "$FOR -> fresh codex delegate in $PEER_CWD (live foreground session stays attached)"
   else
     echo "$FOR -> codex session $SESSION_ID"
   fi

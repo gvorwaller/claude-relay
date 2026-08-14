@@ -18,7 +18,8 @@ function makeHooks(t, config, options = {}) {
       fired.push({ entry, context });
     },
     now: options.now,
-    logger: options.logger
+    logger: options.logger,
+    jobStore: options.jobStore
   });
   return { hooks, fired, configPath };
 }
@@ -117,6 +118,49 @@ test('delegate-suppressed exec gets a trailing-edge wake too', async t => {
   assert.equal(fired.length, 0, 'no immediate wake while a delegate is live');
   await new Promise(resolve => setTimeout(resolve, 350));
   assert.equal(fired.length, 1, 'wake fires after the delegate window in case it exited unread');
+});
+
+test('an active owner stays single-flight and gets one successor wake', async t => {
+  let busy = true;
+  const jobStore = { activeForOwner: owner => busy && owner === 'CODEX3' ? [{}] : [] };
+  const { hooks, fired } = makeHooks(t, {
+    CODEX3: [{ type: 'exec', command: 'poke', debounceSeconds: 0.05 }]
+  }, { jobStore });
+
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'q1', delivered: true });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'q2', delivered: true });
+  assert.equal(fired.length, 0, 'busy owner never starts an overlapping delegate');
+  setTimeout(() => { busy = false; }, 90);
+  await new Promise(resolve => setTimeout(resolve, 260));
+  assert.equal(fired.length, 1, 'queued mail coalesces into one successor wake');
+  assert.equal(fired[0].context.messageId, 'q2', 'successor represents the newest durable message');
+});
+
+test('delegate timeout kills the entire detached process group', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notify-timeout-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const childScript = path.join(root, 'child.js');
+  const pidFile = path.join(root, 'child.pid');
+  fs.writeFileSync(childScript,
+    `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+  const configPath = path.join(root, 'notify.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    CODEX3: [{ type: 'exec', command: `${JSON.stringify(process.execPath)} ${JSON.stringify(childScript)}` }]
+  }));
+  const warnings = [];
+  const hooks = new NotifyHooks({
+    configPath, execTimeoutMs: 80, execKillGraceMs: 40,
+    logger: { info() {}, warn: (event, data) => warnings.push({ event, data }), error() {} }
+  });
+  hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'timeout-1', delivered: false });
+  for (let i = 0; i < 20 && !fs.existsSync(pidFile); i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(fs.existsSync(pidFile), true, 'delegate child started');
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
+  assert.ok(warnings.some(item => item.event === 'notify_hook_delegate_timeout'));
 });
 
 test('a failed runner does not start a debounce window that eats the retry', t => {

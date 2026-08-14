@@ -918,6 +918,66 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'operator_terminate_delegate': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const jobId = typeof msg.jobId === 'string' ? msg.jobId : '';
+          if (!/^wake_[0-9a-f-]{36}$/.test(jobId)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Choose one exact active delegate job' }));
+            return;
+          }
+          const job = jobStore.get(jobId);
+          if (!job || !['spawned', 'running'].includes(job.status)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'That delegate is no longer active' }));
+            return;
+          }
+          if (job.serverInstance !== jobStore.instanceId || !Number.isInteger(job.spawnPid) || job.spawnPid <= 1) {
+            ws.send(JSON.stringify({ type: 'error', message: 'That delegate cannot be terminated safely by this relay instance' }));
+            return;
+          }
+          let signaled = false;
+          try {
+            // Wake commands are detached process-group leaders. Signal the
+            // whole group so codex and its MCP bridge cannot survive as
+            // invisible orphans after the wrapper exits.
+            process.kill(-job.spawnPid, 'SIGTERM');
+            signaled = true;
+          } catch (error) {
+            if (error.code !== 'ESRCH') {
+              ws.send(JSON.stringify({ type: 'error', message: `Could not terminate delegate: ${error.message}` }));
+              return;
+            }
+          }
+          for (const peer of clients.values()) {
+            if (peer.delegateJob?.jobId === jobId) {
+              try { peer.terminate(); } catch {}
+            }
+          }
+          capabilities.consumeResultSecret(jobId);
+          jobStore.transition(jobId, 'interrupted', {
+            reason: signaled
+              ? 'Terminated by the local operator from Relay Control Center.'
+              : 'The local operator found no live delegate process to terminate.'
+          });
+          if (signaled) {
+            const pid = job.spawnPid;
+            const timer = setTimeout(() => {
+              try { process.kill(-pid, 'SIGKILL'); } catch {}
+            }, 5000);
+            timer.unref();
+          }
+          refreshRuntimeStatus();
+          logger.warn('delegate_termination_requested', {
+            jobId, owner: job.owner, pid: job.spawnPid, signaled
+          });
+          ws.send(JSON.stringify({
+            type: 'delegate_termination_requested', jobId, owner: job.owner, signaled
+          }));
+          break;
+        }
+
         case 'operator_purge_delegate_jobs': {
           if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
             ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));

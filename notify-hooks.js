@@ -7,7 +7,8 @@ const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 const { notifyDelegate } = require('./delegate-notifier');
 
-const EXEC_TIMEOUT_MS = 30000;
+const EXEC_TIMEOUT_MS = 60 * 60 * 1000;
+const EXEC_KILL_GRACE_MS = 5000;
 const NOT_APPLICABLE_EXIT = 64;
 // A nonzero exit sooner than this means the command never really ran
 // (missing binary -> shell exits 127, bad flags, etc).
@@ -58,6 +59,10 @@ class NotifyHooks {
     this.retryCounts = new Map();
     this.maxRetries = options.maxRetries === undefined ? 3 : options.maxRetries;
     this.retryDelayMs = options.retryDelayMs === undefined ? 2000 : options.retryDelayMs;
+    this.execTimeoutMs = options.execTimeoutMs === undefined
+      ? (this.capabilities?.jobSessionMaxMs || EXEC_TIMEOUT_MS)
+      : options.execTimeoutMs;
+    this.execKillGraceMs = options.execKillGraceMs || EXEC_KILL_GRACE_MS;
     this.configCache = { mtimeMs: -1, entries: null };
   }
 
@@ -134,6 +139,17 @@ class NotifyHooks {
       // "Wake everyone" has no owner to attribute a job to; concrete targets
       // already get their own entries (re-check #11).
       this.logger.info('notify_exec_skipped_broadcast', { from: context.from });
+      return;
+    }
+    // Enforce one active delegate per named identity. The message is already
+    // durable, so a busy owner needs only one trailing wake after its current
+    // job becomes terminal. Re-checking here on every timer prevents a long
+    // review from accumulating overlapping delegates.
+    if (entry.type === 'exec' && this.jobStore?.activeForOwner?.(job.target)?.length) {
+      this.logger.info('notify_hook_deferred_owner_busy', {
+        target: job.target, from: context.from, messageId: context.messageId
+      });
+      this.scheduleTrailing(key, entry, index, job, context, debounceMs || 5000);
       return;
     }
     if (entry.type === 'exec' && deliveredToDelegate) {
@@ -279,7 +295,6 @@ class NotifyHooks {
         shell: true,
         detached: true,
         stdio: 'ignore',
-        timeout: EXEC_TIMEOUT_MS,
         env: {
           ...process.env,
           RELAY_FOR: target,
@@ -309,9 +324,28 @@ class NotifyHooks {
       }
       // 'error' and 'exit' can both fire; the outcome must be reported once.
       let settled = false;
+      let timeoutTimer = null;
+      let forceKillTimer = null;
+      const killProcessGroup = signal => {
+        if (!child.pid) return false;
+        try {
+          // detached:true makes the shell the process-group leader. Killing
+          // the group reaps wake-codex, its runner, codex, and the MCP bridge
+          // together instead of orphaning grandchildren.
+          process.kill(-child.pid, signal);
+          return true;
+        } catch (error) {
+          if (error.code !== 'ESRCH') this.logger.warn('notify_hook_group_kill_failed', {
+            target, jobId: jobRecord?.jobId || null, pid: child.pid, signal, error: error.message
+          });
+          return false;
+        }
+      };
       const settle = outcome => {
         if (settled) return;
         settled = true;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (forceKillTimer && !outcome.keepForceKill) clearTimeout(forceKillTimer);
         // Exit 64: the wake script determined there is nothing to wake here
         // (a Claude Code peer wakes via its own watcher; a broadcast has no
         // single owner). Nothing ran, so no receipt is owed — discard the
@@ -331,10 +365,10 @@ class NotifyHooks {
           const exitCode = outcome.code === undefined ? null : outcome.code;
           const current = this.jobStore.get(jobRecord.jobId);
           const ranAsDelegate = current && current.status === 'running';
-          let terminal;
-          if (outcome.error || (exitCode !== null && exitCode !== 0)) {
+          let terminal = outcome.terminal || null;
+          if (!terminal && (outcome.error || (exitCode !== null && exitCode !== 0))) {
             terminal = 'failed';
-          } else {
+          } else if (!terminal) {
             terminal = ranAsDelegate ? 'completed' : 'exited_no_delegate';
           }
           this.jobStore.transition(jobRecord.jobId, terminal, {
@@ -343,18 +377,23 @@ class NotifyHooks {
           });
           this.notifier({ owner: target, state: terminal === 'completed' ? 'completed' : 'failed' });
         }
-        if (!outcome.ok) {
+        if (!outcome.ok || outcome.terminal === 'interrupted') {
           // A wake that never really ran must leave nothing usable behind:
           // its capability is revoked and its handoff file removed, so a
           // retry mints a fresh one instead of leaving several live tokens
           // (and stale pid bindings) outstanding.
           if (jobKey) this.capabilities.revokeJobByKey(jobKey);
           if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+          if (jobRecord && this.capabilities) this.capabilities.consumeResultSecret(jobRecord.jobId);
         }
         onOutcome(outcome);
       };
       child.on('error', err => settle({ ok: false, error: err.message }));
-      child.on('exit', code => {
+      child.on('exit', (code, signal) => {
+        if (signal) {
+          settle({ ok: true, terminal: 'interrupted', error: `Delegate process ended by ${signal}` });
+          return;
+        }
         // A wake command legitimately runs long (a resumed agent turn). Only
         // an early nonzero exit means it never really started — that is the
         // shell-127 case a synchronous check cannot see.
@@ -362,6 +401,22 @@ class NotifyHooks {
           ? { ok: false, code }
           : { ok: true, code });
       });
+      timeoutTimer = setTimeout(() => {
+        this.logger.warn('notify_hook_delegate_timeout', {
+          target, jobId: jobRecord?.jobId || null, pid: child.pid || null,
+          timeoutMs: this.execTimeoutMs
+        });
+        killProcessGroup('SIGTERM');
+        forceKillTimer = setTimeout(() => killProcessGroup('SIGKILL'), this.execKillGraceMs);
+        if (typeof forceKillTimer.unref === 'function') forceKillTimer.unref();
+        settle({
+          ok: true,
+          terminal: 'interrupted',
+          error: `Delegate exceeded the ${Math.round(this.execTimeoutMs / 1000)}s execution limit`,
+          keepForceKill: true
+        });
+      }, this.execTimeoutMs);
+      if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
       child.unref();
     }
   }

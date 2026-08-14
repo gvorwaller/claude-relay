@@ -99,6 +99,19 @@ test('pending() returns only this owner\'s terminal-but-unreported jobs', t => {
   assert.deepEqual(store.pending('CODEX3'), []);
 });
 
+test('activeForOwner is an exact-owner single-flight view', t => {
+  const { store } = makeStore(t);
+  const first = store.create({ owner: 'CODEX1', inboundMessageId: 'a1', from: 'GROK' });
+  const other = store.create({ owner: 'CODEX2', inboundMessageId: 'a2', from: 'CC2' });
+  store.transition(first.jobId, 'running');
+  store.transition(other.jobId, 'running');
+
+  assert.deepEqual(store.activeForOwner('CODEX1').map(job => job.jobId), [first.jobId]);
+  assert.deepEqual(store.activeForOwner('CODEX2').map(job => job.jobId), [other.jobId]);
+  store.transition(first.jobId, 'completed');
+  assert.deepEqual(store.activeForOwner('CODEX1'), [], 'terminal work releases the owner gate');
+});
+
 test('a job whose process died is recovered as interrupted, not lost', async t => {
   const { store, dir } = makeStore(t);
   const job = store.create({ owner: 'CODEX3', inboundMessageId: 'm5', from: 'CC6' });

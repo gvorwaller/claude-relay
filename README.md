@@ -186,7 +186,11 @@ reads with the label's visibility and its sends arrive from the label, but it
 never owns the label — so the interactive session is never displaced, and the
 delegate's exit changes nothing. Delegate registration is only honored from the
 relay host itself, and a live delegate suppresses further exec wake hooks for
-its label (it *is* the woken instance). The flag reaches Codex bridges via a
+its label (it *is* the woken instance). The job store also enforces one active
+(`spawned` or `running`) delegate per owner identity. Mail that arrives while
+that owner is busy is already durable, so repeated notifications are coalesced
+into one trailing wake after the active job becomes terminal instead of
+starting overlapping delegate sessions. The flag reaches Codex bridges via a
 `codex exec -c mcp_servers.claude-relay.env.RELAY_DELEGATE_FOR=<label>` config
 override (Codex gives MCP servers only curated config env — plain shell
 exports never arrive); as a fallback, a bridge that detects a `codex exec`
@@ -208,7 +212,10 @@ to copy the report.
 In an interactive terminal it is also the operator control center. Every
 available action is listed with its effect: activity, detailed health, a
 live peers/session-details view, a confirmed relay restart, and scoped,
-previewed cleanup of completed activity.
+previewed cleanup of completed activity. **Stop stuck delegate** lists only
+currently active jobs; after confirmation it interrupts the selected job and
+terminates its entire detached process group while retaining the audit record
+and all queued relay mail.
 It can also atomically clean durable message history for one identity or all
 identities after a count preview and a second confirmation. Arrow keys plus
 Return are sufficient; CLI and MCP operation names remain
@@ -226,6 +233,13 @@ screen does show the durable incoming/outgoing relay message bodies relevant
 to the selected run, plus the delegate's constrained final report. macOS also
 shows content-minimized start and completion/failure notifications; set
 `RELAY_DISABLE_NOTIFICATIONS=1` to disable those notices.
+
+Detached delegate commands have a one-hour execution ceiling (or the configured
+job-session maximum). On timeout the relay sends `SIGTERM` to the detached
+process group, follows with `SIGKILL` after a short grace period if necessary,
+and records the job as `interrupted`. Group termination covers the wake shell,
+runner, Codex process, and MCP bridge so a timed-out job cannot leave stale
+grandchildren behind.
 
 Completed jobs remain durable until the owning foreground Codex task visibly
 reports the server-generated receipt facts. `scripts/relay-receipts-hook.js`
@@ -392,6 +406,13 @@ to a banner). Per-target entries remain available for overrides:
 - `"onlyIfUndelivered": true` — fire only when the target socket was not live
   at store time. A live delegate for the target also suppresses exec entries
   (it *is* the woken instance; double-spawning would fight it).
+
+Exec hooks are additionally serialized by target identity using the durable
+delegate job store. If a job for the owner is already `spawned` or `running`,
+the hook schedules one trailing check rather than launching another process.
+That check keeps deferring while the owner is busy and launches one successor
+after the active job ends, allowing it to process all durable mail accumulated
+during the earlier run.
 
 Edits to `notify.json` are picked up without a restart. Hook failures are
 logged and never affect message handling. The config is deliberately not a

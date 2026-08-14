@@ -13,8 +13,8 @@ result in the same screen.
 - Arrow keys move through visible actions; Return selects one.
 - The activity view remains the default and continues to refresh.
 - A persistent action bar exposes **Activity**, **Health**, **Restart/repair**,
-  **Clean activity**, and **Clean messages**. No undocumented shortcuts are
-  required.
+  **Stop stuck delegate**, **Clean activity**, and **Clean messages**. No
+  undocumented shortcuts are required.
 - Selecting an action opens an explanation and preview before anything runs.
 - Destructive operations require a second, explicit confirmation. Escape always
   cancels.
@@ -31,6 +31,9 @@ result in the same screen.
 4. Add completed-activity cleanup with owner/all scope, exact preview counts,
    confirmation, and guaranteed preservation of spawned/running work.
 5. Keep `--once` as a non-interactive diagnostics mode.
+6. List canonical active delegate jobs and provide a confirmed operator stop
+   that terminates the selected detached process group while preserving its
+   audit record and durable relay mail.
 
 ## Phase 2: safe message cleanup
 
@@ -54,6 +57,8 @@ result in the same screen.
   not an interactive terminal.
 - Restart acts only on the exact `com.claude-relay` launchd label.
 - Cleanup never removes active delegate jobs.
+- Stopping a delegate is exact-job scoped, local-admin only, and records the
+  terminal state as interrupted; it does not delete queued messages.
 - Every cleanup is previewed, scoped, confirmed, and auditable.
 - Existing CLI and MCP operations remain automation interfaces, not things the
   human must remember.

@@ -6,7 +6,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  delegateJobDetail, delegateJobReportLines, operatorOwnerRepair,
+  activeJobChoices, delegateJobDetail, delegateJobReportLines, operatorOwnerRepair,
+  operatorTerminateDelegate,
   previewJobCleanup, purgeJobCleanup, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
@@ -93,6 +94,19 @@ test('topology view distinguishes peer identities from detailed live sessions', 
 test('credential repair requires one exact named identity', async () => {
   await assert.rejects(operatorOwnerRepair('/unused', 'all'), /one exact named identity/);
   await assert.rejects(operatorOwnerRepair('/unused', '../CC1'), /one exact named identity/);
+});
+
+test('stuck-delegate choices include only active canonical jobs', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-active-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeJob(root, 'wake_10000000-0000-4000-8000-000000000010', 'CODEX1', 'running');
+  writeJob(root, 'wake_10000000-0000-4000-8000-000000000011', 'CODEX1', 'completed');
+  const choices = activeJobChoices(root);
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].status, 'running');
+  await assert.rejects(operatorTerminateDelegate(root, '../bad'), /exact active delegate job/);
+  const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'relay-monitor.js'), 'utf8');
+  assert.match(source, /Stop stuck delegate/);
 });
 
 test('delegate detail joins durable messages and separates relay evidence from delegate prose', t => {

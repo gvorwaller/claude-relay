@@ -151,6 +151,47 @@ function releaseWake(outDir, base) {
   fs.writeFileSync(path.join(outDir, `${base}.release`), 'release');
 }
 
+test('local operator can terminate one active delegate process group', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-terminate-'));
+  const configPath = path.join(root, 'notify.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    '*': [{ type: 'exec', command: 'sleep 120' }]
+  }));
+  const port = startServer(t, root, { RELAY_NOTIFY_CONFIG: configPath });
+  const sender = await connectWithRetry(port, 'TERMINATE-SOURCE', { pid: process.pid });
+  t.after(() => sender.close());
+  sender.send(JSON.stringify({ type: 'message', to: 'CODEX1', content: 'start a wake' }));
+
+  let job;
+  for (let attempt = 0; attempt < 200 && !job; attempt += 1) {
+    try {
+      const name = fs.readdirSync(path.join(root, 'jobs')).find(file => file.endsWith('.json'));
+      if (name) {
+        const candidate = JSON.parse(fs.readFileSync(path.join(root, 'jobs', name), 'utf8'));
+        if (candidate.spawnPid) job = candidate;
+      }
+    } catch {}
+    if (!job) await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(job?.spawnPid, 'active wake job was created');
+
+  const operator = await open(port);
+  t.after(() => operator.close());
+  const response = nextMessage(operator, 'delegate_termination_requested');
+  operator.send(JSON.stringify({
+    type: 'operator_terminate_delegate',
+    adminSecret: fs.readFileSync(path.join(root, 'admin.secret'), 'utf8').trim(),
+    jobId: job.jobId
+  }));
+  const result = await response;
+  assert.equal(result.jobId, job.jobId);
+  assert.equal(result.owner, 'CODEX1');
+
+  const stopped = JSON.parse(fs.readFileSync(path.join(root, 'jobs', `${job.jobId}.json`), 'utf8'));
+  assert.equal(stopped.status, 'interrupted');
+  assert.match(stopped.reason, /local operator/);
+});
+
 
 
 test('a responsive holder is never evicted, even by a claimant quoting its pid', async t => {
@@ -211,6 +252,18 @@ test('delegate reads and speaks as its base label without ever owning it', async
   for (let attempt = 0; attempt < 100 && !fs.existsSync(path.join(outDir, 'CODEXD.token')); attempt += 1) {
     await new Promise(resolve => setTimeout(resolve, 25));
   }
+  // Single-flight deliberately refuses to start a second CODEXD wake while
+  // the first fake wake is still active. End it, wait for its job to become
+  // terminal, then the next message may mint the successor capability.
+  releaseWake(outDir, 'CODEXD');
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const records = fs.readdirSync(path.join(root, 'jobs'))
+      .filter(file => file.endsWith('.json'))
+      .map(file => JSON.parse(fs.readFileSync(path.join(root, 'jobs', file), 'utf8')));
+    if (records.length && records.every(job => !['spawned', 'running'].includes(job.status))) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  try { fs.unlinkSync(path.join(outDir, 'CODEXD.release')); } catch {}
   const jobToken = await mintJobToken(t, outDir, sender, 'CODEXD');
 
   // Delegate registers: derived visible ID, no contest with the base.

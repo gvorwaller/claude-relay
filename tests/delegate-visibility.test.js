@@ -45,14 +45,15 @@ test('delegate runner forwards bounded child stderr for operator diagnosis', () 
   assert.match(result.stderr, /resume refused/);
 });
 
-test('Desktop app-server wake path uses a fresh same-cwd delegate', () => {
+test('every live Codex wake uses a fresh same-cwd delegate', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'scripts', 'wake-codex.sh'), 'utf8'
   );
-  assert.match(source, /PARENT_ARGS.*app-server/);
-  assert.match(source, /FRESH_DELEGATE=1/);
+  assert.match(source, /PEER_LIVE=1/);
+  assert.match(source, /IS_CODEX.*PEER_LIVE.*FRESH_DELEGATE=1/s);
+  assert.doesNotMatch(source, /if \[\[ "\$PARENT_ARGS" == \*" app-server"/);
   assert.match(source, /codex exec --json.*-C "\$PEER_CWD"/s);
-  assert.match(source, /foreground app-server session stays attached/);
+  assert.match(source, /live foreground session stays attached/);
   assert.match(source, /--output-schema "\$RESULT_SCHEMA"/);
   const schema = JSON.parse(fs.readFileSync(
     path.join(__dirname, '..', 'scripts', 'delegate-result-schema.json'), 'utf8'

@@ -29,6 +29,7 @@ const TRANSITIONS = {
   reported: []
 };
 const TERMINAL_RUN_STATES = new Set(['completed', 'exited_no_delegate', 'failed', 'interrupted']);
+const ACTIVE_RUN_STATES = new Set(['spawned', 'running']);
 const ACTIVITY_TYPES = new Set([
   'analyzing', 'reading_message', 'reading_files', 'running_command',
   'using_tool', 'updating_files', 'sending_reply', 'preparing_response',
@@ -274,6 +275,13 @@ class DelegateJobStore {
       .sort((a, b) => String(a.completedAt).localeCompare(String(b.completedAt)));
   }
 
+  /** Active work for one owner, used as the per-identity single-flight gate. */
+  activeForOwner(owner) {
+    return Array.from(this.jobs.values())
+      .filter(job => job.owner === owner && ACTIVE_RUN_STATES.has(job.status))
+      .sort((a, b) => String(a.requestedAt).localeCompare(String(b.requestedAt)));
+  }
+
   markReported(jobIds, turnId) {
     const marked = [];
     for (const jobId of jobIds) {
@@ -433,4 +441,4 @@ class DelegateJobStore {
   }
 }
 
-module.exports = { DelegateJobStore, TRANSITIONS, TERMINAL_RUN_STATES };
+module.exports = { ACTIVE_RUN_STATES, DelegateJobStore, TRANSITIONS, TERMINAL_RUN_STATES };
