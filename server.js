@@ -11,13 +11,14 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { randomUUID, createHash } = require('crypto');
 const { execFileSync, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { MessageStore } = require('./message-store');
 const { OperationalLogger } = require('./operational-logger');
 const { NotifyHooks } = require('./notify-hooks');
-const { CapabilityStore } = require('./capabilities');
+const { CapabilityStore, isTransientOwnerLabel } = require('./capabilities');
 const { DelegateJobStore } = require('./delegate-job-store');
 const { RuntimeStatus } = require('./runtime-status');
 const { runRetention } = require('./retention');
@@ -181,6 +182,134 @@ function refreshRuntimeStatus(ancestryBindingReady) {
   };
   if (runtimeStatus.state) runtimeStatus.update(status);
   else runtimeStatus.initialize({ host: HOST, port: PORT, ...status });
+}
+
+function ownerLastActivity(label, createdAt) {
+  const timestamps = [createdAt];
+  for (const message of messageStore.readAll()) {
+    if (message.from === label || message.to === label) timestamps.push(message.timestamp);
+  }
+  for (const job of jobStore.jobs.values()) {
+    if (job.owner !== label) continue;
+    timestamps.push(job.reportedAt, job.completedAt, job.startedAt, job.requestedAt);
+  }
+  return timestamps
+    .filter(value => typeof value === 'string' && Number.isFinite(Date.parse(value)))
+    .sort((a, b) => Date.parse(b) - Date.parse(a))[0] || null;
+}
+
+function unusedOwnerCandidates() {
+  return capabilities.ownerRecords()
+    .filter(record => !isTransientOwnerLabel(record.label))
+    .filter(record => !(clients.get(record.label)?.readyState === 1))
+    .filter(record => jobStore.activeForOwner(record.label).length === 0)
+    .map(record => ({
+      identity: record.label,
+      acknowledged: record.acknowledged,
+      createdAt: record.createdAt,
+      host: record.host,
+      lastActivity: ownerLastActivity(record.label, record.createdAt)
+    }))
+    .sort((a, b) => a.identity.localeCompare(b.identity));
+}
+
+function normalizedHost(value) {
+  return String(value || '').split('.')[0].toLowerCase();
+}
+
+function verifiedLocalMcpPid(label) {
+  const live = clients.get(label);
+  const meta = clientMeta.get(label) || {};
+  const pid = Number(meta.pid);
+  if (!live || live.readyState !== 1 || !Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (!isLoopback(meta.remoteAddress)) return null;
+  if (normalizedHost(meta.host) !== normalizedHost(os.hostname())) return null;
+  try {
+    const command = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8', timeout: 2000
+    }).trim();
+    const expected = path.resolve(__dirname, 'mcp-server.js');
+    return command.split(/\s+/).some(part => path.resolve(part) === expected) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function ownerStopDetails(label) {
+  const live = clients.get(label);
+  if (!live || live.readyState !== 1) return { live: false, canStop: true, stopMode: null };
+  const meta = clientMeta.get(label) || {};
+  const localPid = verifiedLocalMcpPid(label);
+  if (meta.operatorShutdown === true) {
+    return { live: true, canStop: true, stopMode: 'cooperative', pid: Number(meta.pid) || null };
+  }
+  if (localPid) return { live: true, canStop: true, stopMode: 'verified-local-process', pid: localPid };
+  return { live: true, canStop: false, stopMode: null, pid: Number(meta.pid) || null };
+}
+
+function removableOwnerCandidates() {
+  return capabilities.ownerRecords()
+    .filter(record => !isTransientOwnerLabel(record.label))
+    .filter(record => jobStore.activeForOwner(record.label).length === 0)
+    .map(record => {
+      const stop = ownerStopDetails(record.label);
+      const meta = clientMeta.get(record.label) || {};
+      return {
+        identity: record.label,
+        acknowledged: record.acknowledged,
+        createdAt: record.createdAt,
+        host: record.host || meta.host || null,
+        lastActivity: ownerLastActivity(record.label, record.createdAt),
+        live: stop.live,
+        canStop: stop.canStop,
+        stopMode: stop.stopMode,
+        pid: stop.pid || null,
+        cwd: meta.cwd || null,
+        source: meta.source || null
+      };
+    })
+    .filter(record => record.canStop)
+    .sort((a, b) => a.identity.localeCompare(b.identity));
+}
+
+function ownerRemovalRefusal(label, options = {}) {
+  if (!CLIENT_ID_PATTERN.test(label) || label === 'all' || isTransientOwnerLabel(label)) {
+    return 'Choose one exact named identity';
+  }
+  if (!capabilities.hasOwner(label)) return 'That identity is no longer enrolled';
+  if (clients.get(label)?.readyState === 1) {
+    if (!options.disconnectLive) return 'That identity has a live relay session';
+    if (!ownerStopDetails(label).canStop) {
+      return 'That live relay bridge cannot be stopped safely by this relay instance';
+    }
+  }
+  if (jobStore.activeForOwner(label).length) return 'That identity has active delegated work';
+  return null;
+}
+
+function stopOwnerConnection(label) {
+  const live = clients.get(label);
+  if (!live || live.readyState !== 1) return { requested: false, pid: null };
+  const stop = ownerStopDetails(label);
+  if (!stop.canStop) throw new Error('Live relay bridge is not safe to stop');
+  try {
+    live.send(JSON.stringify({ type: 'operator_remove_identity', clientId: label }));
+  } catch { /* forced close below is authoritative */ }
+  const timer = setTimeout(() => {
+    // Older local bridges do not understand the cooperative shutdown frame.
+    // Kill only a still-running pid whose command is re-verified as this
+    // checkout's exact mcp-server.js, never the parent agent process.
+    if (stop.stopMode === 'verified-local-process' && verifiedLocalMcpPid(label) === stop.pid) {
+      try { process.kill(stop.pid, 'SIGTERM'); } catch (error) {
+        if (error.code !== 'ESRCH') {
+          logger.warn('owner_bridge_stop_failed', { label, pid: stop.pid, error: error.message });
+        }
+      }
+    }
+    try { live.terminate(); } catch { /* already closed */ }
+  }, 100);
+  if (typeof timer.unref === 'function') timer.unref();
+  return { requested: true, pid: stop.pid || null, stopMode: stop.stopMode };
 }
 
 // Capacity is a control-plane fault, not merely a log line. Refresh the
@@ -904,6 +1033,91 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'operator_list_unused_owners': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'unused_owners', owners: unusedOwnerCandidates() }));
+          break;
+        }
+
+        case 'operator_list_removable_owners': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'removable_owners', owners: removableOwnerCandidates() }));
+          break;
+        }
+
+        case 'operator_preview_owner_removal': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const label = typeof msg.clientId === 'string' ? msg.clientId : '';
+          const disconnectLive = msg.disconnectLive === true;
+          const refusal = ownerRemovalRefusal(label, { disconnectLive });
+          if (refusal) {
+            ws.send(JSON.stringify({ type: 'error', message: refusal }));
+            return;
+          }
+          const preview = capabilities.previewOwnerRemoval(label);
+          ws.send(JSON.stringify({
+            type: 'owner_removal_preview',
+            identity: label,
+            acknowledged: preview.acknowledged,
+            createdAt: preview.createdAt,
+            host: preview.host,
+            lastActivity: ownerLastActivity(label, preview.createdAt),
+            ...ownerStopDetails(label),
+            cwd: (clientMeta.get(label) || {}).cwd || null,
+            source: (clientMeta.get(label) || {}).source || null,
+            confirmation: preview.confirmation
+          }));
+          break;
+        }
+
+        case 'operator_remove_owner': {
+          if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
+            return;
+          }
+          const label = typeof msg.clientId === 'string' ? msg.clientId : '';
+          const disconnectLive = msg.disconnectLive === true;
+          const refusal = ownerRemovalRefusal(label, { disconnectLive });
+          if (refusal) {
+            ws.send(JSON.stringify({ type: 'error', message: refusal }));
+            return;
+          }
+          const wasLive = clients.get(label)?.readyState === 1;
+          const result = ownerAdmin.remove(label, msg.confirmation);
+          if (!result.confirmed) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Identity preview changed; review it again before confirming'
+            }));
+            return;
+          }
+          const stopped = wasLive ? stopOwnerConnection(label) : { requested: false, pid: null };
+          refreshRuntimeStatus();
+          ws.send(JSON.stringify({
+            type: 'owner_removed', identity: label,
+            liveConnectionStopped: stopped.requested,
+            bridgePid: stopped.pid
+          }));
+          break;
+        }
+
+        case 'operator_remove_identity_ack': {
+          logger.info('owner_bridge_stop_acknowledged', {
+            clientId,
+            requestedClientId: msg.clientId || null
+          });
+          break;
+        }
+
         case 'operator_preview_delegate_jobs': {
           if (!isLoopback(req.socket.remoteAddress) || !verifySecret(adminSecret, msg.adminSecret)) {
             ws.send(JSON.stringify({ type: 'error', message: 'Operator action requires local admin authority' }));
@@ -1123,6 +1337,27 @@ wss.on('connection', (ws, req) => {
           } else {
             logger.warn('enrollment_ack_invalid', { clientId });
           }
+          break;
+        }
+
+        case 'discard_enrollment': {
+          // Disposable live-test clients may remove only their own pending
+          // enrollment and must prove possession of the secret minted for
+          // that exact connection. Confirmed identities are never deletable
+          // through this path.
+          if (ws.delegateJob || !clientId || msg.clientId !== clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Enrollment cleanup must match this identity' }));
+            return;
+          }
+          if (!capabilities.discardUnacknowledged(clientId, msg.ownerSecret)) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Enrollment cleanup requires the unacknowledged identity owner secret'
+            }));
+            return;
+          }
+          refreshRuntimeStatus();
+          ws.send(JSON.stringify({ type: 'enrollment_discarded', clientId }));
           break;
         }
 

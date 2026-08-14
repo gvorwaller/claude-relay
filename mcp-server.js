@@ -1398,7 +1398,10 @@ function registerWithServer(idOverride) {
       cwd: process.cwd(),
       host: HOST,
       source: CLIENT_ID_SOURCE,
-      relayUrl: RELAY_URL
+      relayUrl: RELAY_URL,
+      // A local operator can ask this exact bridge to release its identity
+      // and exit without terminating the parent Claude or Codex process.
+      operatorShutdown: true
     }
   };
   if (DELEGATE_FOR) registration.delegate = true;
@@ -1442,6 +1445,29 @@ function connectToRelay() {
       const msg = JSON.parse(data.toString());
 
       switch (msg.type) {
+        case 'operator_remove_identity': {
+          shuttingDown = true;
+          relayWaiter.finish('cancel');
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
+          updateRegistry('release');
+          try { fs.unlinkSync(ownerSecretPath(CLIENT_ID)); } catch (error) {
+            if (error.code !== 'ENOENT') {
+              console.error(`[Claude Relay MCP] Could not remove owner credential for ${CLIENT_ID}: ${error.message}`);
+            }
+          }
+          try {
+            ws.send(JSON.stringify({ type: 'operator_remove_identity_ack', clientId: CLIENT_ID }));
+          } catch { /* the server closes the socket regardless */ }
+          setTimeout(() => {
+            try { if (ws) ws.close(); } catch { /* already closed */ }
+            process.exit(0);
+          }, 25);
+          break;
+        }
+
         case 'registered':
           peers = msg.peers || [];
           // A newly enrolled label's owner capability arrives exactly once —

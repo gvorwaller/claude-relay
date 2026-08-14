@@ -120,6 +120,66 @@ class CapabilityStore {
     return this.hasOwner(label) && this.owners[label].acknowledged === true;
   }
 
+  ownerRecords() {
+    return Object.entries(this.owners).map(([label, record]) => ({
+      label,
+      generation: record.generation,
+      createdAt: record.createdAt || null,
+      acknowledged: record.acknowledged === true,
+      host: record.host || null
+    }));
+  }
+
+  previewOwnerRemoval(label) {
+    if (!this.hasOwner(label)) return null;
+    const record = this.owners[label];
+    const confirmation = sha256(JSON.stringify({
+      label,
+      hash: record.hash,
+      generation: record.generation,
+      createdAt: record.createdAt || null,
+      acknowledged: record.acknowledged === true
+    }));
+    return {
+      label,
+      generation: record.generation,
+      createdAt: record.createdAt || null,
+      acknowledged: record.acknowledged === true,
+      host: record.host || null,
+      confirmation
+    };
+  }
+
+  removeOwner(label, confirmation) {
+    const preview = this.previewOwnerRemoval(label);
+    if (!preview || !confirmation || confirmation !== preview.confirmation) {
+      return { ...(preview || { label }), removed: false, confirmed: false };
+    }
+    delete this.owners[label];
+    this.persist();
+    this.revokeJobsFor(label);
+    this.logger.warn('owner_capability_removed', { label, generation: preview.generation });
+    return { ...preview, removed: true, confirmed: true };
+  }
+
+  /**
+   * Remove a never-confirmed enrollment when the enrolling client proves it
+   * still holds the one-time secret. This lets disposable live-test clients
+   * clean up without granting a general identity-deletion capability.
+   */
+  discardUnacknowledged(label, secret) {
+    if (!this.hasOwner(label) || this.owners[label].acknowledged) return false;
+    if (typeof secret !== 'string' || !secret) return false;
+    const provided = Buffer.from(sha256(secret), 'hex');
+    const stored = Buffer.from(this.owners[label].hash, 'hex');
+    if (provided.length !== stored.length || !timingSafeEqual(provided, stored)) return false;
+    delete this.owners[label];
+    this.persist();
+    this.revokeJobsFor(label);
+    this.logger.info('owner_enrollment_discarded', { label });
+    return true;
+  }
+
   /**
    * Drop never-acknowledged records older than the retention window. Every
    * transient client (watchers, one-off tools) enrolls a label, so without

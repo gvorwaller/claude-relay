@@ -311,6 +311,25 @@ function operatorOwnerRepair(dataRoot, clientId, options = {}) {
   }, options, ['owner_rotated']);
 }
 
+function operatorUnusedOwners(dataRoot, options = {}) {
+  return operatorRequest(dataRoot, 'operator_list_unused_owners', {}, options, ['unused_owners'])
+    .then(result => Array.isArray(result.owners) ? result.owners : []);
+}
+
+function operatorRemovableOwners(dataRoot, options = {}) {
+  return operatorRequest(dataRoot, 'operator_list_removable_owners', {}, options, ['removable_owners'])
+    .then(result => Array.isArray(result.owners) ? result.owners : []);
+}
+
+function operatorOwnerRemoval(dataRoot, action, clientId, details = {}, options = {}) {
+  if (!CLIENT_ID_PATTERN.test(clientId) || clientId === 'all') {
+    return Promise.reject(new Error('Choose one exact named identity.'));
+  }
+  return operatorRequest(dataRoot,
+    action === 'preview' ? 'operator_preview_owner_removal' : 'operator_remove_owner',
+    { clientId, ...details }, options, ['owner_removal_preview', 'owner_removed']);
+}
+
 function operatorTerminateDelegate(dataRoot, jobId, options = {}) {
   if (!/^wake_[0-9a-f-]{36}$/.test(jobId || '')) {
     return Promise.reject(new Error('Choose one exact active delegate job.'));
@@ -362,7 +381,10 @@ module.exports = {
   operatorJobRequest,
   operatorMessageRequest,
   operatorOwnerRepair,
+  operatorOwnerRemoval,
+  operatorRemovableOwners,
   operatorTerminateDelegate,
+  operatorUnusedOwners,
   pendingOwnerLabels,
   messageOwnerChoices,
   ownerChoices,

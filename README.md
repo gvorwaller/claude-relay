@@ -241,6 +241,21 @@ and records the job as `interrupted`. Group termination covers the wake shell,
 runner, Codex process, and MCP bridge so a timed-out job cannot leave stale
 grandchildren behind.
 
+For a live wake-path check, use
+`npm run test:wake-e2e -- --target CODEX1`. The helper creates a unique
+transient sender, waits for an exact-token reply, and then proves possession of
+its one-time owner secret to discard that unacknowledged enrollment before it
+exits. This keeps synthetic test identities out of Health and `owners.json`.
+
+Relay Control Center also includes **Remove identity**. It lists named
+identities with no active delegated work and shows whether their credential was
+confirmed, when they were last active, and whether they still have a live relay
+bridge. A live identity is removable only when the relay can stop that exact
+MCP bridge safely; the parent Claude or Codex process is never terminated. A
+second confirmation removes the owner credential and saved local secret.
+Durable messages and completed delegate activity are preserved. If that
+identity is used again later, it must enroll again.
+
 Completed jobs remain durable until the owning foreground Codex task visibly
 reports the server-generated receipt facts. `scripts/relay-receipts-hook.js`
 implements the `UserPromptSubmit`/`Stop` handshake. It processes at most five

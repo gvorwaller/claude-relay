@@ -8,7 +8,8 @@ const { spawnSync } = require('child_process');
 const {
   activeJobChoices, delegateJobDetail, delegateJobReportLines, healthAssessment,
   messageOwnerChoices, operatorJobRequest, operatorMessageRequest,
-  operatorOwnerRepair, operatorTerminateDelegate, ownerChoices, pendingOwnerLabels,
+  operatorOwnerRepair, operatorOwnerRemoval, operatorTerminateDelegate,
+  operatorRemovableOwners, ownerChoices, pendingOwnerLabels,
   readJobRecords, relayTopology, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
@@ -125,6 +126,7 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
     ['Health', 'See whether the relay and its safety checks are working.'],
     ['Peers and sessions', 'See connected identities and details for their live connections.'],
     ['Repair owner credentials', 'Install a credential for an identity still using local fallback.'],
+    ['Remove identity', 'Forget an identity; safely stop its relay bridge first if it is still connected.'],
     ['Stop stuck delegate', 'Terminate one active delegated run and all of its child processes.'],
     ['Restart or repair', 'Restart only the relay service; no history is deleted.'],
     ['Clean completed activity', 'Remove old finished monitor entries; active work is always kept.'],
@@ -223,6 +225,24 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
           : 'This identity is offline. Its replacement credential will be ready for its next start.',
         'Messages, activity, and the identity name are not deleted.'
       ], ['Repair this identity', 'Cancel']));
+    } else if (state.dialog?.type === 'remove_owner_scope') {
+      lines.push(...renderDialog([
+        'Choose one identity to forget.',
+        'A live relay bridge is shown only when it can be stopped safely; identities with active delegated work are not listed.'
+      ], state.dialog.options));
+    } else if (state.dialog?.type === 'remove_owner_confirm') {
+      const item = state.dialog.preview;
+      lines.push(...renderDialog([
+        item.live
+          ? `Stop the live relay bridge and forget ${item.identity}?`
+          : `Forget the relay identity ${item.identity}?`,
+        ...(item.live
+          ? [`Only its relay MCP bridge${item.pid ? ` (pid ${item.pid})` : ''} will be stopped; the parent agent is not terminated.`]
+          : []),
+        `Status: ${item.acknowledged ? 'confirmed credential' : 'credential not confirmed'}${item.lastActivity ? ` • last activity ${age(item.lastActivity)} ago` : ''}.`,
+        'Its owner credential and saved local secret will be removed.',
+        'Messages and completed delegate activity are preserved. A future session must enroll again.'
+      ], [item.live ? 'Stop bridge and remove identity' : 'Remove this identity', 'Cancel']));
     } else if (state.dialog?.type === 'terminate_scope') {
       lines.push(...renderDialog([
         'Choose the active delegated run that appears stuck.',
@@ -332,6 +352,41 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
       state.dialog = null;
       return;
     }
+    if (state.dialog?.type === 'remove_owner_scope') {
+      const item = state.dialog.items[state.dialog.selected];
+      if (!item) { state.dialog = null; return; }
+      try {
+        const preview = await operatorOwnerRemoval(dataRoot, 'preview', item.identity, {
+          disconnectLive: item.live === true
+        });
+        state.dialog = {
+          type: 'remove_owner_confirm', preview, selected: 1,
+          options: ['Remove this identity', 'Cancel']
+        };
+      } catch (error) {
+        state.dialog = null;
+        state.notice = `Identity cannot be removed: ${error.message}`;
+      }
+      return;
+    }
+    if (state.dialog?.type === 'remove_owner_confirm') {
+      const preview = state.dialog.preview;
+      if (state.dialog.selected === 0) {
+        try {
+          await operatorOwnerRemoval(dataRoot, 'remove', preview.identity, {
+            confirmation: preview.confirmation,
+            disconnectLive: preview.live === true
+          });
+          state.notice = preview.live
+            ? `Stopped ${preview.identity}'s relay bridge and removed the identity. Its messages and completed activity were preserved.`
+            : `Removed ${preview.identity}. Its messages and completed activity were preserved.`;
+        } catch (error) {
+          state.notice = `Identity was not removed: ${error.message}`;
+        }
+      }
+      state.dialog = null;
+      return;
+    }
     if (state.dialog?.type === 'terminate_scope') {
       const item = state.dialog.items[state.dialog.selected];
       if (!item) { state.dialog = null; return; }
@@ -406,6 +461,29 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
       }
     }
     if (state.selected === 4) {
+      try {
+        const items = await operatorRemovableOwners(dataRoot);
+        if (!items.length) {
+          state.notice = 'No inactive identities are available to remove.';
+        } else {
+          const labels = items.map(item => {
+            const status = item.acknowledged ? 'confirmed' : 'not confirmed';
+            const activity = item.lastActivity ? ` • last activity ${age(item.lastActivity)} ago` : '';
+            const connection = item.live
+              ? ` • LIVE${item.pid ? ` bridge pid ${item.pid}` : ''}${item.canStop ? ' • will be stopped' : ' • cannot stop safely'}`
+              : '';
+            return `${item.identity} • ${status}${connection}${activity}`;
+          });
+          state.dialog = {
+            type: 'remove_owner_scope', items: [...items, null], selected: labels.length,
+            options: [...labels, 'Cancel']
+          };
+        }
+      } catch (error) {
+        state.notice = `Could not list unused identities: ${error.message}`;
+      }
+    }
+    if (state.selected === 5) {
       const items = activeJobChoices(dataRoot);
       if (!items.length) {
         state.notice = 'No delegated runs are currently active.';
@@ -417,9 +495,9 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
         };
       }
     }
-    if (state.selected === 5) state.dialog = { type: 'restart', selected: 1, options: ['Restart relay now', 'Cancel'] };
-    if (state.selected === 6 || state.selected === 7) {
-      const kind = state.selected === 6 ? 'jobs' : 'messages';
+    if (state.selected === 6) state.dialog = { type: 'restart', selected: 1, options: ['Restart relay now', 'Cancel'] };
+    if (state.selected === 7 || state.selected === 8) {
+      const kind = state.selected === 7 ? 'jobs' : 'messages';
       const owners = kind === 'jobs' ? ownerChoices(dataRoot) : messageOwnerChoices(dataRoot);
       const optionLabels = [...owners.map(name => `${name} only`), 'All identities', 'Cancel'];
       state.dialog = { type: 'scope', kind, selected: optionLabels.length - 1, options: optionLabels, values: [...owners, 'all', null] };

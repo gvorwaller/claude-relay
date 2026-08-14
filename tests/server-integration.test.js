@@ -27,14 +27,14 @@ function nextMessage(ws, type) {
   return waitForMessage(ws, message => message.type === type);
 }
 
-async function connect(port, clientId) {
+async function connect(port, clientId, meta) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise((resolve, reject) => {
     ws.once('open', resolve);
     ws.once('error', reject);
   });
   const registered = waitForMessage(ws, message => message.type === 'registered');
-  ws.send(JSON.stringify({ type: 'register', clientId }));
+  ws.send(JSON.stringify({ type: 'register', clientId, ...(meta ? { meta } : {}) }));
   await registered;
   return ws;
 }
@@ -86,7 +86,10 @@ test('server persists authorized history, preserves it on cache clear, and gates
   const outsider = await connect(port, 'C');
   const admin = await connect(port, 'ADMIN');
   const watcher = await connect(port, 'B-watch-test');
-  t.after(() => [sender, recipient, outsider, admin, watcher].forEach(ws => ws.close()));
+  const liveAuto = await connect(port, 'LIVEAUTO', {
+    source: 'auto', operatorShutdown: true, pid: 4242, cwd: '/hidden/session', host: 'Test-Mac'
+  });
+  t.after(() => [sender, recipient, outsider, admin, watcher, liveAuto].forEach(ws => ws.close()));
 
   const observer = new WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise((resolve, reject) => {
@@ -96,10 +99,10 @@ test('server persists authorized history, preserves it on cache clear, and gates
   t.after(() => observer.close());
   observer.send(JSON.stringify({ type: 'get_peers' }));
   assert.deepEqual((await nextMessage(observer, 'peers')).peers.sort(),
-    ['A', 'ADMIN', 'B', 'B-watch-test', 'C'].sort());
+    ['A', 'ADMIN', 'B', 'B-watch-test', 'C', 'LIVEAUTO'].sort());
   observer.send(JSON.stringify({ type: 'get_sessions' }));
   assert.deepEqual(Object.keys((await nextMessage(observer, 'sessions')).sessions).sort(),
-    ['A', 'ADMIN', 'B', 'B-watch-test', 'C'].sort());
+    ['A', 'ADMIN', 'B', 'B-watch-test', 'C', 'LIVEAUTO'].sort());
 
   const watching = nextMessage(watcher, 'watching');
   watcher.send(JSON.stringify({ type: 'watch', for: 'B' }));
@@ -179,6 +182,57 @@ test('server persists authorized history, preserves it on cache clear, and gates
   }));
   assert.equal((await nextMessage(operator, 'owner_rotated')).clientId, 'REPAIR1');
   assert.ok(fs.existsSync(path.join(root, 'owners', 'REPAIR1.secret')));
+  operator.send(JSON.stringify({
+    type: 'rotate_owner', clientId: 'REMOVE1', adminSecret: localSecret, force: true
+  }));
+  assert.equal((await nextMessage(operator, 'owner_rotated')).clientId, 'REMOVE1');
+  operator.send(JSON.stringify({
+    type: 'operator_preview_owner_removal', clientId: 'A', adminSecret: localSecret
+  }));
+  assert.match((await nextMessage(operator, 'error')).message, /live relay session/);
+  operator.send(JSON.stringify({ type: 'operator_list_unused_owners', adminSecret: localSecret }));
+  const unused = await nextMessage(operator, 'unused_owners');
+  assert.equal(unused.owners.some(owner => owner.identity === 'A'), false, 'live identity is excluded');
+  assert.equal(unused.owners.some(owner => owner.identity === 'REMOVE1'), true);
+  operator.send(JSON.stringify({ type: 'operator_list_removable_owners', adminSecret: localSecret }));
+  const removable = await nextMessage(operator, 'removable_owners');
+  const liveCandidate = removable.owners.find(owner => owner.identity === 'LIVEAUTO');
+  assert.equal(liveCandidate.live, true);
+  assert.equal(liveCandidate.canStop, true);
+  assert.equal(liveCandidate.pid, 4242);
+  operator.send(JSON.stringify({
+    type: 'operator_preview_owner_removal', clientId: 'LIVEAUTO',
+    disconnectLive: true, adminSecret: localSecret
+  }));
+  const liveRemovalPreview = await nextMessage(operator, 'owner_removal_preview');
+  assert.equal(liveRemovalPreview.live, true);
+  const shutdownRequested = nextMessage(liveAuto, 'operator_remove_identity');
+  operator.send(JSON.stringify({
+    type: 'operator_remove_owner', clientId: 'LIVEAUTO', disconnectLive: true,
+    confirmation: liveRemovalPreview.confirmation, adminSecret: localSecret
+  }));
+  const liveRemoved = await nextMessage(operator, 'owner_removed');
+  assert.equal(liveRemoved.identity, 'LIVEAUTO');
+  assert.equal(liveRemoved.liveConnectionStopped, true);
+  assert.equal((await shutdownRequested).clientId, 'LIVEAUTO');
+  operator.send(JSON.stringify({
+    type: 'operator_preview_owner_removal', clientId: 'REMOVE1', adminSecret: localSecret
+  }));
+  const removalPreview = await nextMessage(operator, 'owner_removal_preview');
+  assert.equal(removalPreview.identity, 'REMOVE1');
+  operator.send(JSON.stringify({
+    type: 'operator_remove_owner', clientId: 'REMOVE1', confirmation: 'wrong', adminSecret: localSecret
+  }));
+  assert.match((await nextMessage(operator, 'error')).message, /preview changed/);
+  assert.ok(fs.existsSync(path.join(root, 'owners', 'REMOVE1.secret')));
+  operator.send(JSON.stringify({
+    type: 'operator_remove_owner', clientId: 'REMOVE1',
+    confirmation: removalPreview.confirmation, adminSecret: localSecret
+  }));
+  assert.equal((await nextMessage(operator, 'owner_removed')).identity, 'REMOVE1');
+  assert.equal(fs.existsSync(path.join(root, 'owners', 'REMOVE1.secret')), false);
+  const persistedOwners = JSON.parse(fs.readFileSync(path.join(root, 'owners.json'), 'utf8'));
+  assert.equal(Object.hasOwn(persistedOwners, 'REMOVE1'), false);
   operator.send(JSON.stringify({
     type: 'operator_preview_delegate_jobs', owner: 'CODEX2', adminSecret: localSecret
   }));

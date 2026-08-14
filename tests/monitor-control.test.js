@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {
   activeJobChoices, delegateJobDetail, delegateJobReportLines, operatorOwnerRepair,
-  operatorTerminateDelegate,
+  operatorOwnerRemoval, operatorTerminateDelegate,
   previewJobCleanup, purgeJobCleanup, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
@@ -94,6 +94,16 @@ test('topology view distinguishes peer identities from detailed live sessions', 
 test('credential repair requires one exact named identity', async () => {
   await assert.rejects(operatorOwnerRepair('/unused', 'all'), /one exact named identity/);
   await assert.rejects(operatorOwnerRepair('/unused', '../CC1'), /one exact named identity/);
+});
+
+test('identity removal requires one exact named identity and is visible in the TUI', async () => {
+  await assert.rejects(operatorOwnerRemoval('/unused', 'preview', 'all'), /one exact named identity/);
+  await assert.rejects(operatorOwnerRemoval('/unused', 'remove', '../CC1'), /one exact named identity/);
+  const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'relay-monitor.js'), 'utf8');
+  assert.match(source, /Remove identity/);
+  assert.match(source, /Stop bridge and remove identity/);
+  assert.match(source, /parent agent is not terminated/);
+  assert.match(source, /Messages and completed delegate activity are preserved/);
 });
 
 test('stuck-delegate choices include only active canonical jobs', async t => {

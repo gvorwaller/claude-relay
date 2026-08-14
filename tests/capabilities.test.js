@@ -105,6 +105,37 @@ test('first successful use marks the capability acknowledged (migration closes)'
   assert.equal(reopened.isAcknowledged('CCM'), true);
 });
 
+test('a disposable client can discard only its own unacknowledged enrollment', t => {
+  const { store: caps } = store(t);
+  const pending = caps.mintOwner('WAKE-E2E-watch-12345-deadbeef');
+  assert.equal(caps.discardUnacknowledged('WAKE-E2E-watch-12345-deadbeef', 'wrong'), false);
+  assert.equal(caps.hasOwner('WAKE-E2E-watch-12345-deadbeef'), true);
+  assert.equal(caps.discardUnacknowledged('WAKE-E2E-watch-12345-deadbeef', pending.secret), true);
+  assert.equal(caps.hasOwner('WAKE-E2E-watch-12345-deadbeef'), false);
+
+  const confirmed = caps.mintOwner('CC-CONFIRMED');
+  assert.equal(caps.verifyOwner('CC-CONFIRMED', confirmed.secret), true);
+  assert.equal(caps.discardUnacknowledged('CC-CONFIRMED', confirmed.secret), false);
+  assert.equal(caps.hasOwner('CC-CONFIRMED'), true, 'confirmed identities are never discarded');
+});
+
+test('operator owner removal is preview-bound and may remove confirmed owners', t => {
+  const { store: caps } = store(t);
+  const enrolled = caps.mintOwner('OLD-CODEX');
+  assert.equal(caps.verifyOwner('OLD-CODEX', enrolled.secret), true);
+  const preview = caps.previewOwnerRemoval('OLD-CODEX');
+  assert.equal(preview.acknowledged, true);
+  assert.equal(caps.removeOwner('OLD-CODEX', 'wrong').removed, false);
+  assert.equal(caps.hasOwner('OLD-CODEX'), true);
+  const rotated = caps.mintOwner('OLD-CODEX');
+  assert.equal(caps.removeOwner('OLD-CODEX', preview.confirmation).removed, false,
+    'a stale preview cannot remove a changed credential');
+  const current = caps.previewOwnerRemoval('OLD-CODEX');
+  assert.equal(caps.removeOwner('OLD-CODEX', current.confirmation).removed, true);
+  assert.equal(caps.hasOwner('OLD-CODEX'), false);
+  assert.equal(caps.verifyOwner('OLD-CODEX', rotated.secret), false);
+});
+
 test('an abandoned pending enrollment expires and can be reissued', t => {
   let clock = Date.parse('2026-08-01T00:00:00Z');
   const { store: caps } = store(t, { now: () => clock });

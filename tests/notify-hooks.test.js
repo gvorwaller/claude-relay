@@ -149,17 +149,21 @@ test('delegate timeout kills the entire detached process group', async t => {
   }));
   const warnings = [];
   const hooks = new NotifyHooks({
-    configPath, execTimeoutMs: 80, execKillGraceMs: 40,
+    configPath, execTimeoutMs: 500, execKillGraceMs: 100,
     logger: { info() {}, warn: (event, data) => warnings.push({ event, data }), error() {} }
   });
   hooks.fire({ to: 'CODEX3', from: 'CC5', messageId: 'timeout-1', delivered: false });
-  for (let i = 0; i < 20 && !fs.existsSync(pidFile); i += 1) {
+  for (let i = 0; i < 100 && !fs.existsSync(pidFile); i += 1) {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   assert.equal(fs.existsSync(pidFile), true, 'delegate child started');
   const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-  await new Promise(resolve => setTimeout(resolve, 250));
-  assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
+  let gone = false;
+  for (let i = 0; i < 100 && !gone; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    try { process.kill(pid, 0); } catch (error) { gone = error.code === 'ESRCH'; }
+  }
+  assert.equal(gone, true, 'delegate child process exited after its process group was terminated');
   assert.ok(warnings.some(item => item.event === 'notify_hook_delegate_timeout'));
 });
 

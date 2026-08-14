@@ -57,3 +57,17 @@ test('owner rotation rejects hostile labels before touching disk', t => {
   assert.throws(() => admin.rotate('../escape'), /Invalid owner label/);
   assert.throws(() => admin.rotate('all'), /Invalid owner label/);
 });
+
+test('owner removal deletes the capability and saved secret after exact preview', t => {
+  const { capabilities, admin } = setup(t);
+  const rotated = admin.rotate('UNUSED1');
+  assert.equal(fs.existsSync(rotated.secretPath), true);
+  const preview = capabilities.previewOwnerRemoval('UNUSED1');
+  assert.equal(admin.remove('UNUSED1', 'wrong').removed, false);
+  assert.equal(capabilities.hasOwner('UNUSED1'), true);
+  const removed = admin.remove('UNUSED1', preview.confirmation);
+  assert.equal(removed.removed, true);
+  assert.equal(capabilities.hasOwner('UNUSED1'), false);
+  assert.equal(fs.existsSync(rotated.secretPath), false);
+  assert.equal(fs.readdirSync(path.join(admin.dataDir, 'owner-removals')).length, 0);
+});

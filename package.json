@@ -9,6 +9,7 @@
     "monitor": "node scripts/relay-monitor.js",
     "health": "node scripts/relay-health.js",
     "owner": "node scripts/relay-owner.js",
+    "test:wake-e2e": "node scripts/e2e-wake-test.js",
     "test-client": "node test-client.js",
     "test": "node --test tests/*.test.js"
   },

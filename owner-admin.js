@@ -49,6 +49,7 @@ class OwnerAdmin {
     this.ownerDir = options.ownerDir;
     this.logger = options.logger || { info() {}, warn() {}, error() {} };
     this.journalDir = path.join(this.dataDir, 'owner-rotations');
+    this.removalJournalDir = path.join(this.dataDir, 'owner-removals');
   }
 
   secretPath(label) {
@@ -57,6 +58,10 @@ class OwnerAdmin {
 
   journalPath(label) {
     return path.join(this.journalDir, `${label}.json`);
+  }
+
+  removalJournalPath(label) {
+    return path.join(this.removalJournalDir, `${label}.json`);
   }
 
   rotate(label, options = {}) {
@@ -84,7 +89,49 @@ class OwnerAdmin {
     }
   }
 
+  remove(label, confirmation) {
+    if (!LABEL_PATTERN.test(label) || label.toLowerCase() === 'all') {
+      throw new Error('Invalid owner label');
+    }
+    const journal = this.removalJournalPath(label);
+    fs.mkdirSync(this.removalJournalDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(journal, JSON.stringify({ label }), { mode: 0o600, flag: 'wx' });
+    const result = this.capabilities.removeOwner(label, confirmation);
+    if (!result.removed) {
+      fs.unlinkSync(journal);
+      return result;
+    }
+    try { fs.unlinkSync(this.secretPath(label)); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    fs.unlinkSync(journal);
+    this.logger.warn('owner_identity_removed', { label, generation: result.generation });
+    return result;
+  }
+
+  recoverRemovals() {
+    let names = [];
+    try { names = fs.readdirSync(this.removalJournalDir).filter(name => name.endsWith('.json')); } catch {}
+    for (const name of names) {
+      const journal = path.join(this.removalJournalDir, name);
+      try {
+        const record = JSON.parse(fs.readFileSync(journal, 'utf8'));
+        if (!record || !LABEL_PATTERN.test(record.label)) throw new Error('invalid removal journal');
+        const preview = this.capabilities.previewOwnerRemoval(record.label);
+        if (preview) this.capabilities.removeOwner(record.label, preview.confirmation);
+        try { fs.unlinkSync(this.secretPath(record.label)); } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+        fs.unlinkSync(journal);
+        this.logger.warn('owner_removal_recovered', { label: record.label });
+      } catch (error) {
+        this.logger.error('owner_removal_recovery_failed', { journal, error: error.message });
+      }
+    }
+  }
+
   recover() {
+    this.recoverRemovals();
     let names = [];
     try { names = fs.readdirSync(this.journalDir).filter(name => name.endsWith('.json')); } catch {}
     const recovered = [];
