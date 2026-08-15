@@ -1,8 +1,8 @@
 #!/bin/bash
 # Wake the peer behind a relay ID — generic, zero per-peer configuration.
 #
-# Designed to be fired from a single wildcard notify.json entry for EVERY
-# target. The script decides what the peer is and what waking it means:
+# Invoked by wake-peer.sh after its single wildcard notify entry has selected
+# a Codex target. The script verifies that peer and decides how to wake it:
 #
 #   - Codex peer (its bridge's parent is a codex process, or its label starts
 #     with CODEX): resume its exact session headlessly as a delegate.

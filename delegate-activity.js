@@ -28,4 +28,28 @@ function projectCodexEvent(event) {
   }
 }
 
-module.exports = { projectCodexEvent };
+function projectGrokEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+  if (event.type === 'result') return event.is_error ? 'error' : 'finishing';
+  if (event.type !== 'assistant' || !event.message || !Array.isArray(event.message.content)) {
+    return null;
+  }
+  let projected = null;
+  for (const block of event.message.content) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking') projected = 'analyzing';
+    if (block.type === 'text') projected = 'preparing_response';
+    if (block.type !== 'tool_use') continue;
+    const name = String(block.name || '').toLowerCase();
+    if (name.includes('relay_receive')) projected = 'reading_message';
+    else if (name.includes('relay_send')) projected = 'sending_reply';
+    else if (name.includes('terminal') || name.includes('bash') || name.includes('shell')) {
+      projected = 'running_command';
+    } else if (name.includes('edit') || name.includes('write') || name.includes('replace')) {
+      projected = 'updating_files';
+    } else projected = 'using_tool';
+  }
+  return projected;
+}
+
+module.exports = { projectCodexEvent, projectGrokEvent };

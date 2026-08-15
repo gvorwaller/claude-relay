@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const { notifyDelegate } = require('../delegate-notifier');
+const { projectGrokEvent } = require('../delegate-activity');
 
 test('relay-monitor renders sanitized activity and never arbitrary job fields', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-'));
@@ -59,4 +60,77 @@ test('every live Codex wake uses a fresh same-cwd delegate', () => {
     path.join(__dirname, '..', 'scripts', 'delegate-result-schema.json'), 'utf8'
   ));
   assert.deepEqual(schema.required, ['summary', 'changes', 'verification']);
+});
+
+test('Grok activity projection is sanitized and classifies relay tools', () => {
+  const event = name => ({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', name, input: { secret: 'do not retain' } }] }
+  });
+  assert.equal(projectGrokEvent(event('claude-relay__relay_receive')), 'reading_message');
+  assert.equal(projectGrokEvent(event('claude-relay__relay_send')), 'sending_reply');
+  assert.equal(projectGrokEvent(event('run_terminal_command')), 'running_command');
+  assert.equal(projectGrokEvent({ type: 'result', is_error: false, result: 'private' }), 'finishing');
+});
+
+test('Grok wake is a fresh same-cwd delegate and never resumes foreground session', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'wake-grok.sh'), 'utf8'
+  );
+  assert.match(source, /RELAY_DELEGATE_FOR="\$FOR"/);
+  assert.match(source, /grok --no-leader --cwd "\$PEER_CWD" --always-approve/);
+  assert.match(source, /streaming-messages-json/);
+  assert.doesNotMatch(source, /--resume|-r "\$PEER/);
+});
+
+test('wildcard wake dispatcher routes both Codex and Grok before delegate launch', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'wake-peer.sh'), 'utf8'
+  );
+  assert.match(source, /exec .*wake-codex\.sh/);
+  assert.match(source, /exec .*wake-grok\.sh/);
+});
+
+test('wildcard wake dispatcher tolerates the notify hook passing no argv', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-peer-'));
+  try {
+    const registry = path.join(root, 'registry.json');
+    fs.writeFileSync(registry, JSON.stringify({
+      OTHER: { pid: 0, cwd: root }
+    }));
+    const result = spawnSync(path.join(__dirname, '..', 'scripts', 'wake-peer.sh'), [], {
+      encoding: 'utf8',
+      env: { ...process.env, RELAY_FOR: 'OTHER', RELAY_REGISTRY: registry }
+    });
+    assert.equal(result.status, 64);
+    assert.doesNotMatch(result.stderr, /unbound variable/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Grok runner captures only the terminal result for the operator report', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-grok-runner-'));
+  try {
+    const output = path.join(root, 'last-message.json');
+    const fixture = [
+      JSON.stringify({ type: 'assistant', message: { content: [
+        { type: 'thinking', thinking: 'private reasoning' },
+        { type: 'tool_use', name: 'claude-relay__relay_receive', input: { secret: 'private' } }
+      ] } }),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: false,
+        result: '{"summary":"done","changes":"None","verification":[]}' })
+    ].join('\n') + '\n';
+    const result = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'run-grok-delegate.js'),
+      '--last-message', output, '--', process.execPath, '-e',
+      `process.stdout.write(${JSON.stringify(fixture)})`
+    ], { encoding: 'utf8', env: { ...process.env, RELAY_JOB_RESULT_SECRET_FILE: '' } });
+    assert.equal(result.status, 0);
+    assert.equal(fs.readFileSync(output, 'utf8'),
+      '{"summary":"done","changes":"None","verification":[]}');
+    assert.doesNotMatch(fs.readFileSync(output, 'utf8'), /private reasoning|private/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

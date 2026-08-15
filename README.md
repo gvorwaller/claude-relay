@@ -402,22 +402,22 @@ When a message is stored, the server consults optional operator-local config
 `data/notify.json` (see `notify.json.example`; override path with
 `RELAY_NOTIFY_CONFIG`). The shipped default is a single `"*"` wildcard that
 works for **any** peer with zero per-peer configuration: the wake script
-itself detects what the target is (Codex peers get resumed; Claude Code peers
-exit untouched — they wake via their own watcher; unresumable peers fall back
-to a banner). Per-target entries remain available for overrides:
+itself detects what the target is (Codex and Grok peers get fresh headless
+delegates; Claude Code peers exit untouched because they wake through their own
+watcher). Per-target entries remain available for overrides:
 
 - `{ "type": "banner" }` — content-free macOS notification (sender + target
   only) via `osascript`.
 - `{ "type": "exec", "command": "...", "debounceSeconds": 300 }` — run a
   command detached with `RELAY_FOR`, `RELAY_FROM`, `RELAY_MESSAGE_ID`,
   `RELAY_DELIVERED` in the environment. This is how a turn-based harness with
-  a headless CLI gets woken. For Codex, use `scripts/wake-codex.sh` (see
-  `notify.json.example`): it resolves the peer's *exact* session — registry
-  pid → parent codex process → the rollout file it holds open, falling back
-  to newest-rollout-matching-cwd — never `--last`, which picks the wrong
-  session as soon as several Codex instances run concurrently. The resumed
-  run's bridge registers as a delegate (see "Delegates" above), so the
-  interactive session that owns the label is never displaced.
+  a headless CLI gets woken. Use `scripts/wake-peer.sh` (see
+  `notify.json.example`), which routes to a harness-specific implementation.
+  Live Codex and Grok peers always receive a fresh one-shot delegate in their
+  registered cwd, so the visible foreground conversation is never resumed or
+  given a competing session writer. An offline Codex peer can still resume its
+  unambiguous persisted session. Each worker's bridge registers as a delegate
+  (see "Delegates" above), so the interactive owner label is never displaced.
 - `"onlyIfUndelivered": true` — fire only when the target socket was not live
   at store time. A live delegate for the target also suppresses exec entries
   (it *is* the woken instance; double-spawning would fight it).

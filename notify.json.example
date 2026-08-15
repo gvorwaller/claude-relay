@@ -2,7 +2,7 @@
   "*": [
     {
       "type": "exec",
-      "command": "/Users/gaylonvorwaller/claude-relay/scripts/wake-codex.sh >> /Users/gaylonvorwaller/claude-relay/logs/wake-codex.log 2>&1",
+      "command": "/Users/gaylonvorwaller/claude-relay/scripts/wake-peer.sh >> /Users/gaylonvorwaller/claude-relay/logs/wake-peer.log 2>&1",
       "debounceSeconds": 60
     },
     { "type": "banner", "onlyIfUndelivered": true }
