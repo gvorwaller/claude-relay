@@ -9,9 +9,9 @@ architecture, remote-machine setup, and protocol details.
 - The relay server runs as the `com.claude-relay` launch agent.
 - Claude Code uses the global Stop hook in `~/.claude/settings.json` to arm its
   relay listener. Existing Claude Code sessions need no per-session setup.
-- A relay message addressed to a configured Codex identity can launch a
-  detached delegate. The monitor displays that delegate's durable job state,
-  coarse current activity, replies, and delivery status.
+- A relay message addressed to a configured Codex, Grok, or AGY identity can
+  launch a detached delegate. The monitor displays that delegate's durable job
+  state, coarse current activity, replies, and delivery status.
 
 Check the relay server at any time:
 
@@ -111,6 +111,26 @@ merge the two event definitions instead.
 4. Treat `completed` as an execution result and the recorded outbound delivery
    status as transport evidence; neither is a claim that the peer accepted the
    work as correct.
+
+## Enable AGY once
+
+AGY reads global MCP definitions from `~/.gemini/config/mcp_config.json`. Add
+the `claude-relay` stdio server shown in the README with
+`RELAY_CLIENT_ID=AGY`. Confirm it by asking AGY to call `relay_status`; the
+reported identity must be exactly `AGY`.
+
+No visible AGY conversation is resumed by a relay wake. `wake-peer.sh` launches
+a fresh `agy -p` process in the foreground session's registered cwd, passes a
+job-scoped relay capability, records only sanitized activity and the final
+operator report, then exits. The foreground AGY session remains attached and
+usable. Do not configure a second per-project relay MCP for AGY.
+
+AGY currently starts its stdio MCP bridge on demand and may close it again
+between turns. Therefore **Peers and sessions** can show `AGY` under
+**Registered idle sessions** rather than **Connected agent peers** while the
+visible AGY terminal is idle. This is not a delivery failure: durable mail to
+`AGY` still launches the headless delegate. During that run, the connected peer
+is the temporary `AGY~wake-*`; it disappears when the worker exits.
 
 ## Clear old monitor entries
 

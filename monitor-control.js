@@ -199,6 +199,13 @@ function healthAssessment(dataRoot) {
 function relayTopology(dataRoot, options = {}) {
   const status = readRuntimeStatus(path.join(dataRoot, 'runtime-status.json'));
   if (!status) return Promise.reject(new Error('Relay status is unavailable. Open Health for details.'));
+  let registeredSessions = {};
+  try {
+    const registryPath = options.registryPath
+      || path.join(path.dirname(dataRoot), 'sessions', 'registry.json');
+    const parsed = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) registeredSessions = parsed;
+  } catch { /* live topology remains useful when the local registry is absent */ }
   const WebSocketClient = options.WebSocket || WebSocket;
   return new Promise((resolve, reject) => {
     const socket = new WebSocketClient(`ws://${status.host}:${status.port}`);
@@ -213,6 +220,7 @@ function relayTopology(dataRoot, options = {}) {
       if (error) reject(error); else resolve({
         peers,
         sessions,
+        registeredSessions,
         pendingOwnerLabels: Array.isArray(status.metrics?.ownersPendingLabels)
           ? status.metrics.ownersPendingLabels : []
       });
@@ -240,6 +248,8 @@ function topologyLines(topology) {
   const agentPeers = peers.filter(identity => !isTransientOwnerLabel(identity));
   const watcherPeers = peers.filter(isTransientOwnerLabel);
   const pending = new Set(Array.isArray(topology?.pendingOwnerLabels) ? topology.pendingOwnerLabels : []);
+  const registered = topology?.registeredSessions && typeof topology.registeredSessions === 'object'
+    ? topology.registeredSessions : {};
   const lines = [
     `Connected agent peers: ${agentPeers.length}`,
     agentPeers.length ? `  ${agentPeers.join(', ')}` : '  No agent identities are connected.',
@@ -259,6 +269,20 @@ function topologyLines(topology) {
     if (meta.pid) details.push(`pid ${meta.pid}`);
     if (pending.has(identity)) details.push('owner credential not confirmed');
     lines.push(`  ${identity}${details.length ? ` — ${details.join(' • ')}` : ''}`);
+  }
+  const connected = new Set(peers);
+  const idleEntries = Object.entries(registered)
+    .filter(([identity]) => !isTransientOwnerLabel(identity) && !connected.has(identity))
+    .sort(([a], [b]) => a.localeCompare(b));
+  lines.push('', 'Registered idle sessions (known identity and cwd, no live peer connection):');
+  if (!idleEntries.length) lines.push('  No registered sessions are idle.');
+  for (const [identity, meta] of idleEntries) {
+    const details = [];
+    if (meta.cwd) details.push(String(meta.cwd));
+    if (meta.ended && !Number.isNaN(Date.parse(meta.ended))) {
+      details.push(`bridge ended ${formatClock(meta.ended)}`);
+    } else details.push('bridge not connected');
+    lines.push(`  ${identity} — ${details.join(' • ')}`);
   }
   return lines;
 }

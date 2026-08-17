@@ -52,6 +52,13 @@ if [[ "$PARENT_ARGS" == *[Gg]rok* || "$FOR" == GROK* ]]; then
     exec "$ROOT/scripts/wake-grok.sh"
   fi
 fi
+if [[ "$PARENT_ARGS" == *agy* || "$FOR" == AGY* ]]; then
+  if [[ ${#ARGS[@]} -gt 0 ]]; then
+    exec "$ROOT/scripts/wake-agy.sh" "${ARGS[@]}"
+  else
+    exec "$ROOT/scripts/wake-agy.sh"
+  fi
+fi
 
 # Claude Code sessions use relay-stop-hook.sh; unknown harnesses have no safe
 # process to launch. Exit 64 tells NotifyHooks to discard the provisional job.

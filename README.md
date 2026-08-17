@@ -51,7 +51,7 @@ node server.js
 # [Claude Relay] Ready! Listening on ws://127.0.0.1:9999
 ```
 
-### 2. Configure Claude Code (on each machine)
+### 2. Configure an MCP client (on each machine)
 
 Add to your Claude Code MCP configuration (`~/.claude.json`):
 
@@ -69,6 +69,24 @@ Add to your Claude Code MCP configuration (`~/.claude.json`):
   }
 }
 ```
+
+For Antigravity CLI (`agy`), use its global MCP file at
+`~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "claude-relay": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/claude-relay/mcp-server.js"],
+      "env": { "RELAY_CLIENT_ID": "AGY" }
+    }
+  }
+}
+```
+
+AGY reloads this global file automatically in current releases. Confirm under
+**Additional Options (...) > MCP Servers** or ask it to call `relay_status`.
 
 ### 3. Connect Remote Machines via SSH Tunnel
 
@@ -402,7 +420,7 @@ When a message is stored, the server consults optional operator-local config
 `data/notify.json` (see `notify.json.example`; override path with
 `RELAY_NOTIFY_CONFIG`). The shipped default is a single `"*"` wildcard that
 works for **any** peer with zero per-peer configuration: the wake script
-itself detects what the target is (Codex and Grok peers get fresh headless
+itself detects what the target is (Codex, Grok, and AGY peers get fresh headless
 delegates; Claude Code peers exit untouched because they wake through their own
 watcher). Per-target entries remain available for overrides:
 
@@ -413,7 +431,7 @@ watcher). Per-target entries remain available for overrides:
   `RELAY_DELIVERED` in the environment. This is how a turn-based harness with
   a headless CLI gets woken. Use `scripts/wake-peer.sh` (see
   `notify.json.example`), which routes to a harness-specific implementation.
-  Live Codex and Grok peers always receive a fresh one-shot delegate in their
+  Live Codex, Grok, and AGY peers always receive a fresh one-shot delegate in their
   registered cwd, so the visible foreground conversation is never resumed or
   given a competing session writer. An offline Codex peer can still resume its
   unambiguous persisted session. Each worker's bridge registers as a delegate

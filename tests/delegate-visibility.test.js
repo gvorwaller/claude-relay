@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const { notifyDelegate } = require('../delegate-notifier');
-const { projectGrokEvent } = require('../delegate-activity');
+const { projectGrokEvent, projectAgyEvent } = require('../delegate-activity');
 
 test('relay-monitor renders sanitized activity and never arbitrary job fields', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-'));
@@ -83,12 +83,69 @@ test('Grok wake is a fresh same-cwd delegate and never resumes foreground sessio
   assert.doesNotMatch(source, /--resume|-r "\$PEER/);
 });
 
-test('wildcard wake dispatcher routes both Codex and Grok before delegate launch', () => {
+test('wildcard wake dispatcher routes supported harnesses before delegate launch', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'scripts', 'wake-peer.sh'), 'utf8'
   );
   assert.match(source, /exec .*wake-codex\.sh/);
   assert.match(source, /exec .*wake-grok\.sh/);
+  assert.match(source, /exec .*wake-agy\.sh/);
+});
+
+test('AGY activity projection is sanitized and classifies relay tools', () => {
+  const tool = (name, parameters = {}) => ({
+    event: 'step_update',
+    step_update: { state: 'ACTIVE', step_type: 'tool', tool_name: name,
+      tool_info: { parameters } }
+  });
+  assert.equal(projectAgyEvent(tool('call_mcp_tool', {
+    ToolName: 'relay_receive', Arguments: { secret: 'do not retain' }
+  })), 'reading_message');
+  assert.equal(projectAgyEvent(tool('call_mcp_tool', {
+    ToolName: 'relay_send', Arguments: { message: 'private' }
+  })), 'sending_reply');
+  assert.equal(projectAgyEvent(tool('run_command', { CommandLine: 'cat /secret' })),
+    'running_command');
+  assert.equal(projectAgyEvent({ event: 'result', result: {
+    status: 'SUCCESS', response: 'private'
+  } }), 'finishing');
+});
+
+test('AGY wake is a fresh same-cwd delegate and never resumes foreground session', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'wake-agy.sh'), 'utf8'
+  );
+  assert.match(source, /RELAY_DELEGATE_FOR="\$FOR"/);
+  assert.match(source, /agy -p "\$PROMPT" --output-format stream-json/);
+  assert.match(source, /--dangerously-skip-permissions/);
+  assert.match(source, /--json-schema "\$RESULT_SCHEMA"/);
+  assert.doesNotMatch(source, /--continue|--conversation/);
+});
+
+test('AGY runner captures only the terminal response for the operator report', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-agy-runner-'));
+  try {
+    const output = path.join(root, 'last-message.json');
+    const fixture = [
+      JSON.stringify({ event: 'step_update', step_update: {
+        state: 'ACTIVE', step_type: 'tool', tool_name: 'call_mcp_tool',
+        tool_info: { parameters: { ToolName: 'relay_receive', secret: 'private' } }
+      } }),
+      JSON.stringify({ event: 'result', result: { status: 'SUCCESS',
+        response: '{"summary":"done","changes":"None","verification":[]}' } })
+    ].join('\n') + '\n';
+    const result = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'run-agy-delegate.js'),
+      '--last-message', output, '--', process.execPath, '-e',
+      `process.stdout.write(${JSON.stringify(fixture)})`
+    ], { encoding: 'utf8', env: { ...process.env, RELAY_JOB_RESULT_SECRET_FILE: '' } });
+    assert.equal(result.status, 0);
+    assert.equal(fs.readFileSync(output, 'utf8'),
+      '{"summary":"done","changes":"None","verification":[]}');
+    assert.doesNotMatch(fs.readFileSync(output, 'utf8'), /private/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('wildcard wake dispatcher tolerates the notify hook passing no argv', () => {

@@ -82,6 +82,10 @@ test('topology view distinguishes peer identities from detailed live sessions', 
     sessions: {
       CODEX1: { host: 'Mac', source: 'codex', cwd: '/repo', pid: 42 },
       CC1: { host: 'Mac', source: 'claude-code' }
+    },
+    registeredSessions: {
+      CC1: { cwd: '/live' },
+      AGY: { cwd: '/birds', ended: '2026-08-17T18:18:17.173Z' }
     }
   }).join('\n');
   assert.match(lines, /Connected agent peers: 2/);
@@ -89,6 +93,9 @@ test('topology view distinguishes peer identities from detailed live sessions', 
   assert.match(lines, /Background message watchers: 1/);
   assert.match(lines, /CC1 — Mac • claude-code/);
   assert.match(lines, /CODEX1 — Mac • codex • \/repo • pid 42 • owner credential not confirmed/);
+  assert.match(lines, /Registered idle sessions/);
+  assert.match(lines, /AGY — \/birds • bridge ended/);
+  assert.doesNotMatch(lines, /CC1 — \/live/);
 });
 
 test('credential repair requires one exact named identity', async () => {

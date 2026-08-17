@@ -52,4 +52,29 @@ function projectGrokEvent(event) {
   return projected;
 }
 
-module.exports = { projectCodexEvent, projectGrokEvent };
+function projectAgyEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+  if (event.event === 'result') {
+    return event.result && event.result.status === 'SUCCESS' ? 'finishing' : 'error';
+  }
+  if (event.event !== 'step_update' || !event.step_update) return null;
+  const step = event.step_update;
+  if (step.state !== 'ACTIVE') {
+    if (step.state === 'DONE' && step.step_type === 'agent_response') return 'preparing_response';
+    return null;
+  }
+  if (step.step_type === 'unknown') return 'analyzing';
+  if (step.step_type !== 'tool') return null;
+  const name = String(step.tool_name || '').toLowerCase();
+  const params = step.tool_info && step.tool_info.parameters;
+  const mcpTool = params && String(params.ToolName || params.toolName || '').toLowerCase();
+  if (mcpTool.includes('relay_receive')) return 'reading_message';
+  if (mcpTool.includes('relay_send')) return 'sending_reply';
+  if (name.includes('run_command') || name.includes('command')) return 'running_command';
+  if (name.includes('write') || name.includes('replace') || name.includes('notebook_edit')) {
+    return 'updating_files';
+  }
+  return 'using_tool';
+}
+
+module.exports = { projectCodexEvent, projectGrokEvent, projectAgyEvent };
