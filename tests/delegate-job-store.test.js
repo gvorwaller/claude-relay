@@ -256,6 +256,36 @@ test('activity accepts only allowlisted categories and suppresses duplicates', t
   assert.equal(store.get(job.jobId).activity[0].type, 'running_command');
 });
 
+test('attempted reply without server-attested outbound cannot complete successfully', t => {
+  const { store } = makeStore(t);
+  const job = store.create({ owner: 'CODEX1', inboundMessageId: 'm1', from: 'CC1' });
+  store.transition(job.jobId, 'running');
+  store.recordActivity(job.jobId, { type: 'sending_reply' });
+
+  const ended = store.transition(job.jobId, 'completed', { exitCode: 0 });
+  assert.equal(ended.status, 'failed');
+  assert.equal(ended.deliveryAttestationFailed, true);
+  assert.match(ended.reason, /observed no outbound message/);
+
+  const successful = store.create({ owner: 'CODEX2', inboundMessageId: 'm2', from: 'CC2' });
+  store.transition(successful.jobId, 'running');
+  store.recordActivity(successful.jobId, { type: 'sending_reply' });
+  store.recordOutbound(successful.jobId, { to: 'CC2', messageId: 'out-1', delivered: false });
+  assert.equal(store.transition(successful.jobId, 'completed').status, 'completed');
+
+  const explicitlyAttempted = store.create({ owner: 'CODEX3', inboundMessageId: 'm3', from: 'CC3' });
+  store.transition(explicitlyAttempted.jobId, 'running');
+  store.attachResult(explicitlyAttempted.jobId, {
+    summary: 'The delegate claims it called relay_send.',
+    changes: 'None',
+    verification: [],
+    replyAttempted: true
+  });
+  const explicitlyEnded = store.transition(explicitlyAttempted.jobId, 'completed');
+  assert.equal(explicitlyEnded.status, 'failed');
+  assert.equal(explicitlyEnded.deliveryAttestationFailed, true);
+});
+
 test('invalid or misnamed records are quarantined, not silently dropped', t => {
   const { store, dir } = makeStore(t);
   const job = store.create({ owner: 'CODEX3', inboundMessageId: 'q1', from: 'CC6' });

@@ -40,9 +40,13 @@ test('rotation invalidates the old secret and every derived job capability', t =
   assert.equal(caps.ownerGeneration('CODEX9'), 2);
 });
 
-test('job capability is single-use, owner-bound, and expiring', t => {
+test('job capability is job-lease reusable, owner-bound, revocable, and expiring', t => {
   let clock = 1_000_000;
-  const { store: caps } = store(t, { now: () => clock, jobTtlMs: 1000 });
+  const { store: caps } = store(t, {
+    now: () => clock,
+    jobTtlMs: 1000,
+    jobSessionMaxMs: 10_000
+  });
   caps.mintOwner('CODEX9');
 
   const job = caps.mintJob({ owner: 'CODEX9', messageId: 'm7' });
@@ -51,9 +55,13 @@ test('job capability is single-use, owner-bound, and expiring', t => {
   assert.equal(caps.authorizeJob(job.token, 'CODEX9').ok, true, 'survives a wrong-owner attempt');
 
   const fresh = caps.mintJob({ owner: 'CODEX9', messageId: 'm8' });
-  const consumed = caps.authorizeJob(fresh.token, 'CODEX9').job || null;
-  assert.equal(consumed.messageId, 'm8');
-  assert.equal(caps.authorizeJob(fresh.token, 'CODEX9').job || null, null, 'single use');
+  const activated = caps.authorizeJob(fresh.token, 'CODEX9').job || null;
+  assert.equal(activated.messageId, 'm8');
+  clock += 5000;
+  assert.equal(caps.authorizeJob(fresh.token, 'CODEX9').ok, true,
+    'an activated job survives the shorter initial registration window');
+  caps.revokeJobByKey(fresh.key);
+  assert.equal(caps.authorizeJob(fresh.token, 'CODEX9').ok, false, 'explicit revocation ends the lease');
 
   const expiring = caps.mintJob({ owner: 'CODEX9', messageId: 'm9' });
   clock += 5000;
@@ -204,8 +212,8 @@ test('a failed authorization does not burn the capability', t => {
   assert.equal(real.ok, true);
   assert.equal(real.job.replyTo, 'CC6');
 
-  // Now it is spent.
-  assert.equal(caps.authorizeJob(token, 'CODEXB').ok, false);
+  // The same wake may start a later MCP bridge under the same lease.
+  assert.equal(caps.authorizeJob(token, 'CODEXB').ok, true);
 });
 
 test('result secrets are reusable for activity, explicitly consumed, job-bound, and expiring', t => {

@@ -28,9 +28,10 @@ function sha256(value) {
  *   has been claimed with its secret, that label stops accepting
  *   secret-less claims forever.
  *
- *   Job capability — single-use, short-lived, minted by the notify path when
- *   it spawns a wake, and bound to the spawned process tree. Proves "the
- *   relay server started me for job X on behalf of CODEX3".
+ *   Job capability — bounded to one wake job, minted by the notify path when
+ *   it spawns a wake, and bound to the spawned process tree. The same wake
+ *   may start more than one short-lived MCP bridge, so the credential remains
+ *   reusable for that job's lease and is revoked when the wake terminates.
  *
  * Only hashes are persisted. A corrupt or unreadable store fails CLOSED:
  * treating it as empty would let the next claimant re-enroll every label.
@@ -267,9 +268,11 @@ class CapabilityStore {
   }
 
   /**
-   * Single-use capability for one delegated wake. `replyTo` scopes what the
+   * Lease-scoped capability for one delegated wake. `replyTo` scopes what the
    * delegate may do; `spawnPid` is filled in after the wake process starts so
-   * registration can require the connection to come from that process tree.
+   * every registration can require the connection to come from that process
+   * tree. `expiresAt` is the initial registration window; once activated,
+   * reconnects are allowed until `sessionExpiresAt` or explicit revocation.
    */
   mintJob({ owner, messageId, replyTo, jobId }) {
     this.pruneJobs();
@@ -285,11 +288,13 @@ class CapabilityStore {
       generation: this.ownerGeneration(owner),
       expiresAt: this.now() + this.jobTtlMs,
       sessionExpiresAt: this.now() + this.jobSessionMaxMs,
-      spawnPid: null
+      spawnPid: null,
+      activatedAt: null,
+      registrations: 0
     };
     this.jobs.set(key, job);
-    // Retained by jobId so a result submission can be verified after the
-    // registration token has been spent.
+    // Retained by jobId so result submission has a separate, narrowly scoped
+    // credential from the reusable registration lease.
     this.resultSecrets.set(job.jobId, { hash: sha256(resultSecret), expiresAt: job.sessionExpiresAt });
     return { token, key, job, resultSecret };
   }
@@ -311,10 +316,10 @@ class CapabilityStore {
   }
 
   /**
-   * Authorize AND consume in one step. Every factor is checked before the
-   * token is spent: a failed attempt (wrong owner, expired, failing the
-   * caller's extra check) must not burn the capability, or an attacker could
-   * deny the real delegate simply by trying once (re-check #2).
+   * Authorize one bridge registration for the job lease. Every factor is
+   * checked on every registration. A failed attempt (wrong owner, expired,
+   * failing the caller's extra check) must not burn the capability, or an
+   * attacker could deny the real delegate simply by trying once.
    *
    * `verify` receives the job and returns true to accept.
    */
@@ -325,7 +330,8 @@ class CapabilityStore {
     const job = this.jobs.get(key);
     if (!job) return { ok: false, reason: 'unknown' };
     if (job.owner !== owner) return { ok: false, reason: 'owner-mismatch' };
-    if (job.expiresAt <= this.now()) {
+    const deadline = job.activatedAt !== null ? job.sessionExpiresAt : job.expiresAt;
+    if (deadline <= this.now()) {
       this.jobs.delete(key);
       return { ok: false, reason: 'expired' };
     }
@@ -334,7 +340,8 @@ class CapabilityStore {
       return { ok: false, reason: 'revoked' };
     }
     if (!verify(job)) return { ok: false, reason: 'verification-failed', job };
-    this.jobs.delete(key); // spent only on success
+    if (job.activatedAt === null) job.activatedAt = this.now();
+    job.registrations += 1;
     return { ok: true, job };
   }
 
@@ -368,7 +375,8 @@ class CapabilityStore {
   pruneJobs() {
     const now = this.now();
     for (const [key, job] of this.jobs) {
-      if (job.expiresAt <= now) this.jobs.delete(key);
+      const deadline = job.activatedAt !== null ? job.sessionExpiresAt : job.expiresAt;
+      if (deadline <= now) this.jobs.delete(key);
     }
   }
 }

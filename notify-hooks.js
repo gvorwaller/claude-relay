@@ -41,7 +41,7 @@ class NotifyHooks {
   constructor(options = {}) {
     this.configPath = options.configPath;
     this.logger = options.logger || { info() {}, warn() {}, error() {} };
-    // Mints the single-use job capability each delegated wake must present.
+    // Mints the lease-scoped job capability each delegated wake must present.
     this.capabilities = options.capabilities || null;
     // Durable record of every delegated wake (accountability layer).
     this.jobStore = options.jobStore || null;
@@ -273,8 +273,10 @@ class NotifyHooks {
           }
           tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
           fs.writeFileSync(tokenFile, token, { mode: 0o600 });
-          // Reaped after the consume window, matching the token's own TTL.
-          setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, this.capabilities.jobTtlMs)
+          // A single wake may launch several short-lived MCP bridges. Keep
+          // the handoff file for the bounded job lease; settle() removes it
+          // immediately when the wake process terminates.
+          setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, this.capabilities.jobSessionMaxMs)
             .unref();
         } catch (err) {
           this.logger.error('job_capability_mint_failed', { target, error: err.message });
@@ -371,20 +373,28 @@ class NotifyHooks {
           } else if (!terminal) {
             terminal = ranAsDelegate ? 'completed' : 'exited_no_delegate';
           }
-          this.jobStore.transition(jobRecord.jobId, terminal, {
+          const transitioned = this.jobStore.transition(jobRecord.jobId, terminal, {
             exitCode,
             reason: outcome.error || null
           });
-          this.notifier({ owner: target, state: terminal === 'completed' ? 'completed' : 'failed' });
+          const actualTerminal = transitioned?.status || terminal;
+          this.notifier({
+            owner: target,
+            state: actualTerminal === 'completed' ? 'completed' : 'failed'
+          });
         }
+        // The wake process is now terminal. Revoke every remaining path to
+        // job authority, including a token that was legitimately reused by
+        // multiple MCP subprocesses during the run.
+        if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+        if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
+        if (resultSecretFile) { try { fs.unlinkSync(resultSecretFile); } catch {} }
+        if (jobRecord && this.capabilities) this.capabilities.consumeResultSecret(jobRecord.jobId);
         if (!outcome.ok || outcome.terminal === 'interrupted') {
           // A wake that never really ran must leave nothing usable behind:
           // its capability is revoked and its handoff file removed, so a
           // retry mints a fresh one instead of leaving several live tokens
           // (and stale pid bindings) outstanding.
-          if (jobKey) this.capabilities.revokeJobByKey(jobKey);
-          if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
-          if (jobRecord && this.capabilities) this.capabilities.consumeResultSecret(jobRecord.jobId);
         }
         onOutcome(outcome);
       };

@@ -45,6 +45,7 @@ try {
 let summary = null;
 let changes = null;
 let verification = [];
+let replyAttempted = null;
 if (lastMessageFile) {
   try {
     const raw = fs.readFileSync(lastMessageFile, 'utf8').trim();
@@ -53,6 +54,7 @@ if (lastMessageFile) {
       summary = typeof parsed.summary === 'string' ? parsed.summary : null;
       changes = typeof parsed.changes === 'string' ? parsed.changes : null;
       verification = Array.isArray(parsed.verification) ? parsed.verification : [];
+      replyAttempted = typeof parsed.replyAttempted === 'boolean' ? parsed.replyAttempted : null;
     } catch {
       // Not structured: keep the opening of the final message as the summary
       // rather than inventing fields.
@@ -78,7 +80,8 @@ ws.on('open', () => {
     resultSecret: secret,
     summary,
     changes,
-    verification
+    verification,
+    replyAttempted
   }));
 });
 ws.on('message', data => {

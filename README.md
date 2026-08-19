@@ -203,7 +203,11 @@ registers as a *delegate*: visible as `<label>~wake-<pid>` in the peer list, it
 reads with the label's visibility and its sends arrive from the label, but it
 never owns the label — so the interactive session is never displaced, and the
 delegate's exit changes nothing. Delegate registration is only honored from the
-relay host itself, and a live delegate suppresses further exec wake hooks for
+relay host itself. Its credential is scoped to the owner, wake job, process
+tree, and one-hour lease. It may be reused by sequential MCP bridge processes
+inside that same wake (for example, one bridge receives and a later bridge
+sends), but concurrent bridges are rejected and the credential is revoked as
+soon as the wake terminates. A live delegate suppresses further exec wake hooks for
 its label (it *is* the woken instance). The job store also enforces one active
 (`spawned` or `running`) delegate per owner identity. Mail that arrives while
 that owner is busy is already durable, so repeated notifications are coalesced
@@ -214,6 +218,13 @@ override (Codex gives MCP servers only curated config env — plain shell
 exports never arrive); as a fallback, a bridge that detects a `codex exec`
 process ancestor self-selects delegate mode, so headless one-offs never seize
 a label even without the flag.
+
+Delegate result reports explicitly say whether `relay_send` was attempted.
+When a reply was attempted (or the sanitized activity stream observed one), a
+zero-exit wake is accepted as completed only if the relay server itself recorded
+the outbound message. Missing server evidence marks the run failed and keeps it
+visible for operator diagnosis. A run may still complete without a reply when
+no response was warranted.
 
 ### Watching delegated Codex work
 
@@ -412,7 +423,10 @@ session is always reachable while idle, automatically.
 message is durably stored and replayed when the target next reads. It is not an
 error, and the old `Client X not connected` error is gone. A `delivered: true`
 ack means the target's socket took the bytes; it does not mean anyone is
-paying attention.
+paying attention. The MCP tool reports success only after receiving this
+server ack. If registration is unconfirmed or the ack does not arrive within
+the bounded wait, `relay_send` returns an explicit error and must not be
+described as sent.
 
 ### Server-side notify hooks (waking non-Claude harnesses)
 
@@ -446,6 +460,11 @@ the hook schedules one trailing check rather than launching another process.
 That check keeps deferring while the owner is busy and launches one successor
 after the active job ends, allowing it to process all durable mail accumulated
 during the earlier run.
+
+A delegate run that records a `relay_send` attempt but has no server-attested
+outbound message is marked failed even if the delegate process exits cleanly
+or its narrative claims delivery. The durable message journal and job
+`outbound` array are authoritative; delegate prose is not.
 
 Edits to `notify.json` are picked up without a restart. Hook failures are
 logged and never affect message handling. The config is deliberately not a

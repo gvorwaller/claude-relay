@@ -416,11 +416,10 @@ wss.on('connection', (ws, req) => {
             // Loopback is necessary but NOT sufficient (review finding #3):
             // any local process could otherwise impersonate a label, read its
             // mail, and suppress its wakes. A delegate must present the
-            // single-use capability the notify path minted when it spawned
-            // the wake.
-            // Authorize-and-consume atomically: a failed attempt must NOT
-            // spend the capability, or a thief could deny the real delegate
-            // by trying once (re-check #2). Every factor is checked first.
+            // lease-scoped capability the notify path minted when it spawned
+            // the wake. A wake may launch several short-lived MCP bridges,
+            // so every registration revalidates the owner, lease, and process
+            // tree instead of consuming the credential once.
             // OBSERVED, not asserted: ask the kernel which process owns this
             // socket. A same-user thief who reads the bearer file cannot
             // fake this — it would have to actually be inside the wake's
@@ -429,8 +428,9 @@ wss.on('connection', (ws, req) => {
             // must cost nothing (re-check #2).
             if (!capabilities.hasJob(msg.jobToken)) {
               ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Delegate registration requires a valid, unexpired job capability'
+                type: 'register_rejected',
+                clientId: delegateBase,
+                reason: 'Delegate registration requires a valid, unexpired job capability'
               }));
               logger.warn('delegate_capability_rejected', {
                 delegateOf: delegateBase,
@@ -442,7 +442,7 @@ wss.on('connection', (ws, req) => {
             const observedPid = BIND_DELEGATE_ANCESTRY
               ? await peerPidForPort(req.socket.remotePort)
               : null;
-            // The token could have been consumed or revoked while we looked.
+            // The token could have expired or been revoked while we looked.
             if (ws.readyState !== 1 || clientId) return;
             const authorized = capabilities.authorizeJob(msg.jobToken, delegateBase, jobRecord => {
               if (!BIND_DELEGATE_ANCESTRY) return true;
@@ -454,8 +454,9 @@ wss.on('connection', (ws, req) => {
             });
             if (!authorized.ok) {
               ws.send(JSON.stringify({
-                type: 'error',
-                message: authorized.reason === 'verification-failed'
+                type: 'register_rejected',
+                clientId: delegateBase,
+                reason: authorized.reason === 'verification-failed'
                   ? 'Delegate registration must come from the spawned wake process tree'
                   : 'Delegate registration requires a valid, unexpired job capability'
               }));
@@ -468,6 +469,24 @@ wss.on('connection', (ws, req) => {
               return;
             }
             const job = authorized.job;
+            const existingJobSocket = Array.from(clients.values()).find(peer =>
+              peer !== ws
+              && peer.readyState === 1
+              && peer.delegateJob?.jobId
+              && peer.delegateJob.jobId === job.jobId);
+            if (existingJobSocket) {
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                clientId: delegateBase,
+                reason: 'This delegate job already has a live MCP bridge; close it before reconnecting'
+              }));
+              logger.warn('delegate_duplicate_bridge_rejected', {
+                delegateOf: delegateBase,
+                jobId: job.jobId,
+                existingDelegateId: existingJobSocket.clientId || null
+              });
+              return;
+            }
             // Suffix is a server-generated nonce: no client-supplied text
             // (previously meta.pid) may appear in a minted identity.
             const delegateId = `${delegateBase}~wake-${randomUUID().slice(0, 8)}`;
@@ -484,8 +503,9 @@ wss.on('connection', (ws, req) => {
                 // exited). Accepting it would let a terminal receipt acquire
                 // new sends afterwards (re-check #2).
                 ws.send(JSON.stringify({
-                  type: 'error',
-                  message: 'This delegate job has already ended; registration refused'
+                  type: 'register_rejected',
+                  clientId: delegateBase,
+                  reason: 'This delegate job has already ended; registration refused'
                 }));
                 logger.warn('delegate_rejected_job_not_startable', {
                   delegateOf: delegateBase,
@@ -500,7 +520,7 @@ wss.on('connection', (ws, req) => {
                 return;
               }
             }
-            // Bounded lease: a consumed token must not grant an indefinite
+            // Bounded lease: a reusable job token must not grant an indefinite
             // session. The socket is closed when the job's session window
             // ends, whatever the delegate is doing.
             ws.delegateLease = setTimeout(() => {
@@ -965,7 +985,8 @@ wss.on('connection', (ws, req) => {
             changes: clamp(msg.changes, 2000),
             verification: Array.isArray(msg.verification)
               ? msg.verification.filter(v => typeof v === 'string').slice(0, 20).map(v => v.slice(0, 500))
-              : []
+              : [],
+            replyAttempted: typeof msg.replyAttempted === 'boolean' ? msg.replyAttempted : null
           };
           const job = jobStore.get(jobId);
           if (!job) {

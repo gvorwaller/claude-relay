@@ -382,6 +382,43 @@ function spawnBridge(t, root, port, projDir, extraEnv = {}) {
   return mcp;
 }
 
+function spawnMcpHarness(t, root, port, extraEnv = {}) {
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    `--relay-url=ws://127.0.0.1:${port}`], {
+    env: {
+      ...process.env,
+      HOME: root,
+      CLAUDE_RELAY_SESSION_ID: '',
+      RELAY_CLIENT_ID: '',
+      ...extraEnv
+    },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  let buffer = '';
+  const waiters = [];
+  mcp.stdout.setEncoding('utf8');
+  mcp.stdout.on('data', chunk => {
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const value = JSON.parse(line);
+      const waiter = waiters.find(entry => entry.predicate(value));
+      if (!waiter) continue;
+      waiters.splice(waiters.indexOf(waiter), 1);
+      waiter.resolve(value);
+    }
+  });
+  return {
+    mcp,
+    next: predicate => new Promise(resolve => waiters.push({ predicate, resolve })),
+    send: value => mcp.stdin.write(`${JSON.stringify(value)}\n`)
+  };
+}
+
 test('restart auto-reclaims a registry label whose recorded pid is dead', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
@@ -525,6 +562,81 @@ test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate'
   }
 });
 
+test('one wake can receive in one MCP subprocess and send from a later subprocess', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reconnect-')));
+  const { configPath, outDir } = notifyConfigForTokens(root);
+  const port = startServer(t, root, {
+    RELAY_NOTIFY_CONFIG: configPath,
+    RELAY_BIND_DELEGATE_ANCESTRY: '0'
+  });
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const token = await mintJobToken(t, outDir, observer, 'CODEXR');
+  const tokenFile = path.join(root, 'codexr.token');
+  fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+
+  const firstJoined = waitForMessage(observer, message =>
+    message.type === 'peer_joined' && /^CODEXR~wake-/.test(message.clientId), 10000);
+  const first = spawnMcpHarness(t, root, port, {
+    RELAY_DELEGATE_FOR: 'CODEXR',
+    RELAY_JOB_TOKEN_FILE: tokenFile
+  });
+  const initialized = first.next(message => message.id === 1);
+  first.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await initialized;
+  const firstDelegateId = (await firstJoined).clientId;
+
+  const history = first.next(message => message.id === 2);
+  first.send({
+    jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'relay_receive', arguments: { count: 10 } }
+  });
+  assert.match((await history).result.content[0].text, /wake trigger/);
+  assert.equal(fs.existsSync(tokenFile), true, 'first bridge must leave the job handoff for reconnect');
+
+  const duplicate = await open(port);
+  t.after(() => duplicate.close());
+  const duplicateRejected = waitForMessage(duplicate, message =>
+    message.type === 'register_rejected' && /already has a live MCP bridge/.test(message.reason));
+  duplicate.send(JSON.stringify({
+    type: 'register', clientId: 'CODEXR', delegate: true, jobToken: token, meta: { pid: process.pid }
+  }));
+  await duplicateRejected;
+
+  const firstLeft = waitForMessage(observer, message =>
+    message.type === 'peer_left' && message.clientId === firstDelegateId, 10000);
+  first.mcp.kill('SIGTERM');
+  await firstLeft;
+
+  const secondJoined = waitForMessage(observer, message =>
+    message.type === 'peer_joined' && /^CODEXR~wake-/.test(message.clientId), 10000);
+  const second = spawnMcpHarness(t, root, port, {
+    RELAY_DELEGATE_FOR: 'CODEXR',
+    RELAY_JOB_TOKEN_FILE: tokenFile
+  });
+  const secondInitialized = second.next(message => message.id === 3);
+  second.send({ jsonrpc: '2.0', id: 3, method: 'initialize', params: {} });
+  await secondInitialized;
+  await secondJoined;
+
+  const delivered = nextMessage(observer, 'message');
+  const sendResult = second.next(message => message.id === 4);
+  second.send({
+    jsonrpc: '2.0', id: 4, method: 'tools/call',
+    params: { name: 'relay_send', arguments: { to: 'A', message: 'reply after MCP restart' } }
+  });
+  assert.match((await sendResult).result.content[0].text, /Sent to A/);
+  assert.equal((await delivered).content, 'reply after MCP restart');
+
+  const records = fs.readdirSync(path.join(root, 'jobs'))
+    .filter(file => file.endsWith('.json'))
+    .map(file => JSON.parse(fs.readFileSync(path.join(root, 'jobs', file), 'utf8')));
+  const job = records.find(record => record.owner === 'CODEXR');
+  assert.deepEqual(job.outbound.map(entry => entry.to), ['A'],
+    'the server, not delegate prose, attests the reconnect send');
+});
+
 test('identity mode cannot be switched on a live socket (primary<->delegate)', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);
@@ -659,7 +771,7 @@ test('delegate registration requires a valid job capability', async t => {
   const rogue = await open(port);
   t.after(() => rogue.close());
   const refused = waitForMessage(rogue, msg =>
-    msg.type === 'error' && /valid, unexpired job capability/.test(msg.message));
+    msg.type === 'register_rejected' && /valid, unexpired job capability/.test(msg.reason));
   rogue.send(JSON.stringify({ type: 'register', clientId: 'CAPBASE', delegate: true, meta: { pid: 1 } }));
   await refused;
 
@@ -667,7 +779,7 @@ test('delegate registration requires a valid job capability', async t => {
   const rogue2 = await open(port);
   t.after(() => rogue2.close());
   const refused2 = waitForMessage(rogue2, msg =>
-    msg.type === 'error' && /valid, unexpired job capability/.test(msg.message));
+    msg.type === 'register_rejected' && /valid, unexpired job capability/.test(msg.reason));
   rogue2.send(JSON.stringify({
     type: 'register', clientId: 'CAPBASE', delegate: true, jobToken: 'fabricated', meta: { pid: 1 }
   }));
@@ -823,7 +935,7 @@ test('a stolen job token is useless outside the spawned wake process tree', asyn
   const thief = await open(port);
   t.after(() => thief.close());
   const refused = waitForMessage(thief, msg =>
-    msg.type === 'error' && /spawned wake process tree/.test(msg.message), 8000);
+    msg.type === 'register_rejected' && /spawned wake process tree/.test(msg.reason), 8000);
   // The thief does NOT report its honest pid — it quotes a pid it knows is
   // inside the wake's process tree (this is the attack the previous version
   // missed, because it validated the ASSERTED pid). The server ignores the
@@ -842,7 +954,7 @@ test('a stolen job token is useless outside the spawned wake process tree', asyn
   const legit = await open(port);
   t.after(() => legit.close());
   const stillValid = waitForMessage(legit, msg =>
-    msg.type === 'error' && /spawned wake process tree/.test(msg.message), 8000);
+    msg.type === 'register_rejected' && /spawned wake process tree/.test(msg.reason), 8000);
   legit.send(JSON.stringify({
     type: 'register', clientId: 'ANCBASE', delegate: true, jobToken: stolen, meta: { pid: process.pid }
   }));

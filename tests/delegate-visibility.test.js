@@ -59,7 +59,7 @@ test('every live Codex wake uses a fresh same-cwd delegate', () => {
   const schema = JSON.parse(fs.readFileSync(
     path.join(__dirname, '..', 'scripts', 'delegate-result-schema.json'), 'utf8'
   ));
-  assert.deepEqual(schema.required, ['summary', 'changes', 'verification']);
+  assert.deepEqual(schema.required, ['summary', 'changes', 'verification', 'replyAttempted']);
 });
 
 test('Grok activity projection is sanitized and classifies relay tools', () => {

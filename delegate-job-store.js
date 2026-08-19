@@ -163,6 +163,9 @@ class DelegateJobStore {
       summary: null,
       changes: null,
       verification: [],
+      // Delegate-authored claim, cross-checked against server `outbound` at
+      // completion. Activity provides an independent attempted-send signal.
+      replyAttempted: null,
       // Sanitized, allowlisted progress only. Raw Codex JSON, reasoning,
       // commands, arguments, output, paths, and message text never enter the
       // durable record read by relay-monitor.
@@ -185,6 +188,24 @@ class DelegateJobStore {
   transition(jobId, status, patch = {}) {
     const job = this.jobs.get(jobId);
     if (!job) return null;
+    // Delegate activity says relay_send was attempted, while `outbound` is
+    // populated only by the relay server after durable append. Never let a
+    // clean process exit turn that contradiction into a successful job.
+    if (status === 'completed'
+      && (job.replyAttempted === true
+        || job.activity.some(entry => entry.type === 'sending_reply'))
+      && job.outbound.length === 0) {
+      status = 'failed';
+      patch = {
+        ...patch,
+        deliveryAttestationFailed: true,
+        reason: patch.reason || 'Delegate attempted a relay reply, but the relay server observed no outbound message.'
+      };
+      this.logger.warn('job_completion_refused_missing_outbound', {
+        jobId,
+        owner: job.owner
+      });
+    }
     if (job.status === status) {
       // Idempotent, but never rewritable: a replayed ack must not overwrite
       // the turn that actually reported it (re-check #10).
@@ -253,7 +274,7 @@ class DelegateJobStore {
    * which is the server's evidence. Refused once the job is reported, so a
    * receipt cannot change after the human was told about it.
    */
-  attachResult(jobId, { summary, changes, verification }) {
+  attachResult(jobId, { summary, changes, verification, replyAttempted }) {
     const job = this.jobs.get(jobId);
     if (!job) return null;
     if (job.status === 'reported') {
@@ -263,6 +284,7 @@ class DelegateJobStore {
     job.summary = summary || job.summary;
     job.changes = changes || job.changes;
     if (Array.isArray(verification) && verification.length) job.verification = verification;
+    if (typeof replyAttempted === 'boolean') job.replyAttempted = replyAttempted;
     job.resultSubmittedAt = new Date(this.now()).toISOString();
     this.persist(job);
     return job;

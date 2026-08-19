@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "changes", "verification"],
+  "required": ["summary", "changes", "verification", "replyAttempted"],
   "properties": {
     "summary": {
       "type": "string",
@@ -17,6 +17,10 @@
       "maxItems": 20,
       "items": { "type": "string" },
       "description": "Checks performed and their outcomes."
+    },
+    "replyAttempted": {
+      "type": "boolean",
+      "description": "True if this run called relay_send, regardless of whether the tool reported success."
     }
   }
 }

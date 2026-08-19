@@ -556,6 +556,9 @@ function renderLocalSessions(note) {
 // State
 let ws = null;
 let connected = false;
+// Raw WebSocket open is not authority to use relay tools. The bridge becomes
+// usable only after the relay server acknowledges registration.
+let registered = false;
 // Set when the server tells us a newer connection re-registered our ID
 // (newest-wins takeover). A displaced client must NOT auto-reconnect under
 // the same ID — that guarantees an eternal 5-second takeover ping-pong with
@@ -867,23 +870,24 @@ function handleMcpMessage(message) {
 function handleToolCall(requestId, toolName, args) {
   switch (toolName) {
     case 'relay_send':
-      if (!connected) {
+      if (!connected || !registered) {
         sendMcpResponse({
           jsonrpc: '2.0',
           id: requestId,
           result: {
             content: [{
               type: 'text',
-              text: `Error: Not connected to relay server at ${RELAY_URL}. Is the server running?`
+              text: connected
+                ? 'Error: Relay transport is open, but this session is not registered. No message was sent.'
+                : `Error: Not connected to relay server at ${RELAY_URL}. Is the server running?`
             }]
           }
         });
         return;
       }
 
-      // Respond from the server's ack so the sender learns the truth:
-      // delivered live vs queued for an offline peer. The fallback timer keeps
-      // the tool call from hanging if the ack never arrives (old server).
+      // Respond only from the server's authoritative ack. A timeout is an
+      // explicit unconfirmed failure, never synthetic success.
       const preview = `"${args.message.substring(0, 100)}${args.message.length > 100 ? '...' : ''}"`;
       const sendAck = {
         requestId,
@@ -893,7 +897,9 @@ function handleToolCall(requestId, toolName, args) {
       };
       sendAck.timer = setTimeout(() => {
         pendingMessages = pendingMessages.filter(p => p !== sendAck);
-        sendToolText(requestId, `Message sent to ${sendAck.to === 'all' ? 'all peers' : sendAck.to}: ${preview}`);
+        sendToolText(requestId,
+          `Error: relay server did not acknowledge the send to ${sendAck.to === 'all' ? 'all peers' : sendAck.to}. `
+          + `Delivery is unconfirmed and must not be reported as sent: ${preview}`);
       }, 3000);
       pendingMessages.push(sendAck);
 
@@ -1102,8 +1108,10 @@ function handleToolCall(requestId, toolName, args) {
         result: {
           content: [{
             type: 'text',
-            text: connected
+            text: connected && registered
               ? `Connected to ${RELAY_URL} as "${CLIENT_ID}"${DELEGATE_FOR ? ` (delegate of ${DELEGATE_FOR}: reads and sends its mail, does not own the label)` : ''}. Peers online: ${peers.length > 0 ? peers.filter(p => p !== CLIENT_ID).join(', ') || 'none' : 'checking...'}`
+              : connected
+                ? `Transport connected to ${RELAY_URL}, but registration as "${CLIENT_ID}" is not confirmed. Relay tools are not authorized yet.`
               : rejectedReason
                 ? `REJECTED: ${rejectedReason} This session is NOT auto-reconnecting (the owner would refuse it again). Call relay_rename with a different ID, or stop the owning process and relay_rename back to "${CLIENT_ID}".`
                 : displaced
@@ -1362,15 +1370,14 @@ function writeOwnerSecret(label, secret) {
   }
 }
 
-// The wake hook hands the single-use job capability over in a 0600 file
-// rather than an env value, so it never appears in `ps` output.
+// The wake hook hands the lease-scoped job capability over in a 0600 file
+// rather than an env value, so it never appears in `ps` output. Do not unlink
+// it here: one wake may launch several short-lived MCP bridge subprocesses.
 function readJobToken() {
   const file = process.env.RELAY_JOB_TOKEN_FILE;
   if (!file) return null;
   try {
-    const token = fs.readFileSync(file, 'utf8').trim();
-    try { fs.unlinkSync(file); } catch { /* best effort */ }
-    return token || null;
+    return fs.readFileSync(file, 'utf8').trim() || null;
   } catch {
     return null;
   }
@@ -1427,6 +1434,7 @@ function connectToRelay() {
       return;
     }
     connected = true;
+    registered = false;
     // Register with relay, reporting metadata so peers on other machines can see
     // this session in the cluster-wide list (get_sessions), not just locally.
     // The local registry is written only once the server CONFIRMS the
@@ -1469,6 +1477,7 @@ function connectToRelay() {
         }
 
         case 'registered':
+          registered = true;
           peers = msg.peers || [];
           // A newly enrolled label's owner capability arrives exactly once —
           // persist it durably BEFORE anything else claims the identity is
@@ -1563,6 +1572,7 @@ function connectToRelay() {
           // the close is still in flight), then close and stay down (the
           // close handler sees rejectedReason and will not retry).
           connected = false;
+          registered = false;
           ws.close();
           break;
 
@@ -1783,6 +1793,14 @@ function connectToRelay() {
             }));
             break;
           }
+          const failedSend = pendingMessages.find(p => p.type === 'send_ack');
+          if (failedSend) {
+            pendingMessages = pendingMessages.filter(p => p !== failedSend);
+            clearTimeout(failedSend.timer);
+            sendToolText(failedSend.requestId,
+              `Error: relay server rejected the send to ${failedSend.to}: ${msg.message || 'unknown server error'}. `
+              + 'No delivery was confirmed.');
+          }
           const pendingPurge = pendingMessages.find(p => [
             'purge_history', 'preview_delegate_jobs', 'purge_delegate_jobs'
           ].includes(p.type));
@@ -1804,6 +1822,7 @@ function connectToRelay() {
   ws.on('close', () => {
     if (generation !== socketGeneration) return; // superseded socket: no-op
     connected = false;
+    registered = false;
     peers = [];
     if (pendingRename) {
       // The socket died before the server could confirm or reject: nothing
@@ -1820,18 +1839,6 @@ function connectToRelay() {
     // Attempt reconnect after delay — unless displaced (reconnecting under a
     // taken-over ID just re-seizes it and starts an endless takeover fight)
     // or rejected (the label's live owner would refuse us again forever).
-    if (DELEGATE_FOR && !shuttingDown) {
-      // Its job capability was consumed at registration and cannot be reused,
-      // so reconnecting would produce a connected-but-unregistered zombie
-      // whose relay_receive never resolves. End the delegate instead.
-      console.error(JSON.stringify({
-        timestamp: new Date().toISOString(),
-        event: 'delegate_socket_closed',
-        clientId: CLIENT_ID,
-        action: 'exiting; a delegate job capability is single-use'
-      }));
-      process.exit(0);
-    }
     if (!shuttingDown && !displaced && !rejectedReason) {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
