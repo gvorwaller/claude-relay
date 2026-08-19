@@ -267,6 +267,15 @@ function topologyLines(topology) {
     if (meta.source) details.push(String(meta.source));
     if (meta.cwd) details.push(String(meta.cwd));
     if (meta.pid) details.push(`pid ${meta.pid}`);
+    if (meta.attention?.state === 'relay-wait') {
+      const sender = meta.attention.from
+        ? `from ${meta.attention.from}`
+        : '(any sender)';
+      const since = meta.attention.startedAt && !Number.isNaN(Date.parse(meta.attention.startedAt))
+        ? ` since ${formatClock(meta.attention.startedAt)}`
+        : '';
+      details.push(`waiting for relay mail ${sender}${since}`);
+    }
     if (pending.has(identity)) details.push('owner credential not confirmed');
     lines.push(`  ${identity}${details.length ? ` — ${details.join(' • ')}` : ''}`);
   }

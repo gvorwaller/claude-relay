@@ -8,6 +8,12 @@ that would create two writers for one interactive session. Instead,
 `wake-peer.sh` routes `AGY*` identities to `wake-agy.sh`, which starts one
 noninteractive `agy -p` worker in the registered working directory.
 
+Named AGY role mailboxes may use labels such as `AGY-planner`. When that role
+does not have its own live registry entry, the wake resolves project context
+from the exact foreground prefix (`AGY` for `AGY-planner`) while preserving
+`AGY-planner` as the delegate owner and mailbox. An exact role registry entry
+still wins. The runner never guesses among other AGY identities.
+
 ## MCP configuration
 
 AGY 1.1.13 reads global MCP servers from

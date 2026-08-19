@@ -908,7 +908,8 @@ wss.on('connection', (ws, req) => {
           ws.attentionWait = {
             waitId: String(msg.waitId || ''),
             from: msg.from || null,
-            after: typeof msg.after === 'string' && msg.after ? msg.after : null
+            after: typeof msg.after === 'string' && msg.after ? msg.after : null,
+            startedAt: new Date().toISOString()
           };
           ws.send(JSON.stringify({ type: 'attention_waiting', waitId: ws.attentionWait.waitId }));
           logger.info('attention_wait_started', { clientId, from: ws.attentionWait.from });
@@ -1520,7 +1521,19 @@ wss.on('connection', (ws, req) => {
           // peer can render the whole cluster (not just its local registry.json).
           const sessions = {};
           for (const id of clients.keys()) {
-            sessions[id] = clientMeta.get(id) || {};
+            const peer = clients.get(id);
+            const meta = { ...(clientMeta.get(id) || {}) };
+            if (peer?.attentionWait) {
+              // Expose only the operator-useful state. The wait ID and durable
+              // cursor are internal coordination details and must not leak
+              // through session enumeration.
+              meta.attention = {
+                state: 'relay-wait',
+                from: peer.attentionWait.from || null,
+                startedAt: peer.attentionWait.startedAt || null
+              };
+            }
+            sessions[id] = meta;
           }
           ws.send(JSON.stringify({
             type: 'sessions',

@@ -7,6 +7,7 @@ data/
 
 # Local session data (scripts in sessions/ are tracked; runtime data is not)
 sessions/registry.json
+sessions/read-cursors.json
 sessions/backups/
 .todos/
 .sidecar/

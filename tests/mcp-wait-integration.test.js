@@ -172,11 +172,22 @@ test('foreground relay_wait claims one message and suppresses duplicate watcher 
   // The history response proves the server accepted the attention claim and
   // the MCP bridge moved into its waiting state before the message is sent.
   await new Promise(resolve => setTimeout(resolve, 100));
+  const waitingSessions = wsMessage(peer, msg => msg.type === 'sessions');
+  peer.send(JSON.stringify({ type: 'get_sessions' }));
+  const waitingMeta = (await waitingSessions).sessions.CLAIMED.attention;
+  assert.equal(waitingMeta.state, 'relay-wait');
+  assert.equal(waitingMeta.from, 'SENDER');
+  assert.ok(!Number.isNaN(Date.parse(waitingMeta.startedAt)));
+  assert.equal(Object.hasOwn(waitingMeta, 'waitId'), false);
+  assert.equal(Object.hasOwn(waitingMeta, 'after'), false);
   const claimed = wsMessage(watcher, msg => msg.type === 'message_claimed');
   peer.send(JSON.stringify({ type: 'message', to: 'CLAIMED', content: 'only once' }));
   const response = await next(msg => msg.id === 2);
   assert.match(response.result.content[0].text, /SENDER: only once/);
   assert.equal((await claimed).for, 'CLAIMED');
+  const completedSessions = wsMessage(peer, msg => msg.type === 'sessions');
+  peer.send(JSON.stringify({ type: 'get_sessions' }));
+  assert.equal((await completedSessions).sessions.CLAIMED.attention, undefined);
   await new Promise(resolve => setTimeout(resolve, 250));
   assert.equal(fs.existsSync(marker), false, 'exec wake was suppressed');
 });

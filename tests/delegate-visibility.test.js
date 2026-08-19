@@ -122,6 +122,45 @@ test('AGY wake is a fresh same-cwd delegate and never resumes foreground session
   assert.doesNotMatch(source, /--continue|--conversation/);
 });
 
+test('AGY named roles inherit only their exact foreground AGY cwd', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-agy-role-cwd-'));
+  try {
+    const exactRoleDir = path.join(root, 'exact-role');
+    const foregroundDir = path.join(root, 'foreground');
+    fs.mkdirSync(exactRoleDir);
+    fs.mkdirSync(foregroundDir);
+    const registry = path.join(root, 'registry.json');
+    const wake = path.join(__dirname, '..', 'scripts', 'wake-agy.sh');
+
+    fs.writeFileSync(registry, JSON.stringify({
+      AGY: { cwd: foregroundDir },
+      'AGY-planner': { cwd: exactRoleDir }
+    }));
+    let result = spawnSync(wake, ['--dry-run', 'AGY-planner'], {
+      encoding: 'utf8', env: { ...process.env, RELAY_REGISTRY: registry }
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`in ${exactRoleDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stdout, /cwd from AGY-planner/);
+
+    fs.writeFileSync(registry, JSON.stringify({ AGY: { cwd: foregroundDir } }));
+    result = spawnSync(wake, ['--dry-run', 'AGY-planner'], {
+      encoding: 'utf8', env: { ...process.env, RELAY_REGISTRY: registry }
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`in ${foregroundDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stdout, /cwd from AGY/);
+
+    result = spawnSync(wake, ['--dry-run', 'AGY2-planner'], {
+      encoding: 'utf8', env: { ...process.env, RELAY_REGISTRY: registry }
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr + result.stdout, /no usable registered cwd for AGY2-planner/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('AGY runner captures only the terminal response for the operator report', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-agy-runner-'));
   try {

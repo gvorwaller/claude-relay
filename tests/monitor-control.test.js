@@ -80,7 +80,10 @@ test('topology view distinguishes peer identities from detailed live sessions', 
     peers: ['CC1', 'CODEX1', 'CC1-watch-12345-deadbeef'],
     pendingOwnerLabels: ['CODEX1'],
     sessions: {
-      CODEX1: { host: 'Mac', source: 'codex', cwd: '/repo', pid: 42 },
+      CODEX1: {
+        host: 'Mac', source: 'codex', cwd: '/repo', pid: 42,
+        attention: { state: 'relay-wait', from: 'CC1', startedAt: '2026-08-17T21:17:51.000Z' }
+      },
       CC1: { host: 'Mac', source: 'claude-code' }
     },
     registeredSessions: {
@@ -92,7 +95,7 @@ test('topology view distinguishes peer identities from detailed live sessions', 
   assert.match(lines, /CC1, CODEX1/);
   assert.match(lines, /Background message watchers: 1/);
   assert.match(lines, /CC1 — Mac • claude-code/);
-  assert.match(lines, /CODEX1 — Mac • codex • \/repo • pid 42 • owner credential not confirmed/);
+  assert.match(lines, /CODEX1 — Mac • codex • \/repo • pid 42 • waiting for relay mail from CC1 since .* • owner credential not confirmed/);
   assert.match(lines, /Registered idle sessions/);
   assert.match(lines, /AGY — \/birds • bridge ended/);
   assert.doesNotMatch(lines, /CC1 — \/live/);

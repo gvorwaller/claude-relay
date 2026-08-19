@@ -301,6 +301,8 @@ interactive use.
 
 **Background forks don't inherit identity.** Forked or background Claude sessions (`--fork-session` subagents, `--bg-pty-host` daemon resumes, scheduled runs) inherit `CLAUDE_RELAY_SESSION_ID`/`RELAY_CLIENT_ID` from the original session's environment. The MCP client detects that ancestry (or an explicit `RELAY_BACKGROUND_FORK=1`) and registers as `<ID>-bg<pid36>` instead of seizing the live session's identity. An explicit `--client-id` argument still wins — that's a deliberate choice by the spawner.
 
+**Claude Code `/mcp reconnect` keeps the foreground identity.** Current Claude Code versions may launch the replacement MCP bridge from a background host whose inherited relay environment belongs to another session. When the replacement carries Claude's bridge-session token, the relay resolves the current transcript back to its original transcript session, matches that lineage to exactly one live foreground registry entry in the same project, retires only that proven predecessor bridge, and reclaims its canonical label. Ambiguous or ordinary background work fails closed and retains a derived `-bg...` identity.
+
 ---
 
 ## MCP Tools
@@ -346,8 +348,13 @@ Use relay_receive to see if there are any messages from peers
 ```
 
 `relay_receive` accepts optional `from`, `to`, and `after` filters. `after` may
-be a returned message cursor or an ISO timestamp. Direct-message history is
-visible only to its sender and recipient; broadcasts are visible to all peers.
+be a returned message cursor or an ISO timestamp. An unfiltered mailbox read
+automatically resumes from a private per-identity cursor, including after an
+MCP reconnect, so old mail is not silently replayed. Pass `replay=true` only
+when you deliberately want to ignore that saved cursor and resynchronize from
+recent history. Filtered/audit reads do not move the mailbox cursor.
+Direct-message history is visible only to its sender and recipient; broadcasts
+are visible to all peers.
 
 **Coordinate continuously with a peer:**
 ```
@@ -360,6 +367,11 @@ cursor (message UUID or ISO timestamp), and `timeoutSeconds` from 1 through 300
 existing WebSocket push path without polling the relay server. A returned
 message includes its UUID cursor; pass that cursor as `after` on the next call.
 Timeout and disconnect results do not advance the cursor.
+
+While a foreground `relay_wait` is active, **Peers and sessions** in
+`relay-monitor` labels that live identity as waiting for relay mail. The label
+shows its exact sender filter (or any sender) and the wait start time in the
+operator's local timezone. Wait IDs and durable cursors remain internal.
 
 The portable [`relay-coordinate`](skills/relay-coordinate/SKILL.md) skill loops
 after normal timeouts, processes one peer request at a time, replies to the

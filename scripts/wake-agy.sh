@@ -22,14 +22,29 @@ done
 DEFAULT_PROMPT='[Automated wake from claude-relay - no human typed this.] You are a fresh headless delegate for the relay identity named in your environment. Use the claude-relay MCP tools to receive unread durable mail addressed to that identity. Act on the request in its registered working directory and reply to the sender with relay_send when warranted. Do not rename, reclaim, or displace the foreground identity. Do not open relay_wait; the notify hook will start another delegate for later mail. Your final response must match the required JSON schema and must not include hidden reasoning, secrets, or raw tool output.'
 PROMPT="${ARGS[1]:-$DEFAULT_PROMPT}"
 
-PEER_CWD="$(python3 - "$REGISTRY" "$FOR" <<'PY'
-import json, sys
+registry_cwd() {
+  python3 -c 'import json, sys
 try:
-    print((json.load(open(sys.argv[1])).get(sys.argv[2]) or {}).get("cwd") or "")
+    registry = json.load(open(sys.argv[1]))
 except Exception:
-    print("")
-PY
-)"
+    registry = {}
+print((registry.get(sys.argv[2]) or {}).get("cwd") or "")' "$REGISTRY" "$1"
+}
+
+PEER_CWD="$(registry_cwd "$FOR")"
+CWD_SOURCE="$FOR"
+
+# Named AGY roles (for example AGY-planner) share the foreground AGY
+# session's project context, but retain their own relay identity and mailbox.
+# Only the exact prefix before the first hyphen is eligible; never choose an
+# arbitrary AGY session by recency or cwd.
+if [[ -z "$PEER_CWD" && "$FOR" == *-* ]]; then
+  FOREGROUND_ID="${FOR%%-*}"
+  if [[ "$FOREGROUND_ID" == AGY* ]]; then
+    PEER_CWD="$(registry_cwd "$FOREGROUND_ID")"
+    [[ -n "$PEER_CWD" ]] && CWD_SOURCE="$FOREGROUND_ID"
+  fi
+fi
 
 [[ "$FOR" == AGY* ]] || { echo "$FOR -> not an AGY peer"; exit 64; }
 [[ -n "$PEER_CWD" && -d "$PEER_CWD" ]] || {
@@ -39,7 +54,7 @@ PY
 command -v agy >/dev/null 2>&1 || { echo "error: agy CLI not found"; exit 1; }
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "$FOR -> fresh AGY delegate in $PEER_CWD (foreground session stays attached)"
+  echo "$FOR -> fresh AGY delegate in $PEER_CWD (cwd from $CWD_SOURCE; foreground session stays attached)"
   exit 0
 fi
 

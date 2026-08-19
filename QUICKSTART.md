@@ -45,7 +45,9 @@ completed activity or durable message history.
 Select **Peers and sessions** to see live agent identities, background watcher
 count, and each connection's reported host, client source, working directory,
 and process ID. Identities still using the local credential-migration fallback
-are labeled there as well.
+are labeled there as well. A session with an active `relay_wait` is labeled
+**waiting for relay mail**, including the exact sender filter (or any sender)
+and the local time when the wait began.
 
 Select **Activity**, choose a delegated run, and press Return to inspect it.
 The detail screen separates relay-observed request/reply/delivery facts from
@@ -125,6 +127,11 @@ job-scoped relay capability, records only sanitized activity and the final
 operator report, then exits. The foreground AGY session remains attached and
 usable. Do not configure a second per-project relay MCP for AGY.
 
+Role addresses such as `AGY-planner` remain separate mailboxes, but inherit the
+exact foreground `AGY` session's registered cwd when they have no live registry
+entry of their own. Keep the foreground AGY session registered in the intended
+project before sending role-addressed work.
+
 AGY currently starts its stdio MCP bridge on demand and may close it again
 between turns. Therefore **Peers and sessions** can show `AGY` under
 **Registered idle sessions** rather than **Connected agent peers** while the
@@ -165,6 +172,11 @@ never deleted.
 - **Claude Code is not waking:** confirm its global Stop hook still points to
   `~/claude-relay/scripts/relay-stop-hook.sh`; do not install a separate hook in
   every session.
+- **Claude Code changed identity or replayed old mail after `/mcp reconnect`:**
+  update the relay checkout, then reconnect the MCP once more. The replacement
+  bridge now rebinds through Claude's transcript lineage and unfiltered
+  `relay_receive` calls resume from the identity's saved cursor. Use
+  `replay=true` only for an intentional history resync.
 
 ## Recover a lost owner capability
 

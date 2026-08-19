@@ -41,6 +41,7 @@ const RELAY_URL = args['relay-url'] || process.env.RELAY_URL || 'ws://localhost:
 // Session registry path
 const SESSIONS_DIR = path.join(os.homedir(), 'claude-relay', 'sessions');
 const REGISTRY_FILE = path.join(SESSIONS_DIR, 'registry.json');
+const READ_CURSORS_FILE = path.join(SESSIONS_DIR, 'read-cursors.json');
 
 // Ensure sessions directory exists
 try {
@@ -158,6 +159,74 @@ function registryPidAlive(info) {
   }
 }
 
+function processEnvironmentValue(pid, name) {
+  if (!pid || !/^[A-Z0-9_]+$/.test(name)) return null;
+  try {
+    if (process.platform === 'linux') {
+      const raw = fs.readFileSync(`/proc/${Number(pid)}/environ`, 'utf8');
+      const entry = raw.split('\0').find(value => value.startsWith(`${name}=`));
+      return entry ? entry.slice(name.length + 1) : null;
+    }
+    const command = require('child_process').execFileSync(
+      'ps', ['eww', '-p', String(Number(pid)), '-o', 'command='],
+      { encoding: 'utf8', timeout: 2000 }
+    );
+    const match = command.match(new RegExp(`(?:^|\\s)${name}=([^\\s]+)`));
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function claudeTranscriptFile(session) {
+  if (!session) return null;
+  const projects = path.join(os.homedir(), '.claude', 'projects');
+  try {
+    for (const project of fs.readdirSync(projects)) {
+      const candidate = path.join(projects, project, `${session}.jsonl`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return null;
+}
+
+function claudeRootSessionId(session) {
+  const transcript = claudeTranscriptFile(session);
+  if (!transcript) return session || null;
+  try {
+    const fd = fs.openSync(transcript, 'r');
+    const buffer = Buffer.alloc(2 * 1024 * 1024);
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    fs.closeSync(fd);
+    const head = buffer.subarray(0, bytes).toString('utf8');
+    const match = head.match(/"session_id":"([0-9a-f-]{36})"/);
+    return match ? match[1] : session;
+  } catch {
+    return session;
+  }
+}
+
+function findClaudeReconnectIdentity(registry = readRegistry()) {
+  const current = (process.env.CLAUDE_CODE_SESSION_ID || '').trim();
+  const bridge = (process.env.CLAUDE_CODE_BRIDGE_SESSION_ID || '').trim();
+  // Claude Code's /mcp reconnect bridge carries both the current transcript
+  // and a bridge-session token. Ordinary background agents can share the
+  // foreground transcript lineage, so the bridge token is required before we
+  // may retire/reclaim the foreground relay identity.
+  if (!current || !bridge || !detectBackgroundFork()) return null;
+  const root = claudeRootSessionId(current);
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const matches = Object.entries(registry).filter(([, info]) =>
+    info?.source !== 'background-fork'
+    && sameCwd(projectDir, info?.cwd)
+    && registryPidAlive(info) === true
+    && processEnvironmentValue(info.pid, 'CLAUDE_CODE_SESSION_ID') === root
+  );
+  if (matches.length !== 1) return null;
+  const [id, info] = matches[0];
+  return { id, pid: Number(info.pid), current, root, bridge };
+}
+
 function findRegisteredSessionId(baseId, cwd, registry = readRegistry()) {
   if (!baseId) return null;
 
@@ -208,6 +277,19 @@ function nextAvailableNumberedId(baseId, registry) {
 }
 
 function resolveClientIdentity() {
+  const reconnect = findClaudeReconnectIdentity();
+  if (reconnect) {
+    return {
+      id: reconnect.id,
+      source: 'claude-reconnect',
+      supersedePid: reconnect.pid,
+      agentSessionId: reconnect.current,
+      agentRootSessionId: reconnect.root,
+      agentBridgeSessionId: reconnect.bridge,
+      note: `Claude Code MCP reconnect resolved through session lineage to ${reconnect.id}; `
+        + `retiring bridge pid ${reconnect.pid}.`
+    };
+  }
   if (sessionId) {
     return { id: sessionId, source: 'CLAUDE_RELAY_SESSION_ID' };
   }
@@ -332,7 +414,7 @@ if (!DELEGATE_FOR) {
 // An explicit --client-id is deliberate even in a fork; every other source is
 // (potentially) inherited environment, so a background fork gets a derived,
 // collision-free identity instead.
-if (resolvedIdentity.source !== '--client-id' && !DELEGATE_FOR) {
+if (resolvedIdentity.source !== '--client-id' && resolvedIdentity.source !== 'claude-reconnect' && !DELEGATE_FOR) {
   const forkReason = detectBackgroundFork();
   if (forkReason) {
     const baseId = resolvedIdentity.id;
@@ -366,6 +448,31 @@ if (resolvedIdentity.note) {
   console.error(`[Claude Relay MCP] ${resolvedIdentity.note}`);
 }
 
+let reconnectPrepared = false;
+function prepareClaudeReconnect() {
+  if (reconnectPrepared || resolvedIdentity.source !== 'claude-reconnect') return;
+  reconnectPrepared = true;
+  const pid = Number(resolvedIdentity.supersedePid);
+  if (!pid || pid === process.pid) return;
+  // Re-check the proof immediately before signaling. Only an MCP bridge from
+  // the same Claude transcript lineage may be retired; a stale registry pid
+  // or unrelated process is left untouched.
+  const args = psField(pid, 'args');
+  const root = processEnvironmentValue(pid, 'CLAUDE_CODE_SESSION_ID');
+  if (!/mcp-server\.js\b/.test(args) || root !== resolvedIdentity.agentRootSessionId) {
+    console.error('[Claude Relay MCP] Reconnect predecessor changed; refusing to signal it.');
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+    console.error(`[Claude Relay MCP] Retired superseded MCP bridge pid ${pid} for ${CLIENT_ID}.`);
+  } catch (error) {
+    if (error.code !== 'ESRCH') {
+      console.error(`[Claude Relay MCP] Could not retire predecessor pid ${pid}: ${error.message}`);
+    }
+  }
+}
+
 /**
  * Update the session registry with this client's info
  */
@@ -384,6 +491,16 @@ function updateRegistry(action = 'connect') {
         cwd: process.cwd(),
         relayUrl: RELAY_URL,
         source: CLIENT_ID_SOURCE,
+        ...((process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId)
+          ? { agentSessionId: process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId }
+          : {}),
+        ...((process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentRootSessionId)
+          ? { agentRootSessionId: resolvedIdentity.agentRootSessionId
+              || claudeRootSessionId(process.env.CLAUDE_CODE_SESSION_ID) }
+          : {}),
+        ...(process.env.CLAUDE_CODE_BRIDGE_SESSION_ID
+          ? { agentBridgeSessionId: process.env.CLAUDE_CODE_BRIDGE_SESSION_ID }
+          : {}),
         // Exact owning Codex conversation, when unambiguously resolvable.
         ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {})
       };
@@ -409,6 +526,27 @@ function updateRegistry(action = 'connect') {
   } catch (err) {
     // Non-fatal: don't interrupt MCP operation for registry issues
   }
+}
+
+function readStoredCursor(label = CLIENT_ID) {
+  try {
+    const cursors = JSON.parse(fs.readFileSync(READ_CURSORS_FILE, 'utf8'));
+    return typeof cursors[label]?.cursor === 'string' ? cursors[label].cursor : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredCursor(cursor, label = CLIENT_ID) {
+  if (!cursor) return;
+  withRegistryLock(() => {
+    let cursors = {};
+    try { cursors = JSON.parse(fs.readFileSync(READ_CURSORS_FILE, 'utf8')); } catch {}
+    cursors[label] = { cursor, updatedAt: new Date().toISOString() };
+    const tmp = `${READ_CURSORS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cursors, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, READ_CURSORS_FILE);
+  });
 }
 
 /**
@@ -678,6 +816,11 @@ function handleMcpMessage(message) {
           }
         }
       });
+      // A Claude Code /mcp reconnect starts a new bridge before it closes the
+      // old one. Retire only a predecessor proven to belong to this exact
+      // transcript lineage, then let normal owner-capability registration
+      // reclaim the canonical label.
+      prepareClaudeReconnect();
       // Connect to relay after initialization
       connectToRelay();
       break;
@@ -731,6 +874,10 @@ function handleMcpMessage(message) {
                   after: {
                     type: 'string',
                     description: 'Return messages after this message ID or ISO timestamp (optional)'
+                  },
+                  replay: {
+                    type: 'boolean',
+                    description: 'Intentionally ignore the saved read cursor and replay recent history (default: false)'
                   }
                 }
               }
@@ -965,12 +1112,22 @@ function handleToolCall(requestId, toolName, args) {
         return;
       }
 
+      // Unfiltered mailbox reads resume durably across MCP subprocess
+      // reconnects. Filtered/audit reads retain their explicit cursor
+      // semantics and never move the main mailbox cursor.
+      const tracksMailboxCursor = !args.from && !args.to && !args.after;
+      const effectiveAfter = args.replay
+        ? undefined
+        : (args.after || (tracksMailboxCursor ? readStoredCursor() : undefined));
+
       // Request history from server
       const historyRequestId = Date.now();
       pendingMessages.push({
         requestId,
         type: 'history',
-        id: historyRequestId
+        id: historyRequestId,
+        tracksMailboxCursor,
+        effectiveAfter
       });
 
       ws.send(JSON.stringify({
@@ -978,7 +1135,7 @@ function handleToolCall(requestId, toolName, args) {
         count: args.count || 10,
         from: args.from,
         to: args.to,
-        after: args.after
+        after: effectiveAfter
       }));
 
       // Set timeout for response
@@ -1643,11 +1800,18 @@ function connectToRelay() {
               relayWaiter.deliverHistory(messages);
               break;
             }
+            if (histReq.tracksMailboxCursor) {
+              // An unknown cursor must not silently become start-of-history on
+              // the next call. Keep it pinned until the caller explicitly
+              // requests replay=true, whose successful response establishes a
+              // fresh cursor.
+              if (!msg.unknownCursor && msg.cursor) writeStoredCursor(msg.cursor);
+            }
             let text = messages.length > 0
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
             if (msg.unknownCursor) {
-              text = `Warning: the "after" cursor was not found (expired, pruned, or foreign) — nothing was replayed. Call relay_receive WITHOUT "after" to resync, then continue from the new cursor.\n${text}`;
+              text = `Warning: the saved or supplied cursor was not found (expired, pruned, or foreign) — nothing was replayed. The saved cursor was retained to prevent an accidental replay. Call relay_receive with replay=true once to resync intentionally.\n${text}`;
             }
             if (msg.cursor) text += `\n\nCursor: ${msg.cursor}`;
             sendMcpResponse({
