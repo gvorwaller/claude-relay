@@ -73,6 +73,13 @@ function formatClock(input) {
   return new Date(input).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
 }
 
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function delegateJobReportLines(detail) {
   const { job, inbound, outbound } = detail;
   const start = Date.parse(job.startedAt || job.requestedAt);
@@ -265,6 +272,11 @@ function topologyLines(topology) {
     const details = [];
     if (meta.host) details.push(String(meta.host));
     if (meta.source) details.push(String(meta.source));
+    if (meta.toolProfile) {
+      details.push(meta.toolProfile === 'claude-core'
+        ? 'Claude Code lean relay profile'
+        : `${meta.toolProfile} relay profile`);
+    }
     if (meta.cwd) details.push(String(meta.cwd));
     if (meta.pid) details.push(`pid ${meta.pid}`);
     if (meta.attention?.state === 'relay-wait') {
@@ -278,6 +290,15 @@ function topologyLines(topology) {
     }
     if (pending.has(identity)) details.push('owner credential not confirmed');
     lines.push(`  ${identity}${details.length ? ` — ${details.join(' • ')}` : ''}`);
+    if (meta.relayUsage?.calls || meta.relayUsage?.messagesSent) {
+      const usage = meta.relayUsage;
+      const warnings = [];
+      if (usage.largeResults) warnings.push(`${usage.largeResults} large tool result${usage.largeResults === 1 ? '' : 's'}`);
+      if (usage.largeMessages) warnings.push(`${usage.largeMessages} large message${usage.largeMessages === 1 ? '' : 's'}`);
+      const since = usage.since && !Number.isNaN(Date.parse(usage.since))
+        ? ` since ${formatClock(usage.since)}` : '';
+      lines.push(`    Relay usage${since}: ${usage.calls || 0} MCP calls • ${formatBytes(usage.resultBytes)} returned • ${usage.messagesSent || 0} messages / ${formatBytes(usage.messageBytes)}${warnings.length ? ` • WARNING: ${warnings.join(', ')}` : ''}`);
+    }
   }
   const connected = new Set(peers);
   const idleEntries = Object.entries(registered)

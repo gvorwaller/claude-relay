@@ -56,6 +56,18 @@ async function open(port, id) {
   return ws;
 }
 
+async function waitForSessionMeta(ws, clientId, predicate, timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const response = wsMessage(ws, message => message.type === 'sessions');
+    ws.send(JSON.stringify({ type: 'get_sessions' }));
+    const meta = (await response).sessions[clientId];
+    if (meta && predicate(meta)) return meta;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for session metadata for ${clientId}`);
+}
+
 async function startRelay(t, root) {
   const port = await new Promise((resolve, reject) => {
     const probe = net.createServer();
@@ -153,6 +165,10 @@ test('Claude Code reconnect reclaims the canonical identity from the same transc
   }});
   assert.match((await mcp.next(message => message.id === 2)).result.content[0].text, /Sent to OBSERVER/);
   assert.equal((await relayed).from, 'CC1');
+  const meta = await waitForSessionMeta(observer, 'CC1', value => value.relayUsage?.calls >= 1);
+  assert.equal(meta.toolProfile, 'claude-core');
+  assert.equal(meta.relayUsage.byTool.relay_send, 1);
+  assert.ok(meta.relayUsage.resultBytes > 0);
   await predecessorExited;
 });
 

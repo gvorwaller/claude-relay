@@ -43,7 +43,7 @@ class MessageStore {
     return envelope;
   }
 
-  query({ requester, count = 10, from, to, after, floorId } = {}) {
+  query({ requester, count = 10, from, to, after, floorId, inboundOnly = false } = {}) {
     if (!requester) return { messages: [], cursor: null };
     const limit = Math.max(1, Math.min(Number(count) || 10, this.maxQueryCount));
     // floorId confines a least-authority reader (a job delegate) to the
@@ -57,7 +57,7 @@ class MessageStore {
       // millisecond would otherwise leak the earlier one, and a clock
       // rollback would scramble the boundary entirely (re-check #4).
       const scoped = all.slice(index);
-      const result = this.filterMessages(scoped, { requester, from, to, after });
+      const result = this.filterMessages(scoped, { requester, from, to, after, inboundOnly });
       const messages = result.messages.slice(-limit);
       return {
         messages,
@@ -65,7 +65,7 @@ class MessageStore {
         unknownCursor: result.unknownCursor || undefined
       };
     }
-    const cachedResult = this.filterMessages(this.cache, { requester, from, to, after });
+    const cachedResult = this.filterMessages(this.cache, { requester, from, to, after, inboundOnly });
     const afterIsCovered = !after
       || this.cache.some(message => message.id === after)
       || (Number.isFinite(Date.parse(after))
@@ -73,7 +73,7 @@ class MessageStore {
         && Date.parse(after) >= Date.parse(this.cache[0].timestamp));
     const result = cachedResult.messages.length >= limit && afterIsCovered
       ? cachedResult
-      : this.filterMessages(this.readAll(), { requester, from, to, after });
+      : this.filterMessages(this.readAll(), { requester, from, to, after, inboundOnly });
 
     const messages = result.messages.slice(-limit);
     return {
@@ -83,7 +83,7 @@ class MessageStore {
     };
   }
 
-  filterMessages(source, { requester, from, to, after }) {
+  filterMessages(source, { requester, from, to, after, inboundOnly = false }) {
     let messages = source.filter(message => this.isVisibleTo(message, requester));
 
     // Place an opaque cursor in the requester's whole visible conversation
@@ -109,6 +109,15 @@ class MessageStore {
           unknownCursor = true;
         }
       }
+    }
+    // Ordinary mailbox reads are inbound-only: the requester's own sends are
+    // already present in the model context and replaying them wastes tokens.
+    // Keep cursor placement above this filter so an outbound message remains
+    // a valid explicit request/reply boundary for audit reads and waits.
+    if (inboundOnly) {
+      messages = messages.filter(message =>
+        message.from !== requester
+        && (message.to === requester || message.to === 'all'));
     }
     if (from) messages = messages.filter(message => message.from === from);
     if (to) messages = messages.filter(message => message.to === to);

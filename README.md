@@ -307,7 +307,17 @@ interactive use.
 
 ## MCP Tools
 
-Once configured, Claude Code will have these tools:
+The MCP bridge exposes a client-specific tool profile without changing the
+client's relay identity. A session named `CC1` remains exactly `CC1`; its
+reported `toolProfile` is separate metadata shown by **Peers and sessions**.
+
+Claude Code is detected from its session metadata and receives the lean
+`claude-core` profile: `relay_send`, `relay_receive`, `relay_peers`,
+`relay_status`, and `relay_rename`. It intentionally does not receive
+`relay_wait` or the operator/admin tools. Claude should end its turn when it is
+waiting for a reply; the content-free global Stop hook wakes that same session
+when mail arrives. Codex, Grok, AGY, and explicit `RELAY_TOOL_PROFILE=full`
+clients retain the complete tool catalog:
 
 | Tool | Description |
 |------|-------------|
@@ -348,11 +358,14 @@ Use relay_receive to see if there are any messages from peers
 ```
 
 `relay_receive` accepts optional `from`, `to`, and `after` filters. `after` may
-be a returned message cursor or an ISO timestamp. An unfiltered mailbox read
-automatically resumes from a private per-identity cursor, including after an
-MCP reconnect, so old mail is not silently replayed. Pass `replay=true` only
-when you deliberately want to ignore that saved cursor and resynchronize from
-recent history. Filtered/audit reads do not move the mailbox cursor.
+be a returned message cursor or an ISO timestamp. An ordinary unfiltered
+mailbox read returns only inbound direct messages and broadcasts from other
+identities; it never feeds the caller's own sent messages back into model
+context. It automatically resumes from a private per-identity cursor,
+including after an MCP reconnect, so old mail is not silently replayed. Pass
+`replay=true` only when you deliberately want to ignore that saved cursor and
+resynchronize from recent history. Filtered/audit reads retain the broader
+authorized history view and do not move the mailbox cursor.
 Direct-message history is visible only to its sender and recipient; broadcasts
 are visible to all peers.
 
@@ -381,9 +394,9 @@ wake Claude Code or Codex after the session has returned control to the user.
 
 ### Background doorbell for interactive Claude Code sessions
 
-`relay_wait` intentionally holds its MCP tool call open. For an interactive
-Claude Code session that should remain usable, start the content-free watcher
-as a background Bash task instead:
+`relay_wait` intentionally holds its MCP tool call open and therefore is not
+advertised to Claude Code. For an interactive Claude Code session, use the
+content-free watcher as a background Bash task instead:
 
 ```bash
 node ~/claude-relay/scripts/relay-watch.js --for CC2 --timeout 240
@@ -427,6 +440,23 @@ then exits code 2, which makes the harness wake the model with instructions to
 run `relay_receive`. Sessions without a relay bridge exit instantly; the
 listener stands down if its session dies. With this installed, every CC
 session is always reachable while idle, automatically.
+
+### Usage guardrails
+
+The relay daemon keeps content-free, per-identity counters since its most
+recent restart: MCP call count, approximate JSON result bytes, sent-message
+count/bytes, and per-tool call totals. **Peers and sessions** shows these
+counters beneath the unchanged identity and warns when a single MCP result is
+larger than 8 KiB or a relay message is larger than 4 KiB. The counters are
+diagnostic byte estimates, not provider billing-token measurements, and are
+never written into durable message history.
+
+Large `relay_send` results also tell the sender to prefer a short repository
+path, commit hash, or document reference when both peers share the checkout.
+Use relay messages to coordinate ownership and conclusions; do not paste
+whole files, command output, or long reports that are already available on
+disk. After a long coordination cycle, compact or start a fresh model turn so
+old MCP results do not remain in the model context indefinitely.
 
 ### Send acks are honest
 
@@ -635,6 +665,7 @@ history
 | `RELAY_HOST` | `127.0.0.1` | Listener address; production remains loopback-only |
 | `CLAUDE_RELAY_SESSION_ID` | (none) | Human-readable session ID |
 | `RELAY_URL` | `ws://localhost:9999` | Relay server WebSocket URL |
+| `RELAY_TOOL_PROFILE` | automatic | `claude-core` or `full`; Claude Code is detected automatically |
 
 ### Command Line Arguments
 

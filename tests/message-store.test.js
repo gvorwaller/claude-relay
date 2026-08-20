@@ -118,6 +118,25 @@ test('opaque cursor is resolved before sender filtering for request-reply waits'
   assert.equal(result.unknownCursor, undefined);
 });
 
+test('inbound-only mailbox reads exclude own sends and retain broadcasts', () => {
+  const store = new MessageStore({ dataDir: tempDir() });
+  store.initialize();
+  const outbound = store.append({ from: 'CC1', to: 'GROK', content: 'review this' });
+  store.append({ from: 'GROK', to: 'CC1', content: 'review complete' });
+  store.append({ from: 'CC2', to: 'all', content: 'shared notice' });
+  store.append({ from: 'CC1', to: 'all', content: 'my own broadcast' });
+
+  const result = store.query({ requester: 'CC1', after: outbound.id, inboundOnly: true });
+  assert.deepEqual(result.messages.map(message => message.content), ['review complete', 'shared notice']);
+  assert.equal(result.unknownCursor, undefined);
+
+  // Explicit audit reads keep the prior whole-conversation behavior.
+  assert.deepEqual(
+    store.query({ requester: 'CC1', after: outbound.id }).messages.map(message => message.content),
+    ['review complete', 'shared notice', 'my own broadcast']
+  );
+});
+
 test('delegate floor slices by durable order, not wall clock', () => {
   const store = new MessageStore({ dataDir: tempDir(), now: () => new Date('2026-08-06T00:00:00.000Z') });
   store.initialize();

@@ -49,6 +49,13 @@ are labeled there as well. A session with an active `relay_wait` is labeled
 **waiting for relay mail**, including the exact sender filter (or any sender)
 and the local time when the wait began.
 
+The same screen labels each connection's relay tool profile separately from
+its identity. For example, `CC1` remains the durable identity while **Claude
+Code lean relay profile** explains which tools its MCP bridge exposes. It also
+shows content-free usage counters since the last relay restart and warns about
+large MCP results or relay messages. These are approximate bytes, not billed
+tokens.
+
 Select **Activity**, choose a delegated run, and press Return to inspect it.
 The detail screen separates relay-observed request/reply/delivery facts from
 the delegate's own structured summary, changes, and verification. It also
@@ -113,6 +120,11 @@ merge the two event definitions instead.
 4. Treat `completed` as an execution result and the recorded outbound delivery
    status as transport evidence; neither is a claim that the peer accepted the
    work as correct.
+
+Claude Code should not sit in `relay_wait`. Its lean relay profile omits that
+tool: end the turn and let the content-free Stop hook wake the same named
+identity when mail arrives. When sending substantial work, reference a shared
+file path or commit rather than embedding a long report in the relay message.
 
 ## Enable AGY once
 

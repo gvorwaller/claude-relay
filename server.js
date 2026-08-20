@@ -108,6 +108,41 @@ const duplicateLogTimes = new Map();
 // Watchers receive only an existence ping; they never inherit target history
 // visibility or message content.
 const watchers = new Map();
+// Small, content-free usage counters reported by MCP bridges. They reset with
+// the relay process and never retain prompts or tool results.
+const relayUsage = new Map();
+const LARGE_MCP_RESULT_BYTES = 8 * 1024;
+const LARGE_RELAY_MESSAGE_BYTES = 4 * 1024;
+const MCP_USAGE_TOOLS = new Set([
+  'relay_send',
+  'relay_receive',
+  'relay_wait',
+  'relay_peers',
+  'relay_status',
+  'relay_rename',
+  'relay_sessions',
+  'relay_clear_sessions',
+  'relay_clear_history',
+  'relay_purge_history',
+  'relay_delegate_jobs',
+  'relay_purge_delegate_jobs'
+]);
+
+function usageFor(identity) {
+  if (!relayUsage.has(identity)) {
+    relayUsage.set(identity, {
+      since: new Date().toISOString(),
+      calls: 0,
+      resultBytes: 0,
+      largeResults: 0,
+      messagesSent: 0,
+      messageBytes: 0,
+      largeMessages: 0,
+      byTool: {}
+    });
+  }
+  return relayUsage.get(identity);
+}
 
 // One strict grammar for every client-supplied identity and target (review
 // finding #1: unvalidated labels flowed into shell/AppleScript sinks). `~` is
@@ -799,6 +834,11 @@ wss.on('connection', (ws, req) => {
           // base so peers see one consistent identity and the base session
           // keeps visibility of the conversation.
           const fromId = ws.delegateOf || clientId;
+          const messageBytes = Buffer.byteLength(msg.content, 'utf8');
+          const messageUsage = usageFor(fromId);
+          messageUsage.messagesSent += 1;
+          messageUsage.messageBytes += messageBytes;
+          if (messageBytes > LARGE_RELAY_MESSAGE_BYTES) messageUsage.largeMessages += 1;
           // Direct mail reaches the label's owner AND any live delegates of it.
           const directSockets = [];
           if (to !== 'all') {
@@ -890,6 +930,27 @@ wss.on('connection', (ws, req) => {
             attentionClaimedTargets
           });
           break;
+
+        case 'mcp_usage': {
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Register before reporting MCP usage' }));
+            return;
+          }
+          const tool = typeof msg.tool === 'string' && MCP_USAGE_TOOLS.has(msg.tool)
+            ? msg.tool : null;
+          const resultBytes = Number(msg.resultBytes);
+          if (!tool || !Number.isSafeInteger(resultBytes) || resultBytes < 0 || resultBytes > 10 * 1024 * 1024) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid MCP usage event' }));
+            return;
+          }
+          const identity = ws.delegateOf || clientId;
+          const usage = usageFor(identity);
+          usage.calls += 1;
+          usage.resultBytes += resultBytes;
+          usage.byTool[tool] = (usage.byTool[tool] || 0) + 1;
+          if (resultBytes > LARGE_MCP_RESULT_BYTES) usage.largeResults += 1;
+          break;
+        }
 
         case 'attention_wait':
           if (!clientId) {
@@ -1398,7 +1459,8 @@ wss.on('connection', (ws, req) => {
             count: msg.count,
             from: msg.from,
             to: msg.to,
-            after: msg.after
+            after: msg.after,
+            inboundOnly: msg.inboundOnly === true
           });
           // Durable backlog is foreground work too. If the active attention
           // claim's matching message is satisfied by history rather than a
@@ -1523,6 +1585,8 @@ wss.on('connection', (ws, req) => {
           for (const id of clients.keys()) {
             const peer = clients.get(id);
             const meta = { ...(clientMeta.get(id) || {}) };
+            const usageIdentity = peer?.delegateOf || id;
+            if (relayUsage.has(usageIdentity)) meta.relayUsage = { ...relayUsage.get(usageIdentity) };
             if (peer?.attentionWait) {
               // Expose only the operator-useful state. The wait ID and durable
               // cursor are internal coordination details and must not leak

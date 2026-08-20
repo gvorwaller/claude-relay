@@ -37,6 +37,27 @@ const sessionId = process.env.CLAUDE_RELAY_SESSION_ID;
 const cliClientId = args['client-id'];
 const configuredClientId = process.env.RELAY_CLIENT_ID;
 const RELAY_URL = args['relay-url'] || process.env.RELAY_URL || 'ws://localhost:9999';
+const CLAUDE_CORE_TOOLS = new Set([
+  'relay_send',
+  'relay_receive',
+  'relay_peers',
+  'relay_status',
+  'relay_rename'
+]);
+
+function resolveToolProfile() {
+  const explicit = String(process.env.RELAY_TOOL_PROFILE || '').trim().toLowerCase();
+  if (explicit === 'full' || explicit === 'claude-core') return explicit;
+  return process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_CODE_BRIDGE_SESSION_ID
+    ? 'claude-core'
+    : 'full';
+}
+
+const TOOL_PROFILE = resolveToolProfile();
+
+function toolAllowed(toolName) {
+  return TOOL_PROFILE === 'full' || CLAUDE_CORE_TOOLS.has(toolName);
+}
 
 // Session registry path
 const SESSIONS_DIR = path.join(os.homedir(), 'claude-relay', 'sessions');
@@ -491,6 +512,7 @@ function updateRegistry(action = 'connect') {
         cwd: process.cwd(),
         relayUrl: RELAY_URL,
         source: CLIENT_ID_SOURCE,
+        toolProfile: TOOL_PROFILE,
         ...((process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId)
           ? { agentSessionId: process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId }
           : {}),
@@ -719,6 +741,7 @@ let desiredRename = null;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
+const pendingToolCalls = new Map();
 let reconnectTimer = null;
 let shuttingDown = false;
 
@@ -795,6 +818,13 @@ rl.on('line', (line) => {
 function sendMcpResponse(response) {
   const json = JSON.stringify(response);
   process.stdout.write(json + '\n');
+  if (!pendingToolCalls.has(response.id)) return;
+  const tool = pendingToolCalls.get(response.id);
+  pendingToolCalls.delete(response.id);
+  if (!ws || ws.readyState !== WebSocket.OPEN || !registered) return;
+  const payload = response.result === undefined ? response.error : response.result;
+  const resultBytes = Buffer.byteLength(JSON.stringify(payload || {}), 'utf8');
+  ws.send(JSON.stringify({ type: 'mcp_usage', tool, resultBytes }));
 }
 
 function handleMcpMessage(message) {
@@ -993,12 +1023,26 @@ function handleMcpMessage(message) {
                 required: ['owner', 'confirmation']
               }
             }
-          ]
+          ].filter(tool => toolAllowed(tool.name))
         }
       });
       break;
 
     case 'tools/call':
+      if (!toolAllowed(params.name)) {
+        sendMcpResponse({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32601,
+            message: params.name === 'relay_wait' && TOOL_PROFILE === 'claude-core'
+              ? 'relay_wait is disabled for Claude Code. End the turn; the content-free Stop hook will wake this session when new relay mail arrives.'
+              : `Tool ${params.name} is not available in the ${TOOL_PROFILE} relay profile.`
+          }
+        });
+        break;
+      }
+      pendingToolCalls.set(id, params.name);
       handleToolCall(id, params.name, params.arguments || {});
       break;
 
@@ -1040,7 +1084,8 @@ function handleToolCall(requestId, toolName, args) {
         requestId,
         type: 'send_ack',
         to: args.to || 'all',
-        preview
+        preview,
+        messageBytes: Buffer.byteLength(args.message, 'utf8')
       };
       sendAck.timer = setTimeout(() => {
         pendingMessages = pendingMessages.filter(p => p !== sendAck);
@@ -1135,7 +1180,8 @@ function handleToolCall(requestId, toolName, args) {
         count: args.count || 10,
         from: args.from,
         to: args.to,
-        after: effectiveAfter
+        after: effectiveAfter,
+        inboundOnly: tracksMailboxCursor
       }));
 
       // Set timeout for response
@@ -1562,6 +1608,7 @@ function registerWithServer(idOverride) {
       cwd: process.cwd(),
       host: HOST,
       source: CLIENT_ID_SOURCE,
+      toolProfile: TOOL_PROFILE,
       relayUrl: RELAY_URL,
       // A local operator can ask this exact bridge to release its identity
       // and exit without terminating the parent Claude or Codex process.
@@ -1942,7 +1989,10 @@ function connectToRelay() {
                 ? `Broadcast to ${label} (at least one peer connected): ${sendReq.preview}`
                 : `Sent to ${label} (connection live — delivered; note a live socket doesn't guarantee attention): ${sendReq.preview}`)
               : `Queued for ${label} (offline — stored durably, replayed when they next read): ${sendReq.preview}`;
-            sendToolText(sendReq.requestId, text);
+            const warning = sendReq.messageBytes > 4096
+              ? `\nWarning: this relay message is ${Math.ceil(sendReq.messageBytes / 1024)} KB. When peers share a checkout, prefer a short path/commit reference over embedding large content.`
+              : '';
+            sendToolText(sendReq.requestId, text + warning);
           }
           break;
 

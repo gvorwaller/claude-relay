@@ -104,6 +104,15 @@ test('server persists authorized history, preserves it on cache clear, and gates
   assert.deepEqual(Object.keys((await nextMessage(observer, 'sessions')).sessions).sort(),
     ['A', 'ADMIN', 'B', 'B-watch-test', 'C', 'LIVEAUTO'].sort());
 
+  recipient.send(JSON.stringify({ type: 'mcp_usage', tool: 'relay_receive', resultBytes: 9000 }));
+  recipient.send(JSON.stringify({ type: 'mcp_usage', tool: 'relay_send', resultBytes: 400 }));
+  recipient.send(JSON.stringify({ type: 'get_sessions' }));
+  const usage = (await nextMessage(recipient, 'sessions')).sessions.B.relayUsage;
+  assert.equal(usage.calls, 2);
+  assert.equal(usage.resultBytes, 9400);
+  assert.equal(usage.largeResults, 1);
+  assert.deepEqual(usage.byTool, { relay_receive: 1, relay_send: 1 });
+
   const watching = nextMessage(watcher, 'watching');
   watcher.send(JSON.stringify({ type: 'watch', for: 'B' }));
   assert.equal((await watching).for, 'B');
@@ -115,6 +124,13 @@ test('server persists authorized history, preserves it on cache clear, and gates
   const ping = await doorbell;
   assert.deepEqual(Object.keys(ping).sort(), ['at', 'for', 'type']);
   assert.equal(ping.for, 'B');
+
+  const responseAck = nextMessage(recipient, 'sent');
+  recipient.send(JSON.stringify({ type: 'message', to: 'A', content: 'my outbound reply' }));
+  await responseAck;
+  recipient.send(JSON.stringify({ type: 'get_history', count: 10, inboundOnly: true }));
+  const inboundOnly = await nextMessage(recipient, 'history');
+  assert.deepEqual(inboundOnly.messages.map(message => message.content), ['private review']);
 
   const helperJoined = waitForMessage(sender, message =>
     message.type === 'peer_joined' && message.clientId.startsWith('C-watch-'));

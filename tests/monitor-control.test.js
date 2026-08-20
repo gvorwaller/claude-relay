@@ -81,10 +81,14 @@ test('topology view distinguishes peer identities from detailed live sessions', 
     pendingOwnerLabels: ['CODEX1'],
     sessions: {
       CODEX1: {
-        host: 'Mac', source: 'codex', cwd: '/repo', pid: 42,
+        host: 'Mac', source: 'codex', toolProfile: 'full', cwd: '/repo', pid: 42,
+        relayUsage: {
+          since: '2026-08-17T21:00:00.000Z', calls: 12, resultBytes: 12288,
+          messagesSent: 3, messageBytes: 5000, largeResults: 1, largeMessages: 1
+        },
         attention: { state: 'relay-wait', from: 'CC1', startedAt: '2026-08-17T21:17:51.000Z' }
       },
-      CC1: { host: 'Mac', source: 'claude-code' }
+      CC1: { host: 'Mac', source: 'claude-code', toolProfile: 'claude-core' }
     },
     registeredSessions: {
       CC1: { cwd: '/live' },
@@ -94,8 +98,9 @@ test('topology view distinguishes peer identities from detailed live sessions', 
   assert.match(lines, /Connected agent peers: 2/);
   assert.match(lines, /CC1, CODEX1/);
   assert.match(lines, /Background message watchers: 1/);
-  assert.match(lines, /CC1 — Mac • claude-code/);
-  assert.match(lines, /CODEX1 — Mac • codex • \/repo • pid 42 • waiting for relay mail from CC1 since .* • owner credential not confirmed/);
+  assert.match(lines, /CC1 — Mac • claude-code • Claude Code lean relay profile/);
+  assert.match(lines, /CODEX1 — Mac • codex • full relay profile • \/repo • pid 42 • waiting for relay mail from CC1 since .* • owner credential not confirmed/);
+  assert.match(lines, /Relay usage since .*: 12 MCP calls • 12 KB returned • 3 messages \/ 4\.9 KB • WARNING: 1 large tool result, 1 large message/);
   assert.match(lines, /Registered idle sessions/);
   assert.match(lines, /AGY — \/birds • bridge ended/);
   assert.doesNotMatch(lines, /CC1 — \/live/);
