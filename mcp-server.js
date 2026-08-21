@@ -23,6 +23,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { RelayWaiter } = require('./relay-waiter');
+const { detectCodexRolloutContext } = require('./codex-rollout-lineage');
 
 // Configuration from args or env
 const args = process.argv.slice(2).reduce((acc, arg) => {
@@ -248,6 +249,32 @@ function findClaudeReconnectIdentity(registry = readRegistry()) {
   return { id, pid: Number(info.pid), current, root, bridge };
 }
 
+function findCodexReconnectIdentity(registry = readRegistry()) {
+  const parentArgs = psField(process.ppid, 'args');
+  // Headless `codex exec` processes are transient delegates, never canonical
+  // foreground owners. They are handled after ordinary identity resolution.
+  if (/(^|\/)codex\S*\s+(-\S+\s+)*exec\b/.test(parentArgs)) return null;
+
+  const context = detectCodexRolloutContext(process.ppid);
+  if (!context) return null;
+  const projectDir = process.cwd();
+  const matches = Object.entries(registry).filter(([, info]) => {
+    if (!sameCwd(projectDir, info?.cwd) || registryPidAlive(info) !== true) return false;
+    if (!info?.codexSessionId || !context.lineageIds.has(info.codexSessionId)) return false;
+    const pid = Number(info.pid);
+    return Number(psField(pid, 'ppid')) === process.ppid
+      && /mcp-server\.js\b/.test(psField(pid, 'args'));
+  });
+  if (matches.length !== 1) return null;
+  const [id, info] = matches[0];
+  return {
+    id,
+    pid: Number(info.pid),
+    current: context.currentId,
+    lineageIds: [...context.lineageIds]
+  };
+}
+
 function findRegisteredSessionId(baseId, cwd, registry = readRegistry()) {
   if (!baseId) return null;
 
@@ -309,6 +336,18 @@ function resolveClientIdentity() {
       agentBridgeSessionId: reconnect.bridge,
       note: `Claude Code MCP reconnect resolved through session lineage to ${reconnect.id}; `
         + `retiring bridge pid ${reconnect.pid}.`
+    };
+  }
+  const codexReconnect = findCodexReconnectIdentity();
+  if (codexReconnect) {
+    return {
+      id: codexReconnect.id,
+      source: 'codex-reconnect',
+      supersedePid: codexReconnect.pid,
+      codexSessionId: codexReconnect.current,
+      codexLineageIds: codexReconnect.lineageIds,
+      note: `Codex MCP continuation resolved through rollout lineage to ${codexReconnect.id}; `
+        + `retiring bridge pid ${codexReconnect.pid}.`
     };
   }
   if (sessionId) {
@@ -399,21 +438,7 @@ let DELEGATE_FOR = (process.env.RELAY_DELEGATE_FOR || '').trim() || null;
 // one session's mail into another conversation. Ambiguity yields null — the
 // wake then refuses and notifies rather than resuming the wrong thread.
 function detectCodexSessionId() {
-  try {
-    const parentPid = psField(process.ppid, 'pid') ? process.ppid : null;
-    if (!parentPid) return null;
-    const lsof = require('child_process')
-      .execSync(`lsof -p ${parentPid} 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 });
-    const matches = [...new Set(
-      (lsof.match(/\/[^\s]*rollout-[^\s]*\.jsonl/g) || [])
-    )];
-    if (matches.length !== 1) return null;
-    const uuid = path.basename(matches[0], '.jsonl')
-      .replace(/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, '');
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid) ? uuid : null;
-  } catch {
-    return null;
-  }
+  return detectCodexRolloutContext(process.ppid)?.currentId || null;
 }
 
 function detectCodexHeadless() {
@@ -435,7 +460,9 @@ if (!DELEGATE_FOR) {
 // An explicit --client-id is deliberate even in a fork; every other source is
 // (potentially) inherited environment, so a background fork gets a derived,
 // collision-free identity instead.
-if (resolvedIdentity.source !== '--client-id' && resolvedIdentity.source !== 'claude-reconnect' && !DELEGATE_FOR) {
+if (resolvedIdentity.source !== '--client-id'
+    && !['claude-reconnect', 'codex-reconnect'].includes(resolvedIdentity.source)
+    && !DELEGATE_FOR) {
   const forkReason = detectBackgroundFork();
   if (forkReason) {
     const baseId = resolvedIdentity.id;
@@ -448,7 +475,9 @@ if (resolvedIdentity.source !== '--client-id' && resolvedIdentity.source !== 'cl
 }
 // Recorded for primary sessions only: a delegate's own rollout is the same
 // conversation, and delegates never write the registry.
-const CODEX_SESSION_ID = DELEGATE_FOR ? null : detectCodexSessionId();
+const CODEX_SESSION_ID = DELEGATE_FOR
+  ? null
+  : resolvedIdentity.codexSessionId || detectCodexSessionId();
 
 if (DELEGATE_FOR) {
   resolvedIdentity.id = `${DELEGATE_FOR}~wake-${process.pid}`;
@@ -470,8 +499,9 @@ if (resolvedIdentity.note) {
 }
 
 let reconnectPrepared = false;
-function prepareClaudeReconnect() {
-  if (reconnectPrepared || resolvedIdentity.source !== 'claude-reconnect') return;
+function prepareCanonicalReconnect() {
+  if (reconnectPrepared
+      || !['claude-reconnect', 'codex-reconnect'].includes(resolvedIdentity.source)) return;
   reconnectPrepared = true;
   const pid = Number(resolvedIdentity.supersedePid);
   if (!pid || pid === process.pid) return;
@@ -479,8 +509,11 @@ function prepareClaudeReconnect() {
   // the same Claude transcript lineage may be retired; a stale registry pid
   // or unrelated process is left untouched.
   const args = psField(pid, 'args');
-  const root = processEnvironmentValue(pid, 'CLAUDE_CODE_SESSION_ID');
-  if (!/mcp-server\.js\b/.test(args) || root !== resolvedIdentity.agentRootSessionId) {
+  const claudeRoot = processEnvironmentValue(pid, 'CLAUDE_CODE_SESSION_ID');
+  const lineageMatches = resolvedIdentity.source === 'claude-reconnect'
+    ? claudeRoot === resolvedIdentity.agentRootSessionId
+    : Number(psField(pid, 'ppid')) === process.ppid;
+  if (!/mcp-server\.js\b/.test(args) || !lineageMatches) {
     console.error('[Claude Relay MCP] Reconnect predecessor changed; refusing to signal it.');
     return;
   }
@@ -846,11 +879,11 @@ function handleMcpMessage(message) {
           }
         }
       });
-      // A Claude Code /mcp reconnect starts a new bridge before it closes the
-      // old one. Retire only a predecessor proven to belong to this exact
-      // transcript lineage, then let normal owner-capability registration
-      // reclaim the canonical label.
-      prepareClaudeReconnect();
+      // Claude Code reconnects and Codex rollout continuations can start a new
+      // bridge before closing the old one. Retire only a predecessor proven
+      // to belong to the exact transcript/rollout lineage, then let normal
+      // owner-capability registration reclaim the canonical label.
+      prepareCanonicalReconnect();
       // Connect to relay after initialization
       connectToRelay();
       break;

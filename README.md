@@ -303,6 +303,16 @@ interactive use.
 
 **Claude Code `/mcp reconnect` keeps the foreground identity.** Current Claude Code versions may launch the replacement MCP bridge from a background host whose inherited relay environment belongs to another session. When the replacement carries Claude's bridge-session token, the relay resolves the current transcript back to its original transcript session, matches that lineage to exactly one live foreground registry entry in the same project, retires only that proven predecessor bridge, and reclaims its canonical label. Ambiguous or ordinary background work fails closed and retains a derived `-bg...` identity.
 
+**Codex rollout continuations keep the foreground identity.** A resumed Codex
+task can keep its original rollout open while beginning a continuation rollout,
+and may start a replacement MCP bridge before the prior bridge exits. The
+replacement selects the actively written rollout, reads only its
+`session_meta` lineage, and reclaims a live registry label only when exactly
+one same-cwd predecessor bridge has a matching Codex session ID and the same
+Codex parent process. It then retires that proven predecessor. Unrelated Codex
+tasks in the same checkout cannot satisfy all three bindings and are never
+displaced.
+
 ---
 
 ## MCP Tools

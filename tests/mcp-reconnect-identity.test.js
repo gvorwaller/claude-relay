@@ -115,6 +115,79 @@ function startMcp(t, { root, port, cwd, env = {}, clientId }) {
   return { mcp, next, send, errors: () => errors };
 }
 
+function startCodexContinuation(t, { root, port, cwd, oldRollout, currentRollout, oldSession }) {
+  const wrapper = spawn(process.execPath, [
+    path.join(__dirname, 'fixtures', 'codex-rollout-parent.js'),
+    path.join(__dirname, '..', 'mcp-server.js'),
+    root,
+    cwd,
+    String(port),
+    oldRollout,
+    currentRollout,
+    oldSession
+  ], {
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let errors = '';
+  wrapper.stderr.setEncoding('utf8');
+  wrapper.stderr.on('data', chunk => { errors += chunk; });
+  t.after(() => wrapper.kill('SIGTERM'));
+  const next = nextLine(wrapper.stdout);
+  const send = value => wrapper.stdin.write(`${JSON.stringify(value)}\n`);
+  return { mcp: wrapper, next, send, errors: () => errors };
+}
+
+test('Codex continuation rollout reclaims its canonical identity and retires the prior bridge', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-codex-reconnect-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'birds');
+  const rollouts = path.join(root, 'rollouts');
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(rollouts, { recursive: true });
+  const { port, observer } = await startRelay(t, root);
+
+  const oldSession = '11111111-1111-4111-8111-111111111111';
+  const currentSession = '22222222-2222-4222-8222-222222222222';
+  const oldRollout = path.join(rollouts,
+    `rollout-2026-08-19T20-30-55-${oldSession}.jsonl`);
+  const currentRollout = path.join(rollouts,
+    `rollout-2026-08-21T18-09-30-${currentSession}.jsonl`);
+  fs.writeFileSync(oldRollout,
+    `${JSON.stringify({ type: 'session_meta', payload: { id: oldSession } })}\n`);
+  fs.writeFileSync(currentRollout, [
+    JSON.stringify({ type: 'session_meta', payload: { id: currentSession } }),
+    JSON.stringify({ type: 'session_meta', payload: { id: oldSession } })
+  ].join('\n'));
+  const now = Date.now() / 1000;
+  fs.utimesSync(oldRollout, now - 60, now - 60);
+  fs.utimesSync(currentRollout, now, now);
+
+  const joined = wsMessage(observer,
+    message => message.type === 'peer_joined' && message.clientId === 'CODEX1');
+  const mcp = startCodexContinuation(t, {
+    root, port, cwd: project, oldRollout, currentRollout, oldSession
+  });
+  mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await mcp.next(message => message.id === 1);
+  await joined;
+
+  const relayed = wsMessage(observer,
+    message => message.type === 'message' && message.content === 'continuation');
+  mcp.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'relay_send', arguments: { to: 'OBSERVER', message: 'continuation' }
+  }});
+  await mcp.next(message => message.id === 2);
+  assert.equal((await relayed).from, 'CODEX1');
+
+  const registry = JSON.parse(fs.readFileSync(
+    path.join(root, 'claude-relay', 'sessions', 'registry.json'), 'utf8'));
+  assert.equal(registry.CODEX1.source, 'codex-reconnect');
+  assert.equal(registry.CODEX1.codexSessionId, currentSession);
+  assert.equal(registry.CODEX6, undefined);
+  assert.match(mcp.errors(), /Codex MCP continuation resolved through rollout lineage to CODEX1/);
+});
+
 test('Claude Code reconnect reclaims the canonical identity from the same transcript lineage', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-claude-reconnect-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

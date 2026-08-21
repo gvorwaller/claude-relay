@@ -189,6 +189,11 @@ never deleted.
   bridge now rebinds through Claude's transcript lineage and unfiltered
   `relay_receive` calls resume from the identity's saved cursor. Use
   `replay=true` only for an intentional history resync.
+- **A resumed Codex task auto-numbered itself even though its old identity was
+  still visible:** update the relay checkout and restart that task once. Codex
+  continuation rollouts now rebind through their `session_meta` lineage,
+  retire only the proven prior bridge, and retain the canonical `CODEXn`
+  identity.
 
 ## Recover a lost owner capability
 
