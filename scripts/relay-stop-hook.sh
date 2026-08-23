@@ -19,7 +19,7 @@
 # the listener stands down. --resolve-only prints the resolved label + anchor
 # pid and exits (for testing).
 set -u
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/Users/gaylonvorwaller/.nvm/versions/node/v24.3.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Remote Macs can run Claude without exposing their NVM directory through the
 # non-interactive hook PATH.  RELAY_NODE_BIN lets the operator point this hook

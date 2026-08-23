@@ -607,7 +607,7 @@ Defaults can be changed with:
 cp com.claude-relay.plist ~/Library/LaunchAgents/
 
 # Edit the plist to fix paths for your system:
-# - Update /usr/local/bin/node to your node path (use `which node`)
+# - Set ProgramArguments[0] to the absolute native Node path from `which node`
 # - Update /Users/yourname/claude-relay to your install path
 
 # Load it

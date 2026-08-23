@@ -1706,7 +1706,7 @@ function isLoopback(address) {
 // Resolved by absolute path, never via PATH: the launchd plist ships a
 // minimal PATH without /usr/sbin, which made every peer lookup fail — and
 // because the binding fails closed, every delegate wake was refused.
-const LSOF_PATH = ['/usr/sbin/lsof', '/usr/bin/lsof', '/opt/homebrew/bin/lsof', '/usr/local/bin/lsof']
+const LSOF_PATH = ['/usr/sbin/lsof', '/usr/bin/lsof', '/opt/homebrew/bin/lsof']
   .find(candidate => { try { require('fs').accessSync(candidate, require('fs').constants.X_OK); return true; } catch { return false; } })
   || 'lsof';
 

@@ -5,7 +5,7 @@
 # registered cwd and its job-scoped relay capability, drains current durable
 # mail, replies when warranted, submits a sanitized report, and exits.
 set -u
-export PATH="/Users/gaylonvorwaller/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/Users/gaylonvorwaller/.local/bin:/Users/gaylonvorwaller/.nvm/versions/node/v24.3.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGISTRY="${RELAY_REGISTRY:-$ROOT/sessions/registry.json}"

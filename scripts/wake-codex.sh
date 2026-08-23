@@ -22,7 +22,7 @@
 #
 # --dry-run prints the resolved session id and exits without resuming.
 set -u
-export PATH="/Users/gaylonvorwaller/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/Users/gaylonvorwaller/.local/bin:/Users/gaylonvorwaller/.nvm/versions/node/v24.3.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 REGISTRY="${RELAY_REGISTRY:-$HOME/claude-relay/sessions/registry.json}"
 FOR="${RELAY_FOR:-}"
