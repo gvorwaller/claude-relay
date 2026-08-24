@@ -116,7 +116,6 @@ const LARGE_RELAY_MESSAGE_BYTES = 4 * 1024;
 const MCP_USAGE_TOOLS = new Set([
   'relay_send',
   'relay_receive',
-  'relay_wait',
   'relay_peers',
   'relay_status',
   'relay_rename',
@@ -863,32 +862,12 @@ wss.on('connection', (ws, req) => {
             delivered: deliverySockets.length > 0
           });
           const encodedEnvelope = JSON.stringify(envelope);
-          // Snapshot matching waits before delivery. The recipient may finish
-          // its local wait and send `attention_wait_cancel` as soon as it
-          // receives the frame, potentially before our send callbacks settle.
-          const attentionCandidates = deliverySockets.map(peer =>
-            attentionWaitMatches(peer, fromId, envelope));
           const deliveryResults = await Promise.all(
             deliverySockets.map(peer => sendAttested(peer, encodedEnvelope))
           );
           const delivered = deliveryResults.some(Boolean);
           const deliveredToDelegate = deliverySockets.some((peer, index) =>
             deliveryResults[index] && peer.delegateOf === to);
-          // A foreground relay_wait is a one-shot claim on the next matching
-          // attention event. Suppress background doorbells only after the
-          // primary socket actually accepted the pushed envelope.
-          const attentionClaimedTargets = new Set();
-          deliverySockets.forEach((peer, index) => {
-            if (!deliveryResults[index] || !attentionCandidates[index]) return;
-            attentionClaimedTargets.add(peer.clientId);
-            peer.attentionWait = null;
-            try {
-              peer.send(JSON.stringify({
-                type: 'attention_claimed',
-                messageId: envelope.id
-              }));
-            } catch { /* delivery was already attested; this is advisory */ }
-          });
 
           if (ws.delegateJob && ws.delegateJob.jobId) {
             // Delivery is recorded only after a WebSocket callback attests
@@ -917,17 +896,13 @@ wss.on('connection', (ws, req) => {
             bytes: Buffer.byteLength(msg.content, 'utf8'),
             delivered
           });
-          notifyWatchers(to, envelope.timestamp, fromId, {
-            messageId: envelope.id,
-            attentionClaimedTargets
-          });
+          notifyWatchers(to, envelope.timestamp, fromId);
           notifyHooks.fire({
             to,
             from: fromId,
             messageId: envelope.id,
             delivered,
-            deliveredToDelegate,
-            attentionClaimedTargets
+            deliveredToDelegate
           });
           break;
 
@@ -951,37 +926,6 @@ wss.on('connection', (ws, req) => {
           if (resultBytes > LARGE_MCP_RESULT_BYTES) usage.largeResults += 1;
           break;
         }
-
-        case 'attention_wait':
-          if (!clientId) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Register before waiting' }));
-            return;
-          }
-          if (ws.delegateOf || ws.watchTarget) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Only a primary identity may claim foreground attention' }));
-            return;
-          }
-          if (msg.from !== null && msg.from !== undefined &&
-              (typeof msg.from !== 'string' || !CLIENT_ID_PATTERN.test(msg.from))) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Attention sender must be a valid client ID' }));
-            return;
-          }
-          ws.attentionWait = {
-            waitId: String(msg.waitId || ''),
-            from: msg.from || null,
-            after: typeof msg.after === 'string' && msg.after ? msg.after : null,
-            startedAt: new Date().toISOString()
-          };
-          ws.send(JSON.stringify({ type: 'attention_waiting', waitId: ws.attentionWait.waitId }));
-          logger.info('attention_wait_started', { clientId, from: ws.attentionWait.from });
-          break;
-
-        case 'attention_wait_cancel':
-          if (ws.attentionWait && String(msg.waitId || '') === ws.attentionWait.waitId) {
-            ws.attentionWait = null;
-            logger.info('attention_wait_cancelled', { clientId });
-          }
-          break;
 
         case 'watch':
           if (!clientId) {
@@ -1462,20 +1406,6 @@ wss.on('connection', (ws, req) => {
             after: msg.after,
             inboundOnly: msg.inboundOnly === true
           });
-          // Durable backlog is foreground work too. If the active attention
-          // claim's matching message is satisfied by history rather than a
-          // live push, consume the claim and advance sleeping watchers so
-          // they cannot immediately re-wake on that already-returned mail.
-          const claimedHistoryMessage = ws.attentionWait && result.messages.find(message =>
-            attentionWaitMatches(ws, message.from, message));
-          if (claimedHistoryMessage) {
-            ws.attentionWait = null;
-            notifyWatchers(ws.delegateOf || clientId, claimedHistoryMessage.timestamp,
-              claimedHistoryMessage.from, {
-                messageId: claimedHistoryMessage.id,
-                attentionClaimedTargets: new Set([ws.delegateOf || clientId])
-              });
-          }
           ws.send(JSON.stringify({
             type: 'history',
             messages: result.messages,
@@ -1587,16 +1517,6 @@ wss.on('connection', (ws, req) => {
             const meta = { ...(clientMeta.get(id) || {}) };
             const usageIdentity = peer?.delegateOf || id;
             if (relayUsage.has(usageIdentity)) meta.relayUsage = { ...relayUsage.get(usageIdentity) };
-            if (peer?.attentionWait) {
-              // Expose only the operator-useful state. The wait ID and durable
-              // cursor are internal coordination details and must not leak
-              // through session enumeration.
-              meta.attention = {
-                state: 'relay-wait',
-                from: peer.attentionWait.from || null,
-                startedAt: peer.attentionWait.startedAt || null
-              };
-            }
             sessions[id] = meta;
           }
           ws.send(JSON.stringify({
@@ -1821,15 +1741,7 @@ function broadcast(message, excludeClient = null) {
   });
 }
 
-function attentionWaitMatches(peer, from, envelope) {
-  const wait = peer && !peer.delegateOf ? peer.attentionWait : null;
-  if (!wait || (wait.from && wait.from !== from)) return false;
-  if (!wait.after) return true;
-  const cursorTime = Date.parse(wait.after);
-  return !Number.isFinite(cursorTime) || Date.parse(envelope.timestamp) > cursorTime;
-}
-
-function notifyWatchers(to, at, from, options = {}) {
+function notifyWatchers(to, at, from) {
   const targets = to === 'all' ? Array.from(watchers.keys()) : [to];
   for (const target of targets) {
     // A broadcast must not wake the sender's own watcher — an agent pinging
@@ -1837,13 +1749,7 @@ function notifyWatchers(to, at, from, options = {}) {
     if (from && target === from) continue;
     const subscribers = watchers.get(target);
     if (!subscribers) continue;
-    // A watcher still needs its durable cursor advanced when foreground work
-    // claimed the message; otherwise its next `since` backfill would raise a
-    // stale doorbell for the already-handled mail.
-    const claimed = options.attentionClaimedTargets && options.attentionClaimedTargets.has(target);
-    const ping = JSON.stringify(claimed
-      ? { type: 'message_claimed', for: target, at, messageId: options.messageId }
-      : { type: 'new_message', for: target, at });
+    const ping = JSON.stringify({ type: 'new_message', for: target, at });
     for (const watcher of subscribers) {
       if (watcher.readyState === 1) watcher.send(ping);
     }

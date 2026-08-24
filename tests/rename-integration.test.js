@@ -182,10 +182,10 @@ test('relay_rename corrects a live MCP session identity without restart', async 
   // Messages addressed to the corrected identity reach the renamed session.
   peer.send(JSON.stringify({ type: 'message', to: 'CODEXTEST1', content: 'review request' }));
   send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: {
-    name: 'relay_wait', arguments: { from: 'OBSERVER', timeoutSeconds: 2 }
+    name: 'relay_receive', arguments: { from: 'OBSERVER' }
   }});
-  const waited = await next(msg => msg.id === 5);
-  assert.match(waited.result.content[0].text, /OBSERVER: review request/);
+  const received = await next(msg => msg.id === 5);
+  assert.match(received.result.content[0].text, /OBSERVER: review request/);
 });
 
 test('a live label cannot be stolen; it frees when its holder dies', async t => {

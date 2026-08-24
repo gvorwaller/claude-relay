@@ -22,7 +22,6 @@ const readline = require('readline');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { RelayWaiter } = require('./relay-waiter');
 const { detectCodexRolloutContext } = require('./codex-rollout-lineage');
 
 // Configuration from args or env
@@ -806,28 +805,6 @@ function sendToolText(requestId, text) {
   });
 }
 
-const relayWaiter = new RelayWaiter({
-  respond: sendToolText,
-  onFinish: ({ requestId }) => {
-    const waitHistory = pendingMessages.find(p =>
-      p.type === 'wait_history' && p.requestId === requestId);
-    if (waitHistory) {
-      waitHistory.settled = true;
-      if (!waitHistory.historyRequested) {
-        pendingMessages = pendingMessages.filter(p => p !== waitHistory);
-      }
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'attention_wait_cancel', waitId: String(requestId) }));
-    }
-  },
-  log: fields => console.error(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    event: 'relay_wait_completed',
-    ...fields
-  }))
-});
-
 // MCP protocol handler
 const rl = readline.createInterface({
   input: process.stdin,
@@ -946,23 +923,6 @@ function handleMcpMessage(message) {
               }
             },
             {
-              name: 'relay_wait',
-              description: 'Wait for the next authorized relay message without polling the relay server',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  from: { type: 'string', description: 'Only return messages from this exact peer ID' },
-                  after: { type: 'string', description: 'Return messages after this durable message ID or ISO timestamp' },
-                  timeoutSeconds: {
-                    type: 'number',
-                    minimum: 1,
-                    maximum: 300,
-                    default: 240
-                  }
-                }
-              }
-            },
-            {
               name: 'relay_peers',
               description: 'List currently connected peer Claude Code instances',
               inputSchema: {
@@ -1068,9 +1028,7 @@ function handleMcpMessage(message) {
           id,
           error: {
             code: -32601,
-            message: params.name === 'relay_wait' && TOOL_PROFILE === 'claude-core'
-              ? 'relay_wait is disabled for Claude Code. End the turn; the content-free Stop hook will wake this session when new relay mail arrives.'
-              : `Tool ${params.name} is not available in the ${TOOL_PROFILE} relay profile.`
+            message: `Tool ${params.name} is not available in the ${TOOL_PROFILE} relay profile.`
           }
         });
         break;
@@ -1132,46 +1090,6 @@ function handleToolCall(requestId, toolName, args) {
         type: 'message',
         to: args.to || 'all',
         content: args.message
-      }));
-      break;
-
-    case 'relay_wait':
-      if (!connected) {
-        sendToolText(requestId, `Relay is disconnected. No cursor was advanced.\nCursor: ${args.after || 'none'}`);
-        return;
-      }
-      if (!relayWaiter.start({
-        requestId,
-        from: args.from,
-        after: args.after,
-        timeoutSeconds: args.timeoutSeconds
-      })) {
-        sendMcpResponse({
-          jsonrpc: '2.0',
-          id: requestId,
-          error: { code: -32000, message: 'A relay_wait call is already active in this MCP process' }
-        });
-        return;
-      }
-
-      // Tell the relay that this foreground tool owns the next matching
-      // attention event BEFORE asking for history. WebSocket ordering makes
-      // the claim visible before the history request, so a newly arriving
-      // message cannot also wake the detached delegate and Stop-hook watcher.
-      pendingMessages.push({
-        requestId,
-        type: 'wait_history',
-        waitId: String(requestId),
-        historyRequested: false,
-        settled: false,
-        from: args.from,
-        after: args.after
-      });
-      ws.send(JSON.stringify({
-        type: 'attention_wait',
-        waitId: String(requestId),
-        from: args.from || null,
-        after: args.after || null
       }));
       break;
 
@@ -1692,7 +1610,6 @@ function connectToRelay() {
       switch (msg.type) {
         case 'operator_remove_identity': {
           shuttingDown = true;
-          relayWaiter.finish('cancel');
           if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
@@ -1849,37 +1766,11 @@ function connectToRelay() {
           }
           break;
 
-        case 'attention_waiting': {
-          const waitReq = pendingMessages.find(p =>
-            p.type === 'wait_history' && p.waitId === String(msg.waitId || ''));
-          if (waitReq && !waitReq.settled && !waitReq.historyRequested) {
-            waitReq.historyRequested = true;
-            ws.send(JSON.stringify({
-              type: 'get_history',
-              count: 100,
-              from: waitReq.from,
-              after: waitReq.after
-            }));
-          }
-          break;
-        }
-
         case 'history':
-          const histReq = pendingMessages.find(p => p.type === 'history' || p.type === 'wait_history');
+          const histReq = pendingMessages.find(p => p.type === 'history');
           if (histReq) {
             pendingMessages = pendingMessages.filter(p => p !== histReq);
             const messages = msg.messages || [];
-            if (histReq.type === 'wait_history') {
-              // This may be the losing half of a push/history race. In that
-              // case it is deliberately consumed without a second response.
-              console.error(JSON.stringify({
-                timestamp: new Date().toISOString(),
-                event: 'relay_wait_history_received',
-                messageCount: messages.length
-              }));
-              relayWaiter.deliverHistory(messages);
-              break;
-            }
             if (histReq.tracksMailboxCursor) {
               // An unknown cursor must not silently become start-of-history on
               // the next call. Keep it pinned until the caller explicitly
@@ -1997,8 +1888,7 @@ function connectToRelay() {
           break;
 
         case 'message':
-          // Keep nonmatching messages available to relay_receive. A matching
-          // active waiter is settled directly by the pushed durable envelope.
+          // Keep pushed messages available to relay_receive.
           messageQueue.push({
             type: 'message',
             id: msg.id,
@@ -2007,7 +1897,6 @@ function connectToRelay() {
             content: msg.content,
             timestamp: msg.timestamp
           });
-          relayWaiter.deliver(msg, 'push');
           break;
 
         case 'sent':
@@ -2079,10 +1968,6 @@ function connectToRelay() {
         `Relay disconnected before the rename to "${pendingRename.newId}" was confirmed; identity unchanged ("${CLIENT_ID}").`);
       pendingRename = null;
     }
-    relayWaiter.finish('disconnect');
-    // Any in-flight history response belonged to this closed socket and can
-    // never arrive. Do not let its tombstone consume a post-reconnect reply.
-    pendingMessages = pendingMessages.filter(p => p.type !== 'wait_history');
     // Attempt reconnect after delay — unless displaced (reconnecting under a
     // taken-over ID just re-seizes it and starts an endless takeover fight)
     // or rejected (the label's live owner would refuse us again forever).
@@ -2103,7 +1988,6 @@ function connectToRelay() {
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  relayWaiter.finish('cancel');
   if (reconnectTimer) clearTimeout(reconnectTimer);
   updateRegistry('disconnect');
   if (ws) ws.close();

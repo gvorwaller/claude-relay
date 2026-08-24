@@ -45,9 +45,7 @@ completed activity or durable message history.
 Select **Peers and sessions** to see live agent identities, background watcher
 count, and each connection's reported host, client source, working directory,
 and process ID. Identities still using the local credential-migration fallback
-are labeled there as well. A session with an active `relay_wait` is labeled
-**waiting for relay mail**, including the exact sender filter (or any sender)
-and the local time when the wait began.
+are labeled there as well.
 
 The same screen labels each connection's relay tool profile separately from
 its identity. For example, `CC1` remains the durable identity while **Claude
@@ -121,10 +119,11 @@ merge the two event definitions instead.
    status as transport evidence; neither is a claim that the peer accepted the
    work as correct.
 
-Claude Code should not sit in `relay_wait`. Its lean relay profile omits that
-tool: end the turn and let the content-free Stop hook wake the same named
-identity when mail arrives. When sending substantial work, reference a shared
-file path or commit rather than embedding a long report in the relay message.
+Agents should end the turn whenever they need a later relay reply. Claude Code's
+content-free Stop hook wakes the same named identity; server-side hooks start
+Codex, Grok, and AGY delegates. When sending substantial work, reference a
+shared file path or commit rather than embedding a long report in the relay
+message.
 
 ## Enable AGY once
 

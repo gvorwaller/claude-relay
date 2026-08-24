@@ -19,7 +19,7 @@ done
 [[ -z "$FOR" ]] && { echo "error: peer ID required (RELAY_FOR or first argument)"; exit 2; }
 [[ "$FOR" == "all" ]] && exit 64
 
-DEFAULT_PROMPT='[Automated wake from claude-relay - no human typed this.] You are a fresh headless delegate for the relay identity named in your environment. Use the claude-relay MCP tools to receive unread durable mail addressed to that identity. Act on the request in its registered working directory and reply to the sender with relay_send when warranted. Do not rename, reclaim, or displace the foreground identity. Do not open relay_wait; the notify hook will start another delegate for later mail. Your final response must match the required JSON schema and must not include hidden reasoning, secrets, or raw tool output.'
+DEFAULT_PROMPT='[Automated wake from claude-relay - no human typed this.] You are a fresh headless delegate for the relay identity named in your environment. Use the claude-relay MCP tools to receive unread durable mail addressed to that identity. Act on the request in its registered working directory and reply to the sender with relay_send when warranted. Do not rename, reclaim, or displace the foreground identity. End the turn after current mail is handled; the notify hook will start another delegate for later mail. Your final response must match the required JSON schema and must not include hidden reasoning, secrets, or raw tool output.'
 PROMPT="${ARGS[1]:-$DEFAULT_PROMPT}"
 
 registry_cwd() {

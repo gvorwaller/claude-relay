@@ -2,7 +2,10 @@
 
 Status: proposed (design only, no code yet)
 Motivating incident: 2026-08-02 branch-C QA handoff (trips repo)
-Related: `docs/2026-07-12-relay-wait-coordination-spec.md` (blocking wait semantics)
+
+> **Current status:** wake hooks are now implemented for every supported
+> harness. The former blocking wait tool was retired; agents receive durable
+> mail, reply, and end their turn so hooks can start the next turn on demand.
 
 ## The incident, as a spec
 
@@ -28,7 +31,6 @@ nobody can see that a peer has unread mail. This doc addresses both.
 |---|---|---|
 | Durable store + cursors | `message-store.js` | Reliable async delivery; nothing is lost while a peer is away |
 | `delivered` flag | `server.js` `case 'message'` | Server already knows at append time whether the target socket was live |
-| Blocking in-turn wait | `relay_wait` in `mcp-server.js`, `relay-waiter.js` | A *live* turn can listen push-based for ≤300 s |
 | Content-free watch protocol | `server.js` `case 'watch'` + `notifyWatchers()` | Any socket can subscribe to "a message for X exists" pings, with no content or history visibility |
 | Watch CLI | `scripts/relay-watch.js` | A process that exits `new-message` when mail arrives for `--for X` |
 
@@ -45,9 +47,9 @@ guessing.
 Add an explicit read acknowledgement to the protocol:
 
 - New client→server message: `{ type: 'ack_read', cursor: <messageId> }`.
-  The MCP server sends it automatically whenever `relay_receive` or
-  `relay_wait` returns messages to the model — no new tool, no model
-  cooperation needed. Server keeps `Map<clientId, { cursor, at }>`, persisted
+  The MCP server sends it automatically whenever `relay_receive` returns
+  messages to the model — no new tool or model cooperation needed. Server
+  keeps `Map<clientId, { cursor, at }>`, persisted
   to `data/read-state.json` so restarts don't reset it.
 - `get_sessions` / `get_peers` responses gain per-peer
   `{ unreadCount, lastReadAt, oldestUnreadAt }`, computed against the store
@@ -161,9 +163,8 @@ slots into an `exec` hook without touching the server again.
 
 - `message-store` / server integration tests: `ack_read` persistence, unread
   computation against `to` and `all`, restart survival, never-connected peers.
-- Waiter regression: `ack_read` emission from `relay_receive`/`relay_wait`
-  paths must not change `relay-waiter.js` cursor semantics (existing tests in
-  `tests/relay-waiter.test.js` stay green).
+- Receive regression: `ack_read` emission from `relay_receive` must preserve
+  durable cursor semantics and never replay an unknown cursor implicitly.
 - Notify hooks: unit-test debounce and `onlyIfUndelivered` against a fake
   exec/banner runner; integration test that a hook failure leaves message
   handling untouched.

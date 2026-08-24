@@ -324,16 +324,15 @@ reported `toolProfile` is separate metadata shown by **Peers and sessions**.
 Claude Code is detected from its session metadata and receives the lean
 `claude-core` profile: `relay_send`, `relay_receive`, `relay_peers`,
 `relay_status`, and `relay_rename`. It intentionally does not receive
-`relay_wait` or the operator/admin tools. Claude should end its turn when it is
-waiting for a reply; the content-free global Stop hook wakes that same session
-when mail arrives. Codex, Grok, AGY, and explicit `RELAY_TOOL_PROFILE=full`
-clients retain the complete tool catalog:
+the operator/admin tools. Every agent should end its turn when waiting for a
+reply: the content-free global Stop hook wakes Claude Code, while server-side
+hooks start Codex, Grok, and AGY delegates. Explicit
+`RELAY_TOOL_PROFILE=full` clients additionally receive the operator/admin tools:
 
 | Tool | Description |
 |------|-------------|
 | `relay_send` | Send a message to peer Claude Code instance(s) |
 | `relay_receive` | Get recent messages from peers |
-| `relay_wait` | Block for the next matching pushed message, with durable catch-up |
 | `relay_peers` | List currently connected instances |
 | `relay_status` | Check connection health |
 | `relay_rename` | Rename this session's live relay identity at runtime — no restart or env vars; the old ID is released immediately |
@@ -379,34 +378,21 @@ authorized history view and do not move the mailbox cursor.
 Direct-message history is visible only to its sender and recipient; broadcasts
 are visible to all peers.
 
-**Coordinate continuously with a peer:**
+**Coordinate asynchronously with a peer:**
 ```
 Use the relay-coordinate skill to coordinate with CC2 until it sends RELAY_DONE
 ```
 
-`relay_wait` accepts an exact optional `from` peer ID, an optional `after`
-cursor (message UUID or ISO timestamp), and `timeoutSeconds` from 1 through 300
-(default 240). It first requests authorized durable history, then waits on the
-existing WebSocket push path without polling the relay server. A returned
-message includes its UUID cursor; pass that cursor as `after` on the next call.
-Timeout and disconnect results do not advance the cursor.
-
-While a foreground `relay_wait` is active, **Peers and sessions** in
-`relay-monitor` labels that live identity as waiting for relay mail. The label
-shows its exact sender filter (or any sender) and the wait start time in the
-operator's local timezone. Wait IDs and durable cursors remain internal.
-
-The portable [`relay-coordinate`](skills/relay-coordinate/SKILL.md) skill loops
-after normal timeouts, processes one peer request at a time, replies to the
-exact peer, and stops on the exact `RELAY_DONE` token. Coordination remains an
-intentionally active agent turn: it never interrupts running work and cannot
-wake Claude Code or Codex after the session has returned control to the user.
+The portable [`relay-coordinate`](skills/relay-coordinate/SKILL.md) skill
+processes one peer request at a time, replies to the exact peer, preserves the
+durable cursor, and ends the turn. The configured hook starts the next turn
+only when new mail arrives. No model turn is held open and no polling loop is
+required.
 
 ### Background doorbell for interactive Claude Code sessions
 
-`relay_wait` intentionally holds its MCP tool call open and therefore is not
-advertised to Claude Code. For an interactive Claude Code session, use the
-content-free watcher as a background Bash task instead:
+The content-free watcher remains the low-level doorbell used by Claude Code's
+automatic Stop hook and is also available for operator diagnostics:
 
 ```bash
 node ~/claude-relay/scripts/relay-watch.js --for CC2 --timeout 240

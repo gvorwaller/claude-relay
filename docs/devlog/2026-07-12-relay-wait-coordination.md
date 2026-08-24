@@ -1,5 +1,9 @@
 # 2026-07-12 - Blocking Relay Wait and Agent Coordination
 
+> Historical record only: the blocking wait tool described below was retired
+> after hook-driven wake delivery became available for every supported harness.
+> Do not follow its coordination instructions; receive, reply, and end the turn.
+
 ## 16:53 EDT - `relay_wait`, `relay-coordinate`, and Global Claude MCP Setup
 
 ### Summary

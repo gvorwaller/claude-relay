@@ -83,10 +83,10 @@ test('Claude Code automatically receives the lean relay profile', async t => {
     name: 'relay_wait', arguments: { timeoutSeconds: 1 }
   }});
   assert.match((await next(message => message.id === 3)).error.message,
-    /disabled for Claude Code.*Stop hook/);
+    /not available in the claude-core relay profile/);
 });
 
-test('explicit full profile overrides Claude Code auto-detection without changing identity', async t => {
+test('explicit full profile keeps admin tools but does not expose retired relay_wait', async t => {
   const mcp = spawn(process.execPath, [
     path.join(__dirname, '..', 'mcp-server.js'), '--relay-url=ws://127.0.0.1:1'
   ], {
@@ -106,6 +106,11 @@ test('explicit full profile overrides Claude Code auto-detection without changin
   await next(message => message.id === 1);
   send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = (await next(message => message.id === 2)).result.tools.map(tool => tool.name);
-  assert.ok(names.includes('relay_wait'));
+  assert.ok(!names.includes('relay_wait'));
   assert.ok(names.includes('relay_delegate_jobs'));
+
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+    name: 'relay_wait', arguments: { timeoutSeconds: 1 }
+  }});
+  assert.match((await next(message => message.id === 3)).error.message, /Unknown tool: relay_wait/);
 });

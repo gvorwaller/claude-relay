@@ -9,11 +9,9 @@ model. `CC1` remains `CC1`; a tool profile is independent session metadata.
 ## Changes
 
 1. **Lean Claude Code profile.** Claude Code bridges advertise only send,
-   receive, peers, status, and rename. They do not advertise `relay_wait` or
-   operator/admin tools. A hidden cached call fails with instructions to end
-   the turn and rely on the content-free Stop hook. Other harnesses keep the
-   full profile, and `RELAY_TOOL_PROFILE=full|claude-core` is an explicit
-   override for controlled deployments.
+   receive, peers, status, and rename. They do not advertise operator/admin
+   tools. Other harnesses may keep the full administrative profile, but no
+   profile exposes a blocking wait tool; every harness relies on wake hooks.
 2. **Inbound-only ordinary receive.** Unfiltered mailbox reads exclude the
    identity's own outbound direct messages and broadcasts. Explicit filtered
    audit reads keep the existing authorized-history semantics; `replay=true`
@@ -39,8 +37,8 @@ running relay remains on its existing checkout and behavior.
 
 - Message-store tests prove ordinary reads omit the caller's own traffic while
   explicit reads retain the broader authorized view.
-- MCP catalog tests prove Claude Code receives the five-tool profile and a
-  stale `relay_wait` call fails with Stop-hook guidance.
+- MCP catalog tests prove Claude Code receives the five-tool profile and the
+  full administrative profile does not expose the retired wait tool.
 - A real MCP-to-relay integration test proves `CC1` remains the exact identity,
   reports `claude-core`, and emits usage metrics after a tool response.
 - Server and monitor tests prove aggregation, thresholds, and rendering.

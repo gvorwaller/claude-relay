@@ -39,9 +39,8 @@ delegate is actually running.
   bodies are not stored in the activity stream.
 - The final response is constrained by `delegate-result-schema.json` and
   submitted through the existing job capability/result-secret path.
-- The worker drains current durable mail and exits; it never opens
-  `relay_wait`. Existing single-flight and trailing-wake logic handles mail
-  arriving while it runs.
+- The worker drains current durable mail and exits. Existing single-flight and
+  trailing-wake logic handles mail arriving while it runs.
 
 ## Verification
 

@@ -58,9 +58,8 @@ launchctl kickstart -k gui/501/com.claude-relay
 ```
 
 The restart is the only step that touches live traffic: in-flight messages are
-already durable and every client reconnects within ~5 seconds, but a
-`relay_wait` open at that instant returns `disconnect` and needs re-arming. Do
-it in a quiet window.
+already durable, every client reconnects within ~5 seconds, and hook watchers
+re-arm against durable cursors. Do it in a quiet window.
 
 ## Verifying a release
 

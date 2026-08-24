@@ -39,8 +39,8 @@ the missing bridge between durable delivery and an agent turn.
   writers and accidental context injection into the visible conversation.
 - Never pass capabilities in argv. The existing 0600 token and result-secret
   files are inherited through the spawned process tree.
-- Never use `relay_wait` in a wake. A wake drains current durable mail, replies,
-  and ends; later mail produces another wake.
+- A wake drains current durable mail, replies, and ends; later mail produces
+  another wake.
 - Avoid acknowledgment loops. A receipt or terminal acknowledgment with no new
   request should be consumed without another reply.
 - Preserve human visibility. Job state, server-observed outbound replies,
