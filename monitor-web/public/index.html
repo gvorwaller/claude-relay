@@ -36,6 +36,19 @@
     <div class="dialog-heading"><h2 id="detail-title">Delegate detail</h2><button id="close-detail" type="button" aria-label="Close">×</button></div>
     <div id="detail-body"></div>
   </dialog>
+  <dialog id="stop-confirm">
+    <div class="dialog-heading"><h2>Stop stuck delegate?</h2><button id="close-stop" type="button" aria-label="Close">×</button></div>
+    <div class="action-body">
+      <p>This acts only on the exact job shown below. Review the local-agent preview before confirming.</p>
+      <dl id="stop-facts" class="detail-facts"></dl>
+      <ul id="stop-consequences" class="timeline"></ul>
+      <p id="stop-error" class="action-error" role="alert"></p>
+      <div class="action-buttons">
+        <button id="cancel-stop" type="button" class="secondary-button">Cancel</button>
+        <button id="confirm-stop" type="button" class="danger-button">Stop exact delegate</button>
+      </div>
+    </div>
+  </dialog>
   <script src="/app.js" defer></script>
 </body>
 </html>

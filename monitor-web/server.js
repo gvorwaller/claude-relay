@@ -3,10 +3,12 @@
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { WebSocketServer } = require('ws');
 const { AccessJwtVerifier, BrowserAuth } = require('./auth');
 const {
-  createChallenge, envelope, parseEnvelope, validateSnapshot, verifyHandshakeMac
+  createChallenge, envelope, parseEnvelope, validateAgentCommand, validateAgentResult,
+  validateSnapshot, verifyHandshakeMac
 } = require('../monitor-protocol');
 
 const PUBLIC_ROOT = path.join(__dirname, 'public');
@@ -87,13 +89,15 @@ function createMonitorWebServer(options = {}) {
     teamDomain: process.env.CF_ACCESS_TEAM_DOMAIN,
     audience: process.env.CF_ACCESS_AGENT_AUD || process.env.CF_ACCESS_AUD
   });
+  const enableStopDelegate = options.enableStopDelegate === undefined
+    ? process.env.MONITOR_STOP_DELEGATE_ENABLED === '1' : options.enableStopDelegate;
   const state = {
     agent: null,
     snapshot: null,
     lastHeartbeat: null,
     events: [],
     sse: new Set(),
-    agentAuthFailures: new Map()
+    agentAuthFailures: new Map(), pendingActions: new Map(), actionAudit: []
   };
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
@@ -108,7 +112,71 @@ function createMonitorWebServer(options = {}) {
   }
 
   function publicSnapshot() {
-    return state.snapshot ? { ...state.snapshot, agent: agentState() } : { version: 1, snapshot: null, agent: agentState() };
+    const additions = {
+      agent: agentState(),
+      features: {
+        stopDelegate: enableStopDelegate && Boolean(state.agent?.authenticated)
+          && agentState().state === 'fresh'
+      },
+      recentActions: state.actionAudit.slice(-20)
+    };
+    return state.snapshot ? { ...state.snapshot, ...additions } : { version: 1, snapshot: null, ...additions };
+  }
+
+  function commandFailure(message, code = 'unavailable') {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  function requestAgentCommand(type, details, expectedType, timeoutMs) {
+    if (!enableStopDelegate) return Promise.reject(commandFailure('Remote actions are disabled', 'disabled'));
+    const connection = state.agent;
+    if (!connection?.authenticated || connection.ws.readyState !== 1 || agentState().state !== 'fresh') {
+      return Promise.reject(commandFailure('The local relay agent is unavailable'));
+    }
+    const requestId = randomUUID();
+    const payload = validateAgentCommand(type, { requestId, action: 'stop_delegate', ...details });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        state.pendingActions.delete(requestId);
+        reject(commandFailure(type === 'confirm_request'
+          ? 'Action result is unknown; refresh before taking another action'
+          : 'The local relay agent did not answer the preview', type === 'confirm_request' ? 'unknown' : 'timeout'));
+      }, timeoutMs);
+      timer.unref?.();
+      state.pendingActions.set(requestId, { connection, expectedType, resolve, reject, timer, type, details });
+      try {
+        connection.ws.send(JSON.stringify(envelope(type, connection.outgoingSequence, payload)));
+        connection.outgoingSequence += 1;
+      } catch {
+        clearTimeout(timer);
+        state.pendingActions.delete(requestId);
+        reject(commandFailure('The local relay agent disconnected'));
+      }
+    });
+  }
+
+  function settleAgentResult(connection, message) {
+    const payload = validateAgentResult(message.type, message.payload);
+    const pending = state.pendingActions.get(payload.requestId);
+    if (!pending || pending.connection !== connection || pending.expectedType !== message.type) {
+      throw new Error('Unexpected monitor action result');
+    }
+    clearTimeout(pending.timer);
+    state.pendingActions.delete(payload.requestId);
+    if (message.type === 'action_result') {
+      const result = payload.ok ? payload.result : null;
+      const audit = {
+        action: 'stop_delegate', jobId: pending.details.jobId,
+        owner: result?.owner || null, outcome: payload.ok ? result.status : 'rejected',
+        at: result?.completedAt || new Date(now()).toISOString()
+      };
+      state.actionAudit.push(audit);
+      if (state.actionAudit.length > 100) state.actionAudit.shift();
+      broadcast('action', audit);
+    }
+    pending.resolve(payload);
   }
 
   function agentFailures(remoteAddress) {
@@ -215,6 +283,37 @@ function createMonitorWebServer(options = {}) {
         const job = jobs.find(item => item.jobId === jobId);
         return job ? json(res, 200, job) : json(res, 404, { error: 'Delegate job is unavailable' });
       }
+      if (req.method === 'POST' && url.pathname === '/api/v1/actions/stop-delegate/preview') {
+        if (!enableStopDelegate) return json(res, 404, { error: 'Remote actions are disabled' });
+        if (!browserAuth.verifyCsrf(auth, req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token' });
+        const body = JSON.parse(await readBody(req));
+        if (!body || Object.keys(body).join(',') !== 'jobId' || !JOB_ID.test(body.jobId || '')) {
+          return json(res, 400, { error: 'Choose one exact active delegate job' });
+        }
+        const active = state.snapshot?.activeWork?.find(job => job.jobId === body.jobId && job.actions?.stopDelegate === true);
+        if (!active) return json(res, 409, { error: 'That delegate is no longer active' });
+        try {
+          const result = await requestAgentCommand('preview_request', { jobId: body.jobId }, 'preview_result', 5_000);
+          return result.ok ? json(res, 200, result.preview) : json(res, 409, { error: result.error });
+        } catch (error) {
+          return json(res, error.code === 'timeout' ? 504 : 503, { error: error.message });
+        }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/v1/actions/stop-delegate/confirm') {
+        if (!enableStopDelegate) return json(res, 404, { error: 'Remote actions are disabled' });
+        if (!browserAuth.verifyCsrf(auth, req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token' });
+        const body = JSON.parse(await readBody(req));
+        if (!body || Object.keys(body).sort().join(',') !== 'confirmationToken,jobId'
+          || !JOB_ID.test(body.jobId || '')) return json(res, 400, { error: 'Invalid stop confirmation' });
+        try {
+          const result = await requestAgentCommand('confirm_request', body, 'action_result', 10_000);
+          return result.ok ? json(res, 200, result.result) : json(res, 409, { error: result.error });
+        } catch (error) {
+          return json(res, error.code === 'unknown' ? 504 : 503, {
+            error: error.message, resultUnknown: error.code === 'unknown'
+          });
+        }
+      }
       if (req.method === 'POST' && url.pathname.startsWith('/api/v1/actions/')) {
         return json(res, 404, { error: 'Remote actions are disabled in the read-only release' });
       }
@@ -257,7 +356,7 @@ function createMonitorWebServer(options = {}) {
     const challenge = createChallenge();
     const connection = {
       ws, challenge, challengeExpiresAt: now() + 30_000,
-      authenticated: false, expectedSequence: 0
+      authenticated: false, expectedSequence: 0, outgoingSequence: 1
     };
     state.agent = connection;
     ws.send(JSON.stringify(envelope('agent_hello', 0, { installationId, challenge })));
@@ -267,7 +366,7 @@ function createMonitorWebServer(options = {}) {
     handshakeTimeout.unref();
     ws.on('message', raw => {
       try {
-        const message = parseEnvelope(raw, { readOnlyAgent: true });
+        const message = parseEnvelope(raw, { readOnlyAgent: !enableStopDelegate });
         if (!connection.authenticated) {
           const keys = Object.keys(message.payload).sort().join(',');
           if (message.type !== 'agent_hello' || message.sequence !== 0 || keys !== 'challenge,installationId,mac'
@@ -295,8 +394,11 @@ function createMonitorWebServer(options = {}) {
           state.events.push({ sequence: message.sequence, generatedAt: message.generatedAt, payload: message.payload });
           if (state.events.length > 100) state.events.shift();
           broadcast('event', message.payload);
+        } else if (message.type === 'preview_result' || message.type === 'action_result') {
+          if (!enableStopDelegate) throw new Error('Remote actions are disabled');
+          settleAgentResult(connection, message);
         } else if (message.type !== 'protocol_error') {
-          throw new Error('Unsupported read-only agent message');
+          throw new Error('Unsupported agent message');
         }
       } catch (error) {
         if (!connection.authenticated) {
@@ -310,6 +412,14 @@ function createMonitorWebServer(options = {}) {
     ws.on('close', () => {
       clearTimeout(handshakeTimeout);
       if (state.agent === connection) state.agent = null;
+      for (const [requestId, pending] of state.pendingActions) {
+        if (pending.connection !== connection) continue;
+        clearTimeout(pending.timer);
+        state.pendingActions.delete(requestId);
+        pending.reject(commandFailure(pending.type === 'confirm_request'
+          ? 'Action result is unknown; refresh before taking another action'
+          : 'The local relay agent disconnected', pending.type === 'confirm_request' ? 'unknown' : 'unavailable'));
+      }
       broadcast('agent', agentState());
     });
   });

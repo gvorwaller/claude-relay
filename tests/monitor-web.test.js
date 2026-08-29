@@ -25,7 +25,7 @@ function snapshot(owner = 'CC1') {
       completedAt: null, requestedAgeMs: 300000, runAgeMs: 300000,
       lastActivityAt: '2026-08-29T15:59:00.000Z', lastActivityAgeMs: 60000,
       latestActivity: { type: 'waiting', label: 'Waiting' }, processAlive: true,
-      stalled: null, outbound: [], activity: [], summary: null, changes: null,
+      stalled: null, actions: { stopDelegate: true }, outbound: [], activity: [], summary: null, changes: null,
       verification: [], error: null
     }],
     recentWork: [], identities: [], topologyError: null
@@ -60,6 +60,12 @@ async function login(base) {
   });
   assert.equal(response.status, 200);
   return response.headers.get('set-cookie').split(';')[0];
+}
+
+async function sessionCsrf(base, cookie) {
+  const response = await fetch(`${base}/api/v1/session`, { headers: { Cookie: cookie } });
+  assert.equal(response.status, 200);
+  return (await response.json()).csrf;
 }
 
 function connectAgent(url, secret = AGENT_SECRET) {
@@ -222,4 +228,136 @@ test('real outbound agent completes handshake and publishes the full replacement
   agent.start();
   await waitFor(() => app.state.snapshot?.activeWork?.[0]?.owner === 'AGY');
   assert.equal(app.state.agent.authenticated, true);
+});
+
+test('stop endpoints are disabled by default and require CSRF when enabled', async t => {
+  const disabled = await startWeb(t, { browserAuth: passwordAuth() });
+  const disabledCookie = await login(disabled.base);
+  const response = await fetch(`${disabled.base}/api/v1/actions/stop-delegate/preview`, {
+    method: 'POST', headers: { Cookie: disabledCookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId: 'wake_10000000-0000-4000-8000-000000000001' })
+  });
+  assert.equal(response.status, 404);
+
+  const enabled = await startWeb(t, { browserAuth: passwordAuth(), enableStopDelegate: true });
+  enabled.state.snapshot = snapshot();
+  const cookie = await login(enabled.base);
+  const rejected = await fetch(`${enabled.base}/api/v1/actions/stop-delegate/preview`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId: enabled.state.snapshot.activeWork[0].jobId })
+  });
+  assert.equal(rejected.status, 403);
+});
+
+test('browser preview and confirmation round-trip through the agent exactly once', async t => {
+  const app = await startWeb(t, { browserAuth: passwordAuth(), enableStopDelegate: true });
+  const jobId = 'wake_10000000-0000-4000-8000-000000000001';
+  const confirmationToken = 'Z'.repeat(43);
+  let consumed = false;
+  let confirmations = 0;
+  const stopController = {
+    preview(exactJobId) {
+      assert.equal(exactJobId, jobId);
+      return {
+        action: 'stop_delegate', jobId, owner: 'CC1', processAlive: true,
+        consequences: [
+          'The exact active delegate process group will be terminated.',
+          'The delegate job will become interrupted.',
+          'Its audit record and durable relay mail will be preserved.'
+        ],
+        confirmationToken, expiresAt: new Date(Date.now() + 60_000).toISOString()
+      };
+    },
+    async confirm(exactJobId, token) {
+      if (exactJobId !== jobId || token !== confirmationToken || consumed) {
+        throw new Error('Confirmation is invalid or already used');
+      }
+      consumed = true;
+      confirmations += 1;
+      return {
+        action: 'stop_delegate', jobId, owner: 'CC1', status: 'interrupted',
+        signaled: true, completedAt: new Date().toISOString()
+      };
+    }
+  };
+  const agent = createMonitorAgent({
+    url: app.wsUrl, installationId: 'home-relay', secret: AGENT_SECRET,
+    allowInsecure: true, enableStopDelegate: true, stopController,
+    snapshotIntervalMs: 60_000, heartbeatIntervalMs: 60_000,
+    buildSnapshot: async () => snapshot(), logger: { info() {}, warn() {} }
+  });
+  t.after(() => agent.stop());
+  agent.start();
+  await waitFor(() => app.state.snapshot?.activeWork?.[0]?.jobId === jobId);
+  const cookie = await login(app.base);
+  const csrf = await sessionCsrf(app.base, cookie);
+  const headers = { Cookie: cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf };
+
+  const previewResponse = await fetch(`${app.base}/api/v1/actions/stop-delegate/preview`, {
+    method: 'POST', headers, body: JSON.stringify({ jobId })
+  });
+  assert.equal(previewResponse.status, 200);
+  const preview = await previewResponse.json();
+  assert.equal(preview.confirmationToken, confirmationToken);
+  assert.doesNotMatch(JSON.stringify(preview), /pid|signal|command/i);
+
+  const confirm = () => fetch(`${app.base}/api/v1/actions/stop-delegate/confirm`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ jobId, confirmationToken: preview.confirmationToken })
+  });
+  const first = await confirm();
+  assert.equal(first.status, 200);
+  assert.equal((await first.json()).status, 'interrupted');
+  const replay = await confirm();
+  assert.equal(replay.status, 409);
+  assert.equal(confirmations, 1);
+  assert.equal(app.state.actionAudit.length, 2);
+  assert.deepEqual(app.state.actionAudit.map(item => item.outcome), ['interrupted', 'rejected']);
+});
+
+test('agent disconnect after confirmation reports unknown and never retries the mutation', async t => {
+  const app = await startWeb(t, { browserAuth: passwordAuth(), enableStopDelegate: true });
+  const jobId = 'wake_10000000-0000-4000-8000-000000000001';
+  const confirmationToken = 'Y'.repeat(43);
+  let confirmations = 0;
+  const stopController = {
+    preview() {
+      return {
+        action: 'stop_delegate', jobId, owner: 'CC1', processAlive: true,
+        consequences: ['Exact process group stops.', 'Job becomes interrupted.', 'Durable mail remains.'],
+        confirmationToken, expiresAt: new Date(Date.now() + 60_000).toISOString()
+      };
+    },
+    confirm() {
+      confirmations += 1;
+      return new Promise(() => {});
+    }
+  };
+  const agent = createMonitorAgent({
+    url: app.wsUrl, installationId: 'home-relay', secret: AGENT_SECRET,
+    allowInsecure: true, enableStopDelegate: true, stopController,
+    snapshotIntervalMs: 60_000, heartbeatIntervalMs: 60_000,
+    buildSnapshot: async () => snapshot(), logger: { info() {}, warn() {} }
+  });
+  t.after(() => agent.stop());
+  agent.start();
+  await waitFor(() => app.state.snapshot?.activeWork?.[0]?.jobId === jobId);
+  const cookie = await login(app.base);
+  const csrf = await sessionCsrf(app.base, cookie);
+  const headers = { Cookie: cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf };
+  const previewResponse = await fetch(`${app.base}/api/v1/actions/stop-delegate/preview`, {
+    method: 'POST', headers, body: JSON.stringify({ jobId })
+  });
+  const preview = await previewResponse.json();
+  const pending = fetch(`${app.base}/api/v1/actions/stop-delegate/confirm`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ jobId, confirmationToken: preview.confirmationToken })
+  });
+  await waitFor(() => confirmations === 1);
+  app.state.agent.ws.terminate();
+  const response = await pending;
+  assert.equal(response.status, 504);
+  assert.equal((await response.json()).resultUnknown, true);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(confirmations, 1);
 });

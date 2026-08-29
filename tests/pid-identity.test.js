@@ -153,6 +153,9 @@ function releaseWake(outDir, base) {
 
 test('local operator can terminate one active delegate process group', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-terminate-'));
+  fs.mkdirSync(path.join(root, 'messages'));
+  const durableMail = path.join(root, 'messages', '2026-08-29.jsonl');
+  fs.writeFileSync(durableMail, `${JSON.stringify({ id: 'preserved', from: 'TERMINATE-SOURCE', to: 'CODEX1', content: 'durable' })}\n`);
   const configPath = path.join(root, 'notify.json');
   fs.writeFileSync(configPath, JSON.stringify({
     '*': [{ type: 'exec', command: 'sleep 120' }]
@@ -190,6 +193,7 @@ test('local operator can terminate one active delegate process group', async t =
   const stopped = JSON.parse(fs.readFileSync(path.join(root, 'jobs', `${job.jobId}.json`), 'utf8'));
   assert.equal(stopped.status, 'interrupted');
   assert.match(stopped.reason, /local operator/);
+  assert.match(fs.readFileSync(durableMail, 'utf8'), /"id":"preserved"/);
 });
 
 

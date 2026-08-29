@@ -62,11 +62,19 @@ dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(3px); }
 .dialog-heading { position: sticky; top: 0; display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .dialog-heading button { border: 0; color: var(--muted); background: transparent; font-size: 1.7rem; cursor: pointer; }
 #detail-body { padding: 20px; }
+.action-body { padding: 20px; }
 .detail-facts { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; margin: 0; }
 .detail-facts dt { color: var(--muted); }
 .detail-facts dd { margin: 0; overflow-wrap: anywhere; }
 .report { white-space: pre-wrap; color: #d7dde4; line-height: 1.5; }
 .timeline { margin: 0; padding-left: 20px; color: #d7dde4; line-height: 1.7; }
+.danger-button, .secondary-button { margin-top: 20px; padding: 11px 14px; border: 1px solid transparent; border-radius: 10px; font: inherit; font-weight: 750; cursor: pointer; }
+.danger-button { color: #fff; background: #a62d32; }
+.danger-button:hover, .danger-button:focus-visible { background: #c23a40; outline: 2px solid #ff8f8a; outline-offset: 2px; }
+.danger-button:disabled { cursor: wait; opacity: .55; }
+.secondary-button { color: var(--text); border-color: var(--line); background: var(--panel-2); }
+.action-buttons { display: flex; justify-content: flex-end; gap: 10px; }
+.action-error { min-height: 1.4em; margin: 16px 0 0; color: var(--red); }
 .login-page { display: grid; place-items: center; padding: 20px; }
 .login-card { width: min(420px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
 label { display: block; margin: 26px 0 8px; color: var(--muted); font-size: .85rem; }

@@ -4,8 +4,10 @@
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
-const { buildMonitorSnapshot } = require('../monitor-model');
-const { envelope, handshakeMac, parseEnvelope } = require('../monitor-protocol');
+const { buildMonitorSnapshot, createStopDelegateController } = require('../monitor-model');
+const {
+  envelope, handshakeMac, parseEnvelope, validateAgentCommand
+} = require('../monitor-protocol');
 
 function readPrivateFile(filePath, label) {
   if (!filePath) throw new Error(`${label} file is required`);
@@ -30,6 +32,8 @@ function createMonitorAgent(options = {}) {
   const snapshotIntervalMs = options.snapshotIntervalMs || 5_000;
   const heartbeatIntervalMs = options.heartbeatIntervalMs || 10_000;
   const allowInsecure = options.allowInsecure || process.env.MONITOR_ALLOW_INSECURE === '1';
+  const enableStopDelegate = options.enableStopDelegate === undefined
+    ? process.env.MONITOR_STOP_DELEGATE_ENABLED === '1' : options.enableStopDelegate;
   if (!url || !installationId) throw new Error('Monitor web URL and installation ID are required');
   const parsed = new URL(url);
   if (parsed.protocol !== 'wss:' && !(allowInsecure && parsed.protocol === 'ws:')) {
@@ -48,8 +52,9 @@ function createMonitorAgent(options = {}) {
   const state = {
     socket: null, stopped: false, connected: false, authenticated: false,
     sequence: 0, retryMs: 1_000, reconnectTimer: null, snapshotTimer: null,
-    heartbeatTimer: null, publishing: false
+    heartbeatTimer: null, publishing: false, expectedServerSequence: 0
   };
+  const stopController = options.stopController || createStopDelegateController(dataRoot, options.stopControllerOptions);
 
   function clearConnectionTimers() {
     clearInterval(state.snapshotTimer);
@@ -82,10 +87,39 @@ function createMonitorAgent(options = {}) {
     if (state.authenticated) return;
     state.authenticated = true;
     state.sequence = 1;
+    state.expectedServerSequence = 1;
     state.retryMs = 1_000;
     publishSnapshot();
     state.snapshotTimer = setInterval(publishSnapshot, snapshotIntervalMs);
     state.heartbeatTimer = setInterval(() => send('agent_heartbeat', {}), heartbeatIntervalMs);
+  }
+
+  function commandError(error) {
+    const value = String(error?.message || 'Action failed');
+    if (/no longer active/i.test(value)) return 'That delegate is no longer active';
+    if (/state changed/i.test(value)) return 'Delegate state changed; preview it again before confirming';
+    if (/expired/i.test(value)) return 'Confirmation has expired';
+    if (/invalid|already used/i.test(value)) return 'Confirmation is invalid or already used';
+    return 'The local relay could not complete the requested action';
+  }
+
+  async function handleCommand(message) {
+    const payload = validateAgentCommand(message.type, message.payload);
+    try {
+      if (message.type === 'preview_request') {
+        const preview = stopController.preview(payload.jobId);
+        send('preview_result', { requestId: payload.requestId, ok: true, preview });
+      } else {
+        const result = await stopController.confirm(payload.jobId, payload.confirmationToken);
+        send('action_result', { requestId: payload.requestId, ok: true, result });
+        await publishSnapshot();
+      }
+    } catch (error) {
+      send(message.type === 'preview_request' ? 'preview_result' : 'action_result', {
+        requestId: payload.requestId, ok: false, error: commandError(error)
+      });
+      if (message.type === 'confirm_request') await publishSnapshot();
+    }
   }
 
   function scheduleReconnect() {
@@ -104,6 +138,7 @@ function createMonitorAgent(options = {}) {
     clearConnectionTimers();
     state.authenticated = false;
     state.sequence = 0;
+    state.expectedServerSequence = 0;
     const socket = new WebSocketClient(url, { headers, maxPayload: 1024 * 1024 });
     state.socket = socket;
     socket.on('open', () => {
@@ -112,16 +147,24 @@ function createMonitorAgent(options = {}) {
     });
     socket.on('message', raw => {
       try {
-        const message = parseEnvelope(raw, { readOnlyAgent: true });
-        if (message.type !== 'agent_hello' || message.sequence !== 0 || state.authenticated) return;
-        const { challenge, installationId: expectedInstallation } = message.payload;
-        if (expectedInstallation !== installationId || typeof challenge !== 'string') throw new Error('Monitor server identity mismatch');
-        socket.send(JSON.stringify(envelope('agent_hello', 0, {
-          installationId,
-          challenge,
-          mac: handshakeMac(secret, installationId, challenge)
-        })));
-        beginPublishing();
+        const message = parseEnvelope(raw, { readOnlyAgent: !enableStopDelegate });
+        if (!state.authenticated) {
+          if (message.type !== 'agent_hello' || message.sequence !== 0) throw new Error('Monitor handshake rejected');
+          const { challenge, installationId: expectedInstallation } = message.payload;
+          if (expectedInstallation !== installationId || typeof challenge !== 'string') throw new Error('Monitor server identity mismatch');
+          socket.send(JSON.stringify(envelope('agent_hello', 0, {
+            installationId,
+            challenge,
+            mac: handshakeMac(secret, installationId, challenge)
+          })));
+          beginPublishing();
+          return;
+        }
+        if (!enableStopDelegate || message.sequence !== state.expectedServerSequence) {
+          throw new Error('Monitor command protocol rejected');
+        }
+        state.expectedServerSequence += 1;
+        handleCommand(message).catch(() => socket.close(1008, 'Monitor command failed'));
       } catch {
         socket.close(1008, 'Monitor handshake rejected');
       }

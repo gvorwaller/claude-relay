@@ -23,6 +23,8 @@
     <string>__CF_ACCESS_CLIENT_ID__</string>
     <key>CF_ACCESS_CLIENT_SECRET_FILE</key>
     <string>__SECRET_DIR__/cf-access-client-secret</string>
+    <key>MONITOR_STOP_DELEGATE_ENABLED</key>
+    <string>__STOP_DELEGATE_ENABLED__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -7,6 +7,12 @@ SECRET_DIR="${MONITOR_SECRET_DIR:-$HOME/.config/claude-relay-monitor}"
 LOG_DIR="${MONITOR_LOG_DIR:-$ROOT/logs}"
 PLIST="$HOME/Library/LaunchAgents/com.claude-relay-monitor-agent.plist"
 TEMPLATE="$ROOT/deploy/relay-monitor/com.claude-relay-monitor-agent.plist.example"
+STOP_DELEGATE_ENABLED="${MONITOR_STOP_DELEGATE_ENABLED:-0}"
+
+if [[ "$STOP_DELEGATE_ENABLED" != "0" && "$STOP_DELEGATE_ENABLED" != "1" ]]; then
+  echo "MONITOR_STOP_DELEGATE_ENABLED must be 0 or 1." >&2
+  exit 1
+fi
 
 for file in "$SECRET_DIR/agent-secret" "$SECRET_DIR/cf-access-client-secret"; do
   if [[ ! -s "$file" ]]; then
@@ -35,6 +41,7 @@ sed \
   -e "s|__SECRET_DIR__|$SECRET_DIR|g" \
   -e "s|__LOG_DIR__|$LOG_DIR|g" \
   -e "s|__CF_ACCESS_CLIENT_ID__|$CF_ACCESS_CLIENT_ID|g" \
+  -e "s|__STOP_DELEGATE_ENABLED__|$STOP_DELEGATE_ENABLED|g" \
   "$TEMPLATE" > "$temporary"
 
 plutil -lint "$temporary"

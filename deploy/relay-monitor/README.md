@@ -1,7 +1,7 @@
 # Relay monitor deployment assets
 
-These files deploy the read-only Phase 2 monitor. They do not expose the relay
-daemon and do not enable any remote action.
+These files deploy the Phase 2 monitor and the disabled-by-default Phase 3
+exact-job stop control. They never expose the relay daemon.
 
 ## Secrets
 
@@ -49,3 +49,12 @@ client ID, install or refresh the outbound agent with:
 ```sh
 CF_ACCESS_CLIENT_ID=replace-me ./scripts/install-monitor-agent.sh
 ```
+
+## Phase 3 gate
+
+`MONITOR_STOP_DELEGATE_ENABLED` defaults to `0` independently on the droplet
+and Mac. With either side disabled, no remote mutation is accepted. Enable it
+on both sides only for the synthetic exact-job acceptance test, then reinstall
+the launch agent and restart the web service. The browser can supply only a
+canonical job ID and a local-agent-minted, 60-second, single-use confirmation
+token; it never supplies a PID, signal, executable, or command.

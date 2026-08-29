@@ -6,7 +6,7 @@ Task: `td-f5bce2`
 
 Target: `https://relay.gaylon.photos`
 
-## Current state
+## Initial state
 
 - `relay.gaylon.photos` has no DNS record.
 - The shared DigitalOcean droplet is `134.199.211.199`.
@@ -104,3 +104,35 @@ the outbound agent connection.
 After the read-only deployment has been observed successfully, implement Phase
 3 exact stuck-delegate preview and confirmation as a separate disabled-by-
 default rollout.
+
+### 7. Build and roll out Phase 3 separately
+
+1. Add a strict `preview_request` / `preview_result` and `confirm_request` /
+   `action_result` protocol allowlist.
+2. Mint the confirmation token only on the Mac. Bind it to the exact job,
+   owner, active status, process-group liveness, and previewed job state; expire
+   it after 60 seconds and consume it before attempting the mutation.
+3. Reuse `operatorTerminateDelegate` so the relay performs its existing exact
+   process-group termination, interrupted-state transition, audit retention,
+   and durable-mail preservation.
+4. Require browser authentication and CSRF on both action endpoints. Treat a
+   disconnect or timeout after confirmation as an unknown result and never
+   retry automatically.
+5. Gate both the web broker and Mac executor with
+   `MONITOR_STOP_DELEGATE_ENABLED=0` by default.
+6. Prove expiry, replay rejection, state-change rejection, cross-job binding,
+   exact termination, result reconciliation, and forbidden-data exclusion in
+   isolated tests.
+7. Deploy the new code with the gate off. Enable both sides only for a
+   synthetic stuck delegate, complete the live preview/stop/replay tests, then
+   choose whether to leave the production control enabled.
+
+## Deployment status — 2026-08-29
+
+Phase 2 is live at `https://relay.gaylon.photos` behind Cloudflare Access. The
+proxied DNS record, path-scoped agent Service Auth application, independent
+agent HMAC, loopback-only droplet origin, systemd service, Nginx proxy, and Mac
+launch agent are active. Live browser acceptance showed a fresh connected
+snapshot, healthy relay status, all eight checks passing, six recent jobs, and
+twelve identities. Superseded setup credentials and the pre-Access password
+were removed before Phase 3 work began.

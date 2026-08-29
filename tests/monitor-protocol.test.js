@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   assertDataMinimized, envelope, handshakeMac, parseEnvelope, validateSnapshot,
-  verifyHandshakeMac
+  validateAgentCommand, validateAgentResult, verifyHandshakeMac
 } = require('../monitor-protocol');
 
 test('agent handshake is installation- and nonce-bound with constant-shape verification', () => {
@@ -14,6 +14,33 @@ test('agent handshake is installation- and nonce-bound with constant-shape verif
   assert.equal(verifyHandshakeMac(secret, 'other-relay', 'challenge-a', mac), false);
   assert.equal(verifyHandshakeMac(secret, 'home-relay', 'challenge-b', mac), false);
   assert.equal(verifyHandshakeMac('wrong-secret', 'home-relay', 'challenge-a', mac), false);
+});
+
+test('action protocol accepts only exact minimized stop payloads', () => {
+  const jobId = 'wake_10000000-0000-4000-8000-000000000001';
+  const requestId = 'request_12345678';
+  const confirmationToken = 'A'.repeat(43);
+  assert.equal(validateAgentCommand('preview_request', {
+    requestId, action: 'stop_delegate', jobId
+  }).jobId, jobId);
+  assert.equal(validateAgentCommand('confirm_request', {
+    requestId, action: 'stop_delegate', jobId, confirmationToken
+  }).confirmationToken, confirmationToken);
+  const preview = {
+    action: 'stop_delegate', jobId, owner: 'CC1', processAlive: true,
+    consequences: ['Exact process group stops.', 'Job becomes interrupted.', 'Durable mail remains.'],
+    confirmationToken, expiresAt: '2026-08-29T16:01:00.000Z'
+  };
+  assert.equal(validateAgentResult('preview_result', { requestId, ok: true, preview }).preview, preview);
+  assert.throws(() => validateAgentCommand('confirm_request', {
+    requestId, action: 'stop_delegate', jobId, confirmationToken, pid: 42
+  }), /Invalid confirm request payload/);
+  assert.throws(() => validateAgentCommand('preview_request', {
+    requestId, action: 'shell', jobId
+  }), /Invalid monitor agent command/);
+  assert.throws(() => validateAgentResult('preview_result', {
+    requestId, ok: true, preview: { ...preview, path: '/Users/private' }
+  }), /Invalid stop preview payload/);
 });
 
 test('protocol rejects unknown fields, versions, message types, and read-only mutations', () => {

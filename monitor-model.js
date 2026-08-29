@@ -2,11 +2,15 @@
 
 const fs = require('fs');
 const path = require('path');
-const { healthAssessment, readJobRecords, relayTopology } = require('./monitor-control');
+const { createHash, randomBytes } = require('crypto');
+const {
+  healthAssessment, operatorTerminateDelegate, readJobRecords, relayTopology
+} = require('./monitor-control');
 const { isTransientOwnerLabel } = require('./capabilities');
 
 const ACTIVE_JOB_STATES = new Set(['spawned', 'running']);
 const CANONICAL_JOB_ID = /^wake_[0-9a-f-]{36}$/;
+const STOP_CONFIRMATION_TTL_MS = 60_000;
 const ACTIVITY_LABELS = Object.freeze({
   analyzing: 'Analyzing request',
   reading_message: 'Reading relay message',
@@ -87,12 +91,82 @@ function projectJob(job, options = {}) {
       : null,
     processAlive: active ? processGroupAlive(job.spawnPid, options) : false,
     stalled,
+    actions: { stopDelegate: active && CANONICAL_JOB_ID.test(job.jobId || '') },
     outbound: Array.isArray(job.outbound) ? job.outbound.map(item => ({
       to: typeof item?.to === 'string' ? item.to : 'unknown',
       delivered: item?.delivered === true,
       at: timestamp(item?.at)
     })) : []
   };
+}
+
+function stopDelegateState(dataRoot, jobId, options = {}) {
+  const job = readJobRecords(dataRoot).find(record => record.jobId === jobId && record._recordName === jobId);
+  if (!job || !ACTIVE_JOB_STATES.has(job.status) || !CANONICAL_JOB_ID.test(jobId || '')) {
+    throw new Error('That delegate is no longer active');
+  }
+  const projected = projectJob(job, options);
+  const latestActivityAt = projected.lastActivityAt;
+  const fingerprint = createHash('sha256').update(JSON.stringify({
+    action: 'stop_delegate', jobId, owner: job.owner, status: job.status, spawnPid: job.spawnPid,
+    serverInstance: job.serverInstance, requestedAt: job.requestedAt,
+    startedAt: job.startedAt, latestActivityAt, processAlive: projected.processAlive
+  })).digest('base64url');
+  return { job, projected, fingerprint };
+}
+
+function createStopDelegateController(dataRoot, options = {}) {
+  const now = options.now || (() => Date.now());
+  const confirmations = new Map();
+  const terminate = options.operatorTerminateDelegate || operatorTerminateDelegate;
+  const tokenFactory = options.tokenFactory || (() => randomBytes(32).toString('base64url'));
+  const ttlMs = options.ttlMs || STOP_CONFIRMATION_TTL_MS;
+
+  function prune() {
+    for (const [token, preview] of confirmations) {
+      if (preview.expiresAtMs <= now()) confirmations.delete(token);
+    }
+  }
+
+  function preview(jobId) {
+    prune();
+    const state = stopDelegateState(dataRoot, jobId, { ...options, now: now() });
+    const confirmationToken = tokenFactory();
+    const expiresAtMs = now() + ttlMs;
+    confirmations.set(confirmationToken, {
+      jobId, owner: state.job.owner, fingerprint: state.fingerprint, expiresAtMs
+    });
+    return {
+      action: 'stop_delegate', jobId, owner: state.job.owner,
+      processAlive: state.projected.processAlive,
+      consequences: [
+        'The exact active delegate process group will be terminated.',
+        'The delegate job will become interrupted.',
+        'Its audit record and durable relay mail will be preserved.'
+      ],
+      confirmationToken,
+      expiresAt: new Date(expiresAtMs).toISOString()
+    };
+  }
+
+  async function confirm(jobId, confirmationToken) {
+    const previewed = confirmations.get(confirmationToken);
+    if (previewed) confirmations.delete(confirmationToken);
+    if (!previewed || previewed.jobId !== jobId) throw new Error('Confirmation is invalid or already used');
+    if (previewed.expiresAtMs <= now()) throw new Error('Confirmation has expired');
+    const current = stopDelegateState(dataRoot, jobId, { ...options, now: now() });
+    if (current.job.owner !== previewed.owner || current.fingerprint !== previewed.fingerprint) {
+      throw new Error('Delegate state changed; preview it again before confirming');
+    }
+    const result = await terminate(dataRoot, jobId, options.operatorOptions || {});
+    return {
+      action: 'stop_delegate', jobId, owner: current.job.owner,
+      status: 'interrupted', signaled: result.signaled === true,
+      completedAt: new Date(now()).toISOString()
+    };
+  }
+
+  return { confirmations, preview, confirm };
 }
 
 function projectJobDetail(job, options = {}) {
@@ -220,6 +294,7 @@ async function buildMonitorSnapshot(dataRoot, options = {}) {
 module.exports = {
   ACTIVITY_LABELS,
   buildMonitorSnapshot,
+  createStopDelegateController,
   formatAge,
   processGroupAlive,
   projectHealth,

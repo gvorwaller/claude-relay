@@ -16,6 +16,9 @@ const FORBIDDEN_KEYS = new Set([
 ]);
 const LOCAL_PATH = /(^|[\s(])\/(?!\/)[^\s),;]*/;
 const CREDENTIAL = /\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9_+=-]{40,})\b/;
+const JOB_ID = /^wake_[0-9a-f-]{36}$/;
+const REQUEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
+const CONFIRMATION_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
 function createChallenge() {
   return randomBytes(32).toString('base64url');
@@ -68,10 +71,65 @@ function assertDataMinimized(value, trail = 'payload') {
     }
     return;
   }
-  const canonicalJobId = trail.endsWith('.jobId') && /^wake_[0-9a-f-]{36}$/.test(value);
-  if (typeof value === 'string' && (LOCAL_PATH.test(value) || (!canonicalJobId && CREDENTIAL.test(value)))) {
+  const canonicalJobId = trail.endsWith('.jobId') && JOB_ID.test(value);
+  const confirmationToken = trail.endsWith('.confirmationToken') && CONFIRMATION_TOKEN.test(value);
+  if (typeof value === 'string' && (LOCAL_PATH.test(value) || (!canonicalJobId && !confirmationToken && CREDENTIAL.test(value)))) {
     throw new Error(`Forbidden monitor value: ${trail}`);
   }
+}
+
+function exactKeys(value, expected, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join(',') !== [...expected].sort().join(',')) {
+    throw new Error(`Invalid ${label} payload`);
+  }
+}
+
+function validateAgentCommand(type, payload) {
+  if (type === 'preview_request') {
+    exactKeys(payload, ['requestId', 'action', 'jobId'], 'preview request');
+  } else if (type === 'confirm_request') {
+    exactKeys(payload, ['requestId', 'action', 'jobId', 'confirmationToken'], 'confirm request');
+    if (!CONFIRMATION_TOKEN.test(payload.confirmationToken || '')) throw new Error('Invalid confirmation token');
+  } else {
+    throw new Error('Unsupported monitor agent command');
+  }
+  if (!REQUEST_ID.test(payload.requestId || '') || payload.action !== 'stop_delegate'
+    || !JOB_ID.test(payload.jobId || '')) throw new Error('Invalid monitor agent command');
+  assertDataMinimized(payload);
+  return payload;
+}
+
+function validateAgentResult(type, payload) {
+  if (type !== 'preview_result' && type !== 'action_result') throw new Error('Unsupported monitor agent result');
+  if (!REQUEST_ID.test(payload?.requestId || '') || typeof payload.ok !== 'boolean') {
+    throw new Error('Invalid monitor agent result');
+  }
+  const expected = payload.ok ? ['requestId', 'ok', type === 'preview_result' ? 'preview' : 'result']
+    : ['requestId', 'ok', 'error'];
+  exactKeys(payload, expected, 'agent result');
+  if (payload.ok && type === 'preview_result') {
+    exactKeys(payload.preview, [
+      'action', 'jobId', 'owner', 'processAlive', 'consequences', 'confirmationToken', 'expiresAt'
+    ], 'stop preview');
+    if (payload.preview.action !== 'stop_delegate' || !JOB_ID.test(payload.preview.jobId || '')
+      || typeof payload.preview.owner !== 'string' || typeof payload.preview.processAlive !== 'boolean'
+      || !Array.isArray(payload.preview.consequences) || payload.preview.consequences.length !== 3
+      || !CONFIRMATION_TOKEN.test(payload.preview.confirmationToken || '')
+      || !Number.isFinite(Date.parse(payload.preview.expiresAt || ''))) throw new Error('Invalid stop preview');
+  }
+  if (payload.ok && type === 'action_result') {
+    exactKeys(payload.result, ['action', 'jobId', 'owner', 'status', 'signaled', 'completedAt'], 'action result');
+    if (payload.result.action !== 'stop_delegate' || !JOB_ID.test(payload.result.jobId || '')
+      || typeof payload.result.owner !== 'string' || payload.result.status !== 'interrupted'
+      || typeof payload.result.signaled !== 'boolean'
+      || !Number.isFinite(Date.parse(payload.result.completedAt || ''))) throw new Error('Invalid action result');
+  }
+  if (!payload.ok && (typeof payload.error !== 'string' || !payload.error || payload.error.length > 200)) {
+    throw new Error('Invalid agent error result');
+  }
+  assertDataMinimized(payload);
+  return payload;
 }
 
 function validateSnapshot(snapshot) {
@@ -92,6 +150,8 @@ module.exports = {
   envelope,
   handshakeMac,
   parseEnvelope,
+  validateAgentCommand,
+  validateAgentResult,
   validateSnapshot,
   verifyHandshakeMac
 };

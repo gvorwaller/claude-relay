@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  buildMonitorSnapshot, projectIdentities, projectJob, projectJobDetail,
+  buildMonitorSnapshot, createStopDelegateController, projectIdentities, projectJob, projectJobDetail,
   projectJobs, readMonitorModel
 } = require('../monitor-model');
 
@@ -126,4 +126,62 @@ test('complete snapshot partitions active work and projects topology without raw
   assert.deepEqual(result.recentWork.map(job => job.owner), ['CC2']);
   assert.deepEqual(result.identities.map(item => item.identity), ['CC1']);
   assert.doesNotMatch(JSON.stringify(result), /Users|99|watch-100|_recordName/);
+});
+
+test('stop preview is exact, state-bound, expiring, and single-use', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-stop-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'jobs'));
+  const jobId = 'wake_10000000-0000-4000-8000-000000000007';
+  const file = path.join(root, 'jobs', `${jobId}.json`);
+  const job = {
+    jobId, owner: 'CC1', from: 'CODEX', status: 'running', spawnPid: 4321,
+    serverInstance: 'test-instance', requestedAt: '2026-08-29T15:00:00.000Z', outbound: []
+  };
+  fs.writeFileSync(file, JSON.stringify(job));
+  let now = NOW;
+  let alive = true;
+  const terminated = [];
+  const tokens = ['A', 'B', 'C', 'D', 'E'].map(value => value.repeat(43));
+  const controller = createStopDelegateController(root, {
+    now: () => now, kill(pid, signal) {
+      assert.deepEqual([pid, signal], [-4321, 0]);
+      if (!alive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    },
+    tokenFactory: () => tokens.shift(),
+    operatorTerminateDelegate: async (dataRoot, exactJobId) => {
+      terminated.push([dataRoot, exactJobId]);
+      return { signaled: true };
+    }
+  });
+
+  const first = controller.preview(jobId);
+  assert.deepEqual({ jobId: first.jobId, owner: first.owner, processAlive: first.processAlive }, {
+    jobId, owner: 'CC1', processAlive: true
+  });
+  assert.doesNotMatch(JSON.stringify(first), /4321|spawnPid|test-instance/);
+  const result = await controller.confirm(jobId, first.confirmationToken);
+  assert.equal(result.status, 'interrupted');
+  assert.deepEqual(terminated, [[root, jobId]]);
+  await assert.rejects(controller.confirm(jobId, first.confirmationToken), /invalid or already used/);
+
+  const changed = controller.preview(jobId);
+  fs.writeFileSync(file, JSON.stringify({ ...job, status: 'spawned' }));
+  await assert.rejects(controller.confirm(jobId, changed.confirmationToken), /state changed/);
+  fs.writeFileSync(file, JSON.stringify(job));
+
+  const livenessChanged = controller.preview(jobId);
+  alive = false;
+  await assert.rejects(controller.confirm(jobId, livenessChanged.confirmationToken), /state changed/);
+  alive = true;
+
+  const wrongTarget = controller.preview(jobId);
+  await assert.rejects(controller.confirm(
+    'wake_10000000-0000-4000-8000-000000000099', wrongTarget.confirmationToken
+  ), /invalid or already used/);
+
+  const expired = controller.preview(jobId);
+  now += 60_001;
+  await assert.rejects(controller.confirm(jobId, expired.confirmationToken), /expired/);
+  assert.equal(terminated.length, 1);
 });
