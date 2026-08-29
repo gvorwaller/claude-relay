@@ -70,5 +70,5 @@ curl -fsS -H 'Host: relay.gaylon.photos' http://127.0.0.1/healthz
 test "$(ss -ltnH 'sport = :3006' | awk '{print $4}')" = "127.0.0.1:3006"
 REMOTE
 
-echo "Read-only relay monitor origin deployed at revision $REVISION."
-echo "Create Cloudflare Access applications and the proxied DNS record only after reviewing the pre-DNS checks."
+echo "Relay monitor origin deployed at revision $REVISION."
+echo "Phase 3 remains disabled unless MONITOR_STOP_DELEGATE_ENABLED=1 is set on both services."

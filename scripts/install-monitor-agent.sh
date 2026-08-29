@@ -48,6 +48,17 @@ plutil -lint "$temporary"
 install -m 0600 "$temporary" "$PLIST"
 uid="$(id -u)"
 launchctl bootout "gui/$uid/com.claude-relay-monitor-agent" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$uid" "$PLIST"
+loaded=0
+for attempt in 1 2 3 4 5; do
+  if launchctl bootstrap "gui/$uid" "$PLIST" >/dev/null 2>&1; then
+    loaded=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$loaded" != "1" ]]; then
+  echo "Could not bootstrap com.claude-relay-monitor-agent after launchd unload." >&2
+  exit 1
+fi
 launchctl kickstart -k "gui/$uid/com.claude-relay-monitor-agent"
 launchctl print "gui/$uid/com.claude-relay-monitor-agent" | sed -n '1,40p'
