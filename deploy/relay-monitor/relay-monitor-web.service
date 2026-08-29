@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude Relay browser monitor web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay-monitor
+Group=relay-monitor
+WorkingDirectory=/opt/claude-relay-monitor/current
+Environment=NODE_ENV=production
+Environment=MONITOR_WEB_HOST=127.0.0.1
+Environment=PORT=3006
+EnvironmentFile=/etc/claude-relay-monitor/web.env
+ExecStart=/usr/bin/node monitor-web/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

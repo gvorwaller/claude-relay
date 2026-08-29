@@ -2,7 +2,6 @@
 'use strict';
 
 const path = require('path');
-const fs = require('fs');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 const {
@@ -10,8 +9,9 @@ const {
   messageOwnerChoices, operatorJobRequest, operatorMessageRequest,
   operatorOwnerRepair, operatorOwnerRemoval, operatorTerminateDelegate,
   operatorRemovableOwners, ownerChoices, pendingOwnerLabels,
-  readJobRecords, relayTopology, restartRelay, scrollWindow, topologyLines
+  relayTopology, restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
+const { formatAge, readMonitorModel } = require('../monitor-model');
 
 const args = process.argv.slice(2);
 const value = name => {
@@ -22,14 +22,6 @@ const dataRoot = value('--data-dir') || path.join(__dirname, '..', 'data');
 const owner = value('--owner');
 const once = args.includes('--once');
 const interval = Math.max(250, Number(value('--interval')) || 1000);
-
-const labels = {
-  analyzing: 'Analyzing request', reading_message: 'Reading relay message',
-  reading_files: 'Reading files', running_command: 'Running a command',
-  using_tool: 'Using a tool', updating_files: 'Updating files',
-  sending_reply: 'Sending relay reply', preparing_response: 'Preparing response',
-  waiting: 'Waiting', finishing: 'Finishing delegated run', error: 'Codex reported an error'
-};
 
 function wrapLine(line, width) {
   if (!line || line.length <= width) return [line];
@@ -50,17 +42,11 @@ function wrapped(lines, width = Math.max(40, (process.stdout.columns || 100) - 4
 }
 
 function jobs(limit = 20) {
-  return readJobRecords(dataRoot)
-    .filter(job => !owner || job.owner === owner)
-    .sort((a, b) => String(b.requestedAt).localeCompare(String(a.requestedAt)))
-    .slice(0, limit);
+  return readMonitorModel(dataRoot, { owner, limit, includeLocalDetails: true }).jobs;
 }
 
 function age(input) {
-  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(input)) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  return `${Math.floor(seconds / 3600)}h`;
+  return formatAge(Date.now() - Date.parse(input));
 }
 
 function activityLines(limit = 20) {
@@ -68,10 +54,8 @@ function activityLines(limit = 20) {
   const records = jobs(limit);
   if (!records.length) return ['No delegate activity recorded.'];
   for (const job of records) {
-    const latest = Array.isArray(job.activity) && job.activity.length
-      ? labels[job.activity[job.activity.length - 1].type] || 'Working'
-      : null;
-    lines.push(`${job.owner}  ${job.status}  ${age(job.requestedAt)} ago  from ${job.from || 'unknown'}`);
+    const latest = job.latestActivity?.label || null;
+    lines.push(`${job.owner}  ${job.status}  ${formatAge(job.requestedAgeMs)} ago  from ${job.requester}`);
     if (latest && (job.status === 'spawned' || job.status === 'running')) lines.push(`  ${latest}`);
     for (const outbound of (job.outbound || [])) {
       lines.push(`  Reply to ${outbound.to}: ${outbound.delivered ? 'delivered live' : 'queued'}`);
@@ -83,15 +67,14 @@ function activityLines(limit = 20) {
 }
 
 function healthLines() {
-  const { status, assessment } = healthAssessment(dataRoot);
-  const lines = [assessment.ok ? 'Overall status: HEALTHY' : 'Overall status: NEEDS ATTENTION', ''];
-  for (const result of assessment.results) lines.push(`${result.level.toUpperCase().padEnd(4)}  ${result.text}`);
-  if (status?.metrics) {
-    lines.push('', `Delegate records: ${Number(status.metrics.jobsTotal) || 0}`,
-      `Awaiting owner report: ${Number(status.metrics.jobsUnreported) || 0}`,
-      `Named identities awaiting credential confirmation: ${Number(status.metrics.ownersPending) || 0}`);
-    const pendingLabels = Array.isArray(status.metrics.ownersPendingLabels)
-      ? status.metrics.ownersPendingLabels : [];
+  const { health } = readMonitorModel(dataRoot, { owner, limit: 0, includeLocalDetails: true });
+  const lines = [health.ok ? 'Overall status: HEALTHY' : 'Overall status: NEEDS ATTENTION', ''];
+  for (const result of health.results) lines.push(`${result.level.toUpperCase().padEnd(4)}  ${result.text}`);
+  if (health.metrics) {
+    lines.push('', `Delegate records: ${health.metrics.jobsTotal}`,
+      `Awaiting owner report: ${health.metrics.jobsUnreported}`,
+      `Named identities awaiting credential confirmation: ${health.metrics.ownersPending}`);
+    const pendingLabels = health.metrics.ownersPendingLabels;
     if (pendingLabels.length) {
       lines.push(`  ${pendingLabels.join(', ')}`, '',
         'These identities can still connect locally through the migration fallback,',
@@ -103,17 +86,14 @@ function healthLines() {
 }
 
 function onceLines() {
-  const { status, assessment } = healthAssessment(dataRoot);
+  const { health } = readMonitorModel(dataRoot, { owner, limit: 0, includeLocalDetails: true });
   const lines = ['claude-relay delegate activity', `Updated ${new Date().toLocaleTimeString()}`, ''];
-  let alerts = status?.alerts || [];
-  if (!status) {
-    try { alerts = JSON.parse(fs.readFileSync(path.join(dataRoot, 'runtime-status.json'), 'utf8')).alerts || []; } catch {}
-  }
+  const alerts = health.alerts;
   if (alerts.some(alert => alert?.code === 'job_store_at_capacity')) {
     lines.push('ALERT  Delegate job store is at capacity with retained work', '');
   }
   lines.push(...activityLines());
-  if (!assessment.ok) lines.unshift('RELAY NEEDS ATTENTION', '');
+  if (!health.ok) lines.unshift('RELAY NEEDS ATTENTION', '');
   return lines;
 }
 
@@ -154,9 +134,8 @@ if (once || !process.stdin.isTTY || !process.stdout.isTTY) {
     state.activitySelected = Math.min(state.activitySelected, records.length - 1);
     const lines = [];
     records.forEach((job, index) => {
-      lines.push(`${state.activityBrowsing && index === state.activitySelected ? '>' : ' '} ${job.owner}  ${job.status}  ${age(job.requestedAt)} ago  from ${job.from || 'unknown'}`);
-      const latest = Array.isArray(job.activity) && job.activity.length
-        ? labels[job.activity[job.activity.length - 1].type] || 'Working' : null;
+      lines.push(`${state.activityBrowsing && index === state.activitySelected ? '>' : ' '} ${job.owner}  ${job.status}  ${formatAge(job.requestedAgeMs)} ago  from ${job.requester}`);
+      const latest = job.latestActivity?.label || null;
       if (latest && (job.status === 'spawned' || job.status === 'running')) lines.push(`    ${latest}`);
       for (const outbound of (job.outbound || [])) lines.push(`    Reply to ${outbound.to}: ${outbound.delivered ? 'delivered live' : 'queued'}`);
     });

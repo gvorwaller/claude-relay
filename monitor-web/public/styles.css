@@ -1,0 +1,81 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --panel: #14181d;
+  --panel-2: #1a2027;
+  --line: #2a323c;
+  --text: #f3f5f7;
+  --muted: #98a3af;
+  --green: #5de09a;
+  --yellow: #f0c765;
+  --red: #ff776f;
+  --blue: #78a9ff;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; color: var(--text); background: radial-gradient(circle at 10% -10%, #1d2a38 0, transparent 35rem), var(--bg); }
+header, main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 36px 0 24px; }
+h1, h2, h3, p { margin-top: 0; }
+h1 { margin-bottom: 0; font-size: clamp(2rem, 6vw, 3.5rem); letter-spacing: -.05em; }
+h2 { margin: 0; font-size: 1.05rem; }
+h3 { margin: 24px 0 8px; font-size: .9rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.eyebrow { margin-bottom: 4px; color: var(--blue); font-size: .72rem; font-weight: 800; letter-spacing: .16em; }
+.status, .pill, .facts span, .identity-heading span { border-radius: 999px; padding: 5px 9px; font-size: .72rem; font-weight: 750; text-transform: capitalize; }
+.status.fresh, .live { color: var(--green); background: #143426; }
+.status.stale, .warning { color: var(--yellow); background: #372d15; }
+.status.offline, .offline, .danger { color: var(--red); background: #381c1e; }
+main { display: grid; gap: 32px; padding-bottom: 72px; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; color: var(--muted); }
+.section-heading h2 { color: var(--text); }
+.section-heading span { font-size: .8rem; }
+.health-card, .job-card, .identity-card { border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, transparent); box-shadow: 0 16px 45px rgba(0,0,0,.15); }
+.health-card { border-radius: 18px; overflow: hidden; }
+.health-state { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+.health-state.healthy strong { color: var(--green); }
+.health-state.needs_attention strong { color: var(--yellow); }
+.health-state.offline strong { color: var(--red); }
+.health-state span { color: var(--muted); font-size: .8rem; }
+.checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 24px; margin: 0; padding: 18px 20px; list-style: none; }
+.checks li { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: .84rem; }
+.check-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--green); }
+.checks .warn .check-dot { background: var(--yellow); }
+.checks .fail .check-dot { background: var(--red); }
+.job-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+.job-card { width: 100%; padding: 17px; border-radius: 15px; color: inherit; text-align: left; cursor: pointer; }
+.job-card:hover, .job-card:focus-visible { border-color: #536273; background: var(--panel-2); outline: none; }
+.job-top, .identity-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pill { color: var(--blue); background: #1c2d49; }
+.pill.failed, .pill.interrupted { color: var(--red); background: #381c1e; }
+.pill.completed, .pill.reported { color: var(--green); background: #143426; }
+.job-meta, .activity, .identity-card p { margin: 10px 0 0; color: var(--muted); font-size: .82rem; }
+.activity { color: var(--text); }
+.facts { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 14px; }
+.facts span { color: var(--muted); background: #242b33; }
+.facts .warning { color: var(--yellow); background: #372d15; }
+.facts .danger { color: var(--red); background: #381c1e; }
+.identity-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.identity-card { padding: 16px; border-radius: 15px; }
+.empty { margin: 0; padding: 22px; border: 1px dashed var(--line); border-radius: 14px; color: var(--muted); text-align: center; }
+dialog { width: min(680px, calc(100% - 24px)); max-height: calc(100vh - 48px); padding: 0; border: 1px solid var(--line); border-radius: 18px; color: var(--text); background: var(--panel); }
+dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(3px); }
+.dialog-heading { position: sticky; top: 0; display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.dialog-heading button { border: 0; color: var(--muted); background: transparent; font-size: 1.7rem; cursor: pointer; }
+#detail-body { padding: 20px; }
+.detail-facts { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; margin: 0; }
+.detail-facts dt { color: var(--muted); }
+.detail-facts dd { margin: 0; overflow-wrap: anywhere; }
+.report { white-space: pre-wrap; color: #d7dde4; line-height: 1.5; }
+.timeline { margin: 0; padding-left: 20px; color: #d7dde4; line-height: 1.7; }
+.login-page { display: grid; place-items: center; padding: 20px; }
+.login-card { width: min(420px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
+label { display: block; margin: 26px 0 8px; color: var(--muted); font-size: .85rem; }
+input { width: 100%; padding: 13px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--bg); }
+form button { width: 100%; margin-top: 14px; padding: 13px; border: 0; border-radius: 10px; color: #07130d; background: var(--green); font-weight: 800; cursor: pointer; }
+#login-error { min-height: 1.3em; margin: 12px 0 0; color: var(--red); }
+@media (max-width: 720px) {
+  header, main { width: min(100% - 20px, 1120px); }
+  header { padding-top: 24px; }
+  .checks, .job-list, .identity-grid { grid-template-columns: 1fr; }
+  main { gap: 26px; }
+}

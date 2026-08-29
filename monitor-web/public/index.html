@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Relay Monitor</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">CLAUDE RELAY</p>
+      <h1>Monitor</h1>
+    </div>
+    <div id="connection" class="status offline">Offline</div>
+  </header>
+  <main>
+    <section aria-labelledby="health-title">
+      <div class="section-heading"><h2 id="health-title">Relay health</h2><span id="updated">Waiting for agent</span></div>
+      <div id="health" class="health-card"></div>
+    </section>
+    <section aria-labelledby="active-title">
+      <div class="section-heading"><h2 id="active-title">Active work</h2><span id="active-count"></span></div>
+      <div id="active" class="job-list"></div>
+    </section>
+    <section aria-labelledby="recent-title">
+      <div class="section-heading"><h2 id="recent-title">Recent work</h2><span id="recent-count"></span></div>
+      <div id="recent" class="job-list"></div>
+    </section>
+    <section aria-labelledby="identity-title">
+      <div class="section-heading"><h2 id="identity-title">Identities</h2><span id="identity-count"></span></div>
+      <div id="identities" class="identity-grid"></div>
+    </section>
+  </main>
+  <dialog id="detail">
+    <div class="dialog-heading"><h2 id="detail-title">Delegate detail</h2><button id="close-detail" type="button" aria-label="Close">×</button></div>
+    <div id="detail-body"></div>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>
