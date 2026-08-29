@@ -136,3 +136,25 @@ launch agent are active. Live browser acceptance showed a fresh connected
 snapshot, healthy relay status, all eight checks passing, six recent jobs, and
 twelve identities. Superseded setup credentials and the pre-Access password
 were removed before Phase 3 work began.
+
+Phase 3 shipped in revisions `5c7e51a` and `0961417`. It was deployed with
+both gates off first, then enabled on the web broker and Mac executor only for
+live synthetic acceptance. Two isolated `PHASE3TEST` jobs appeared in the
+browser within the normal refresh window. Exact previews reported the job ID,
+owner, and process-group liveness without a PID or command. Confirmed stops
+changed only those jobs to `interrupted`, terminated both process groups, and
+left both durable relay messages and job audit records intact. A second
+preview was allowed to expire: confirmation was rejected, the job remained
+active with its process alive, and a new preview was required before cleanup.
+The normal notify configuration was restored immediately after each synthetic
+job was created.
+
+The final automated suite passed 144 tests, including expiry, replay,
+cross-job binding, preview-state and liveness changes, CSRF, disconnect-after-
+confirmation unknown-result handling, exact process-group termination, durable
+mail preservation, and data minimization. The production service remains
+loopback-only on `127.0.0.1:3006`; the browser stayed connected during the
+actions; and the droplet journal contained no synthetic body, Mac path, or
+credential marker. Phase 3 is enabled after this acceptance and still requires
+an authenticated browser session, CSRF, a fresh connected agent, and an exact
+local-agent preview for every stop.
