@@ -16,6 +16,7 @@ let pendingPreview = null;
 let pendingAdminPreview = null;
 let lastPayload = null;
 let adminBusy = false;
+const adminSelections = new Map();
 
 function age(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return 'unknown';
@@ -139,7 +140,7 @@ function adminTargets(name, payload) {
   if (name === 'removeIdentity') return identities.map(identity => ({ label: identity, target: { identity } }));
   if (name === 'cleanupActivity') {
     const values = identities.map(identity => ({ label: `${identity} only`, target: { scope: 'owner', identity } }));
-    if (features.admin.cleanupActivityAll) values.push({ label: 'All owners', target: { scope: 'all' }, global: true });
+    if (features.admin.cleanupActivityAll) values.push({ label: 'All identities', target: { scope: 'all' }, global: true });
     return values;
   }
   if (name === 'cleanupMessages') {
@@ -148,6 +149,10 @@ function adminTargets(name, payload) {
     return values;
   }
   return [];
+}
+
+function adminTargetKey(target) {
+  return JSON.stringify(target);
 }
 
 function renderAdmin(payload) {
@@ -166,21 +171,34 @@ function renderAdmin(payload) {
       return card;
     }
     const targets = adminTargets(name, payload);
+    const targetsByKey = new Map(targets.map(item => [adminTargetKey(item.target), item]));
     const select = node('select', 'admin-select');
-    const placeholder = node('option', '', targets.length ? 'Choose one exact target' : 'No eligible target in this snapshot');
+    const placeholderText = name === 'cleanupActivity' && features.admin.cleanupActivityAll
+      ? 'Choose one identity or all activity'
+      : targets.length ? 'Choose one exact target' : 'No eligible target in this snapshot';
+    const placeholder = node('option', '', placeholderText);
     placeholder.value = '';
     select.append(placeholder);
-    targets.forEach((item, index) => {
+    targets.forEach(item => {
       const option = node('option', '', item.label);
-      option.value = String(index);
+      option.value = adminTargetKey(item.target);
       if (item.global) option.className = 'global-option';
       select.append(option);
     });
+    const savedSelection = adminSelections.get(name);
+    if (savedSelection && targetsByKey.has(savedSelection)) select.value = savedSelection;
+    else adminSelections.delete(name);
     const button = node('button', 'secondary-button admin-action', 'Request preview…');
     button.type = 'button';
-    button.disabled = adminBusy || !targets.length;
+    button.disabled = adminBusy || !select.value;
+    select.disabled = adminBusy || !targets.length;
+    select.addEventListener('change', () => {
+      if (select.value && targetsByKey.has(select.value)) adminSelections.set(name, select.value);
+      else adminSelections.delete(name);
+      button.disabled = adminBusy || !select.value;
+    });
     button.addEventListener('click', () => {
-      const selected = targets[Number(select.value)];
+      const selected = targetsByKey.get(select.value);
       if (selected) previewAdmin(name, selected.target);
     });
     card.append(select, button);

@@ -445,7 +445,7 @@ function actionGatesForTest() {
   };
 }
 
-test('Admin browser UI is cancel-focused, phone-safe, persistent, and confirms with token only', () => {
+test('Admin browser UI preserves exact/all selections and never treats its placeholder as target zero', () => {
   const publicRoot = path.join(__dirname, '..', 'monitor-web', 'public');
   const html = fs.readFileSync(path.join(publicRoot, 'index.html'), 'utf8');
   const script = fs.readFileSync(path.join(publicRoot, 'app.js'), 'utf8');
@@ -455,6 +455,12 @@ test('Admin browser UI is cancel-focused, phone-safe, persistent, and confirms w
   assert.match(html, /id="cancel-admin"/);
   assert.match(html, /DELETE ALL MESSAGE HISTORY/);
   assert.match(script, /elements\['cancel-admin'\]\.focus\(\)/);
+  assert.match(script, /const adminSelections = new Map\(\)/);
+  assert.match(script, /adminSelections\.set\(name, select\.value\)/);
+  assert.match(script, /targetsByKey\.get\(select\.value\)/);
+  assert.match(script, /button\.disabled = adminBusy \|\| !select\.value/);
+  assert.doesNotMatch(script, /targets\[Number\(select\.value\)\]/);
+  assert.match(script, /All identities/);
   assert.match(script, /confirmationToken: pending\.value\.confirmationToken/);
   assert.doesNotMatch(script, /confirmationToken: pending\.value\.confirmationToken[\s\S]{0,80}(identity|target|scope):/);
   assert.match(script, /The result is unknown\. The action was not retried/);
