@@ -4,7 +4,7 @@ Date: 2026-08-29
 
 Task: `td-1554bc`
 
-Status: Implemented in `bfba25e`; production gates off pending per-action live acceptance
+Status: Implemented in `bfba25e`; all production gates enabled by explicit operator direction on 2026-08-30
 
 Depends on:
 

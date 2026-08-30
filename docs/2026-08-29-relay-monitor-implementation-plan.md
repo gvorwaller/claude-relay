@@ -179,9 +179,16 @@ metadata, and did not send the target again during confirmation. No destructive
 browser action was confirmed during this verification.
 
 The production web service is active and healthy at release
-`bfba25ee2fc4`. Phase 3 remains enabled. Every Phase 4 gate is explicitly `0`
-on both the Mac agent and droplet, so the public browser remains Phase 4
-read-only. Exact-scope actions must now complete their isolated synthetic or
-maintenance-window live acceptance one at a time before either gate is left
-enabled. Both all-scope gates remain off, and global message cleanup still
-requires separate explicit approval.
+`bfba25ee2fc4`. Phase 3 remains enabled. Phase 4 initially deployed with every
+gate explicitly `0` on both the Mac agent and droplet.
+
+On 2026-08-30, the operator explicitly directed that all Phase 4 functions be
+enabled in one pass, including both all-scope cleanup variants. All seven gates
+were set to `1` on both services, the Mac launch agent and droplet web service
+were refreshed, and production negotiation was verified through the
+authenticated browser. All five Admin cards were visible; `All owners` and
+`All message history` were available; the agent was connected; relay health
+showed eight passing checks; and the browser console had no errors. Credential
+repair correctly showed no selectable target because no identity was pending.
+No restart, cleanup, credential rotation, identity removal, or message deletion
+was executed during enablement verification.
