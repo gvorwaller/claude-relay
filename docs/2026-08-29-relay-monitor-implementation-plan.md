@@ -158,3 +158,30 @@ actions; and the droplet journal contained no synthetic body, Mac path, or
 credential marker. Phase 3 is enabled after this acceptance and still requires
 an authenticated browser session, CSRF, a fresh connected agent, and an exact
 local-agent preview for every stop.
+
+## Phase 4 implementation status — 2026-08-29
+
+Phase 4 code shipped in revision `bfba25e` and is deployed on the droplet as
+release `bfba25ee2fc4`. It adds dependency-free capability negotiation, strict
+action-specific preview/confirm/result schemas, Mac-local 60-second state-bound
+single-use tokens, a one-at-a-time mutation gate, content-free private local
+audit, bounded droplet reconciliation metadata, and all five actions specified
+in the Phase 4 document. Durable message cleanup now stages and fsyncs a full
+journal replacement and recovers the original journal after an interrupted
+directory swap.
+
+The final automated release gate passed 178 tests. Node and shell syntax,
+deployment plist lint, `git diff --check`, and `npm audit --omit=dev` also
+passed. Local browser acceptance passed at desktop and 390-pixel width: the
+Admin UI used a single column without horizontal overflow, kept both controls
+visible, focused Cancel, closed on Escape, exposed only sanitized preview
+metadata, and did not send the target again during confirmation. No destructive
+browser action was confirmed during this verification.
+
+The production web service is active and healthy at release
+`bfba25ee2fc4`. Phase 3 remains enabled. Every Phase 4 gate is explicitly `0`
+on both the Mac agent and droplet, so the public browser remains Phase 4
+read-only. Exact-scope actions must now complete their isolated synthetic or
+maintenance-window live acceptance one at a time before either gate is left
+enabled. Both all-scope gates remain off, and global message cleanup still
+requires separate explicit approval.

@@ -4,7 +4,7 @@ Date: 2026-08-29
 
 Task: `td-1554bc`
 
-Status: Proposed
+Status: Implemented in `bfba25e`; production gates off pending per-action live acceptance
 
 Depends on:
 
