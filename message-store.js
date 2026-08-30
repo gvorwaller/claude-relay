@@ -19,6 +19,7 @@ class MessageStore {
   }
 
   initialize() {
+    this.recoverPurgeTransaction();
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.dataDir, 0o700);
     this.prune();
@@ -168,6 +169,15 @@ class MessageStore {
     let purged = 0;
     let filesDeleted = 0;
     let filesRewritten = 0;
+    const parent = path.dirname(this.dataDir);
+    const base = path.basename(this.dataDir);
+    const transaction = randomUUID();
+    const staged = path.join(parent, `.${base}.purge-${transaction}`);
+    const backup = path.join(parent, `.${base}.backup-${transaction}`);
+    fs.mkdirSync(staged, { mode: 0o700 });
+    let originalRenamed = false;
+    let replacementRenamed = false;
+    try {
     for (const file of this.journalFiles()) {
       const kept = [];
       for (const line of fs.readFileSync(file.path, 'utf8').split('\n')) {
@@ -181,19 +191,58 @@ class MessageStore {
         }
       }
       if (!kept.length) {
-        fs.unlinkSync(file.path);
         filesDeleted += 1;
       } else {
-        const tmp = `${file.path}.${process.pid}.tmp`;
-        fs.writeFileSync(tmp, `${kept.join('\n')}\n`, { mode: 0o600 });
-        fs.renameSync(tmp, file.path);
-        fs.chmodSync(file.path, 0o600);
+        const destination = path.join(staged, path.basename(file.path));
+        const handle = fs.openSync(destination, 'w', 0o600);
+        try {
+          fs.writeSync(handle, `${kept.join('\n')}\n`);
+          fs.fsyncSync(handle);
+        } finally { fs.closeSync(handle); }
         filesRewritten += 1;
       }
+    }
+      const stagedHandle = fs.openSync(staged, 'r');
+      try { fs.fsyncSync(stagedHandle); } finally { fs.closeSync(stagedHandle); }
+      fs.renameSync(this.dataDir, backup);
+      originalRenamed = true;
+      fs.renameSync(staged, this.dataDir);
+      replacementRenamed = true;
+      const parentHandle = fs.openSync(parent, 'r');
+      try { fs.fsyncSync(parentHandle); } finally { fs.closeSync(parentHandle); }
+      fs.rmSync(backup, { recursive: true, force: true });
+    } catch (error) {
+      if (replacementRenamed) {
+        const failed = `${staged}.failed`;
+        try { fs.renameSync(this.dataDir, failed); } catch {}
+        try { fs.renameSync(backup, this.dataDir); } catch {}
+        try { fs.rmSync(failed, { recursive: true, force: true }); } catch {}
+      } else if (originalRenamed) {
+        try { fs.renameSync(backup, this.dataDir); } catch {}
+      }
+      try { fs.rmSync(staged, { recursive: true, force: true }); } catch {}
+      throw error;
     }
     this.clearCache();
     for (const message of this.readAll().slice(-this.maxCacheMessages)) this.addToCache(message);
     return { ...preview, purged, filesDeleted, filesRewritten, confirmed: true };
+  }
+
+  recoverPurgeTransaction() {
+    const parent = path.dirname(this.dataDir);
+    const base = path.basename(this.dataDir);
+    let names = [];
+    try { names = fs.readdirSync(parent); } catch { return; }
+    const backups = names.filter(name => name.startsWith(`.${base}.backup-`)).sort();
+    if (!fs.existsSync(this.dataDir) && backups.length) {
+      fs.renameSync(path.join(parent, backups.at(-1)), this.dataDir);
+    }
+    for (const name of names) {
+      if (name.startsWith(`.${base}.backup-`) || name.startsWith(`.${base}.purge-`)) {
+        const candidate = path.join(parent, name);
+        if (candidate !== this.dataDir) fs.rmSync(candidate, { recursive: true, force: true });
+      }
+    }
   }
 
   prune() {

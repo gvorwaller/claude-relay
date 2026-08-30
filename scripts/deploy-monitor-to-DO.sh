@@ -7,7 +7,7 @@ APP_ROOT="/opt/claude-relay-monitor"
 REVISION="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
 RELEASE="$APP_ROOT/releases/$REVISION"
 SCOPED_PATHS=(
-  monitor-web monitor-model.js monitor-protocol.js monitor-control.js runtime-status.js
+  monitor-web monitor-model.js monitor-protocol.js monitor-admin.js monitor-admin-schema.js monitor-control.js runtime-status.js
   capabilities.js delegate-job-store.js package.json package-lock.json
   scripts/relay-monitor-agent.js scripts/deploy-monitor-to-DO.sh
   deploy/relay-monitor
@@ -32,6 +32,7 @@ ssh "$DROPLET" "id relay-monitor >/dev/null 2>&1 || useradd --system --home-dir 
 rsync -az --delete \
   --include='/monitor-web/***' \
   --include='/monitor-protocol.js' \
+  --include='/monitor-admin-schema.js' \
   --include='/package.json' \
   --include='/package-lock.json' \
   --exclude='*' \
@@ -71,4 +72,4 @@ test "$(ss -ltnH 'sport = :3006' | awk '{print $4}')" = "127.0.0.1:3006"
 REMOTE
 
 echo "Relay monitor origin deployed at revision $REVISION."
-echo "Phase 3 remains disabled unless MONITOR_STOP_DELEGATE_ENABLED=1 is set on both services."
+echo "Phase 3 and every Phase 4 capability remain controlled by independent two-sided gates."

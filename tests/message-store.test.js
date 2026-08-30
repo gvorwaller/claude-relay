@@ -66,6 +66,20 @@ test('identity-scoped purge is preview-bound and atomically preserves unrelated 
   assert.deepEqual(store.query({ requester: 'CODEX3' }).messages.map(message => message.content), ['keep']);
 });
 
+test('message store recovers the original journal from an interrupted directory swap', () => {
+  const parent = tempDir();
+  const dataDir = path.join(parent, 'messages');
+  const store = new MessageStore({ dataDir });
+  store.initialize();
+  store.append({ from: 'A', to: 'B', content: 'survives interrupted cleanup' });
+  const backup = path.join(parent, '.messages.backup-interrupted');
+  fs.renameSync(dataDir, backup);
+  const recovered = new MessageStore({ dataDir });
+  recovered.initialize();
+  assert.equal(recovered.readAll()[0].content, 'survives interrupted cleanup');
+  assert.equal(fs.existsSync(backup), false);
+});
+
 test('prunes files older than seven UTC days and tolerates a corrupt final line', () => {
   const dataDir = tempDir();
   const now = new Date('2026-07-12T12:00:00.000Z');

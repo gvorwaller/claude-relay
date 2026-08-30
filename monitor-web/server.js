@@ -6,9 +6,10 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const { WebSocketServer } = require('ws');
 const { AccessJwtVerifier, BrowserAuth } = require('./auth');
+const { actionGates, enabledActions, validateAdminTarget } = require('../monitor-admin-schema');
 const {
   createChallenge, envelope, parseEnvelope, validateAgentCommand, validateAgentResult,
-  validateSnapshot, verifyHandshakeMac
+  validateAgentCapabilities, validateSnapshot, verifyHandshakeMac
 } = require('../monitor-protocol');
 
 const PUBLIC_ROOT = path.join(__dirname, 'public');
@@ -91,13 +92,18 @@ function createMonitorWebServer(options = {}) {
   });
   const enableStopDelegate = options.enableStopDelegate === undefined
     ? process.env.MONITOR_STOP_DELEGATE_ENABLED === '1' : options.enableStopDelegate;
+  const adminGates = options.adminGates || actionGates(options.env || process.env);
+  const serverAdminActions = new Set(enabledActions(adminGates));
+  const enableCommands = enableStopDelegate || serverAdminActions.size > 0;
   const state = {
     agent: null,
     snapshot: null,
     lastHeartbeat: null,
     events: [],
     sse: new Set(),
-    agentAuthFailures: new Map(), pendingActions: new Map(), actionAudit: []
+    agentAuthFailures: new Map(), pendingActions: new Map(), actionAudit: [],
+    adminRates: new Map(), adminGlobalRates: { preview: [], confirm: [] },
+    adminConfirmationInFlight: false
   };
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
@@ -112,15 +118,27 @@ function createMonitorWebServer(options = {}) {
   }
 
   function publicSnapshot() {
+    const admin = Object.fromEntries([
+      ['restartRelay', 'restart_relay'], ['cleanupActivity', 'cleanup_activity'],
+      ['repairCredential', 'repair_owner_credential'], ['removeIdentity', 'remove_identity'],
+      ['cleanupMessages', 'cleanup_messages']
+    ].map(([name, action]) => [name, capabilityAvailable(action)]));
+    admin.cleanupActivityAll = admin.cleanupActivity && adminGates.cleanup_activity_all;
+    admin.cleanupMessagesAll = admin.cleanupMessages && adminGates.cleanup_messages_all;
     const additions = {
       agent: agentState(),
       features: {
         stopDelegate: enableStopDelegate && Boolean(state.agent?.authenticated)
-          && agentState().state === 'fresh'
+          && agentState().state === 'fresh', admin
       },
       recentActions: state.actionAudit.slice(-20)
     };
     return state.snapshot ? { ...state.snapshot, ...additions } : { version: 1, snapshot: null, ...additions };
+  }
+
+  function capabilityAvailable(action) {
+    return serverAdminActions.has(action) && state.agent?.capabilities?.has(action) === true
+      && Boolean(state.agent?.authenticated) && agentState().state === 'fresh';
   }
 
   function commandFailure(message, code = 'unavailable') {
@@ -129,14 +147,30 @@ function createMonitorWebServer(options = {}) {
     return error;
   }
 
-  function requestAgentCommand(type, details, expectedType, timeoutMs) {
-    if (!enableStopDelegate) return Promise.reject(commandFailure('Remote actions are disabled', 'disabled'));
+  function permitAdminRequest(auth, phase) {
+    const cutoff = now() - 60_000;
+    const limit = phase === 'preview' ? 10 : 5;
+    const key = auth.sessionId || auth.identity;
+    const local = state.adminRates.get(key) || { preview: [], confirm: [] };
+    local[phase] = local[phase].filter(at => at >= cutoff);
+    state.adminGlobalRates[phase] = state.adminGlobalRates[phase].filter(at => at >= cutoff);
+    if (local[phase].length >= limit || state.adminGlobalRates[phase].length >= limit) return false;
+    local[phase].push(now());
+    state.adminGlobalRates[phase].push(now());
+    state.adminRates.set(key, local);
+    return true;
+  }
+
+  function requestAgentCommand(action, type, details, expectedType, timeoutMs) {
+    if (action === 'stop_delegate' ? !enableStopDelegate : !capabilityAvailable(action)) {
+      return Promise.reject(commandFailure('Remote action is disabled', 'disabled'));
+    }
     const connection = state.agent;
     if (!connection?.authenticated || connection.ws.readyState !== 1 || agentState().state !== 'fresh') {
       return Promise.reject(commandFailure('The local relay agent is unavailable'));
     }
     const requestId = randomUUID();
-    const payload = validateAgentCommand(type, { requestId, action: 'stop_delegate', ...details });
+    const payload = validateAgentCommand(type, { requestId, action, ...details });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         state.pendingActions.delete(requestId);
@@ -145,7 +179,7 @@ function createMonitorWebServer(options = {}) {
           : 'The local relay agent did not answer the preview', type === 'confirm_request' ? 'unknown' : 'timeout'));
       }, timeoutMs);
       timer.unref?.();
-      state.pendingActions.set(requestId, { connection, expectedType, resolve, reject, timer, type, details });
+      state.pendingActions.set(requestId, { connection, expectedType, resolve, reject, timer, type, action, details });
       try {
         connection.ws.send(JSON.stringify(envelope(type, connection.outgoingSequence, payload)));
         connection.outgoingSequence += 1;
@@ -168,10 +202,15 @@ function createMonitorWebServer(options = {}) {
     if (message.type === 'action_result') {
       const result = payload.ok ? payload.result : null;
       const audit = {
-        action: 'stop_delegate', jobId: pending.details.jobId,
-        owner: result?.owner || null, outcome: payload.ok ? result.status : 'rejected',
+        action: pending.action,
+        target: pending.details.jobId || pending.details.target?.identity || pending.details.target?.scope || 'relay',
+        outcome: payload.ok ? (result.status || result.outcome) : 'rejected',
         at: result?.completedAt || new Date(now()).toISOString()
       };
+      if (pending.action === 'stop_delegate') {
+        audit.jobId = pending.details.jobId;
+        audit.owner = result?.owner || null;
+      }
       state.actionAudit.push(audit);
       if (state.actionAudit.length > 100) state.actionAudit.shift();
       broadcast('action', audit);
@@ -264,6 +303,9 @@ function createMonitorWebServer(options = {}) {
       if (req.method === 'GET' && url.pathname === '/api/v1/snapshot') {
         return json(res, state.snapshot ? 200 : 503, publicSnapshot());
       }
+      if (req.method === 'GET' && url.pathname === '/api/v1/admin/capabilities') {
+        return json(res, 200, publicSnapshot().features.admin);
+      }
       if (req.method === 'GET' && url.pathname === '/api/v1/events') {
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -293,7 +335,7 @@ function createMonitorWebServer(options = {}) {
         const active = state.snapshot?.activeWork?.find(job => job.jobId === body.jobId && job.actions?.stopDelegate === true);
         if (!active) return json(res, 409, { error: 'That delegate is no longer active' });
         try {
-          const result = await requestAgentCommand('preview_request', { jobId: body.jobId }, 'preview_result', 5_000);
+          const result = await requestAgentCommand('stop_delegate', 'preview_request', { jobId: body.jobId }, 'preview_result', 5_000);
           return result.ok ? json(res, 200, result.preview) : json(res, 409, { error: result.error });
         } catch (error) {
           return json(res, error.code === 'timeout' ? 504 : 503, { error: error.message });
@@ -306,7 +348,7 @@ function createMonitorWebServer(options = {}) {
         if (!body || Object.keys(body).sort().join(',') !== 'confirmationToken,jobId'
           || !JOB_ID.test(body.jobId || '')) return json(res, 400, { error: 'Invalid stop confirmation' });
         try {
-          const result = await requestAgentCommand('confirm_request', body, 'action_result', 10_000);
+          const result = await requestAgentCommand('stop_delegate', 'confirm_request', body, 'action_result', 10_000);
           return result.ok ? json(res, 200, result.result) : json(res, 409, { error: result.error });
         } catch (error) {
           return json(res, error.code === 'unknown' ? 504 : 503, {
@@ -314,8 +356,50 @@ function createMonitorWebServer(options = {}) {
           });
         }
       }
+      const adminRoutes = {
+        'restart-relay': 'restart_relay',
+        'cleanup-activity': 'cleanup_activity',
+        'repair-owner-credential': 'repair_owner_credential',
+        'remove-identity': 'remove_identity',
+        'cleanup-messages': 'cleanup_messages'
+      };
+      const adminMatch = url.pathname.match(/^\/api\/v1\/actions\/([a-z-]+)\/(preview|confirm)$/);
+      if (req.method === 'POST' && adminMatch && adminRoutes[adminMatch[1]]) {
+        const action = adminRoutes[adminMatch[1]];
+        const phase = adminMatch[2];
+        if (!capabilityAvailable(action)) return json(res, 404, { error: 'Remote action is disabled' });
+        if (!browserAuth.verifyCsrf(auth, req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token' });
+        if (!permitAdminRequest(auth, phase)) return json(res, 429, { error: 'Too many action requests' });
+        if (phase === 'confirm' && state.adminConfirmationInFlight) return json(res, 409, { error: 'Another action is in progress' });
+        const body = JSON.parse(await readBody(req));
+        let details;
+        try {
+          if (phase === 'preview') details = { target: validateAdminTarget(action, body, adminGates) };
+          else {
+            if (!body || Object.keys(body).join(',') !== 'confirmationToken'
+              || !/^[A-Za-z0-9_-]{43}$/.test(body.confirmationToken || '')) throw new Error('invalid');
+            details = { confirmationToken: body.confirmationToken };
+          }
+        } catch {
+          return json(res, 400, { error: phase === 'preview' ? 'Invalid action target' : 'Invalid confirmation' });
+        }
+        try {
+          if (phase === 'confirm') state.adminConfirmationInFlight = true;
+          const result = await requestAgentCommand(action,
+            phase === 'preview' ? 'preview_request' : 'confirm_request', details,
+            phase === 'preview' ? 'preview_result' : 'action_result', phase === 'preview' ? 5_000 : 20_000);
+          return result.ok ? json(res, 200, phase === 'preview' ? result.preview : result.result)
+            : json(res, 409, { error: result.error });
+        } catch (error) {
+          return json(res, error.code === 'unknown' ? 504 : error.code === 'disabled' ? 404 : 503, {
+            error: error.message, ...(error.code === 'unknown' ? { resultUnknown: true } : {})
+          });
+        } finally {
+          if (phase === 'confirm') state.adminConfirmationInFlight = false;
+        }
+      }
       if (req.method === 'POST' && url.pathname.startsWith('/api/v1/actions/')) {
-        return json(res, 404, { error: 'Remote actions are disabled in the read-only release' });
+        return json(res, 404, { error: 'Remote actions are disabled' });
       }
       if (await serveStatic(req, res, url.pathname)) return;
       return json(res, 404, { error: 'Not found' });
@@ -356,7 +440,8 @@ function createMonitorWebServer(options = {}) {
     const challenge = createChallenge();
     const connection = {
       ws, challenge, challengeExpiresAt: now() + 30_000,
-      authenticated: false, expectedSequence: 0, outgoingSequence: 1
+      authenticated: false, expectedSequence: 0, outgoingSequence: 1,
+      capabilities: new Set()
     };
     state.agent = connection;
     ws.send(JSON.stringify(envelope('agent_hello', 0, { installationId, challenge })));
@@ -366,7 +451,7 @@ function createMonitorWebServer(options = {}) {
     handshakeTimeout.unref();
     ws.on('message', raw => {
       try {
-        const message = parseEnvelope(raw, { readOnlyAgent: !enableStopDelegate });
+        const message = parseEnvelope(raw, { readOnlyAgent: !enableCommands });
         if (!connection.authenticated) {
           const keys = Object.keys(message.payload).sort().join(',');
           if (message.type !== 'agent_hello' || message.sequence !== 0 || keys !== 'challenge,installationId,mac'
@@ -384,7 +469,12 @@ function createMonitorWebServer(options = {}) {
         }
         if (message.sequence !== connection.expectedSequence) throw new Error('Monitor protocol sequence gap');
         connection.expectedSequence += 1;
-        if (message.type === 'agent_heartbeat') {
+        if (message.type === 'agent_capabilities') {
+          const capabilities = validateAgentCapabilities(message.payload);
+          connection.capabilities = new Set(capabilities.actions);
+          state.lastHeartbeat = now();
+          broadcast('snapshot', publicSnapshot());
+        } else if (message.type === 'agent_heartbeat') {
           state.lastHeartbeat = now();
         } else if (message.type === 'snapshot') {
           state.snapshot = validateSnapshot(message.payload);
@@ -395,7 +485,7 @@ function createMonitorWebServer(options = {}) {
           if (state.events.length > 100) state.events.shift();
           broadcast('event', message.payload);
         } else if (message.type === 'preview_result' || message.type === 'action_result') {
-          if (!enableStopDelegate) throw new Error('Remote actions are disabled');
+          if (!enableCommands) throw new Error('Remote actions are disabled');
           settleAgentResult(connection, message);
         } else if (message.type !== 'protocol_error') {
           throw new Error('Unsupported agent message');

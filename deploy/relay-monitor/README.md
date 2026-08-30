@@ -58,3 +58,15 @@ on both sides only for the synthetic exact-job acceptance test, then reinstall
 the launch agent and restart the web service. The browser can supply only a
 canonical job ID and a local-agent-minted, 60-second, single-use confirmation
 token; it never supplies a PID, signal, executable, or command.
+
+## Phase 4 gates
+
+Every browser admin capability has a separate gate on the droplet and Mac
+agent. All seven settings in `web.env.example` and the generated launchd plist
+default to `0`. The server exposes an action only after the authenticated,
+fresh agent advertises the same capability. Exact-owner and all-owner cleanup
+remain separate; global message cleanup stays off until separately approved.
+
+Enable only the capability under acceptance, refresh the launch agent, restart
+the web service, complete the synthetic acceptance steps in the Phase 4 spec,
+then either record the accepted state or return both gates to `0`.

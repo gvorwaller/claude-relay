@@ -4,11 +4,11 @@ const { createHmac, randomBytes, timingSafeEqual } = require('crypto');
 
 const PROTOCOL_VERSION = 1;
 const MESSAGE_TYPES = new Set([
-  'agent_hello', 'agent_heartbeat', 'snapshot', 'event',
+  'agent_hello', 'agent_capabilities', 'agent_heartbeat', 'snapshot', 'event',
   'preview_request', 'preview_result', 'confirm_request', 'action_result',
   'protocol_error'
 ]);
-const READ_ONLY_AGENT_TYPES = new Set(['agent_hello', 'agent_heartbeat', 'snapshot', 'event', 'protocol_error']);
+const READ_ONLY_AGENT_TYPES = new Set(['agent_hello', 'agent_capabilities', 'agent_heartbeat', 'snapshot', 'event', 'protocol_error']);
 const FORBIDDEN_KEYS = new Set([
   'content', 'message', 'messages', 'prompt', 'reasoning', 'command', 'commands',
   'toolInput', 'toolOutput', 'toolArguments', 'stdout', 'stderr', 'argv', 'args',
@@ -19,6 +19,11 @@ const CREDENTIAL = /\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9_+=-]{
 const JOB_ID = /^wake_[0-9a-f-]{36}$/;
 const REQUEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const CONFIRMATION_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const CLIENT_ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const ADMIN_ACTIONS = new Set([
+  'restart_relay', 'cleanup_activity', 'repair_owner_credential',
+  'remove_identity', 'cleanup_messages'
+]);
 
 function createChallenge() {
   return randomBytes(32).toString('base64url');
@@ -86,16 +91,22 @@ function exactKeys(value, expected, label) {
 }
 
 function validateAgentCommand(type, payload) {
+  const isAdmin = ADMIN_ACTIONS.has(payload?.action);
   if (type === 'preview_request') {
-    exactKeys(payload, ['requestId', 'action', 'jobId'], 'preview request');
+    exactKeys(payload, isAdmin ? ['requestId', 'action', 'target'] : ['requestId', 'action', 'jobId'], 'preview request');
   } else if (type === 'confirm_request') {
-    exactKeys(payload, ['requestId', 'action', 'jobId', 'confirmationToken'], 'confirm request');
+    exactKeys(payload, isAdmin ? ['requestId', 'action', 'confirmationToken']
+      : ['requestId', 'action', 'jobId', 'confirmationToken'], 'confirm request');
     if (!CONFIRMATION_TOKEN.test(payload.confirmationToken || '')) throw new Error('Invalid confirmation token');
   } else {
     throw new Error('Unsupported monitor agent command');
   }
-  if (!REQUEST_ID.test(payload.requestId || '') || payload.action !== 'stop_delegate'
-    || !JOB_ID.test(payload.jobId || '')) throw new Error('Invalid monitor agent command');
+  if (!REQUEST_ID.test(payload.requestId || '')) throw new Error('Invalid monitor agent command');
+  if (isAdmin) {
+    if (type === 'preview_request') validateAdminTargetShape(payload.action, payload.target);
+  } else if (payload.action !== 'stop_delegate' || !JOB_ID.test(payload.jobId || '')) {
+    throw new Error('Invalid monitor agent command');
+  }
   assertDataMinimized(payload);
   return payload;
 }
@@ -108,7 +119,7 @@ function validateAgentResult(type, payload) {
   const expected = payload.ok ? ['requestId', 'ok', type === 'preview_result' ? 'preview' : 'result']
     : ['requestId', 'ok', 'error'];
   exactKeys(payload, expected, 'agent result');
-  if (payload.ok && type === 'preview_result') {
+  if (payload.ok && type === 'preview_result' && payload.preview?.action === 'stop_delegate') {
     exactKeys(payload.preview, [
       'action', 'jobId', 'owner', 'processAlive', 'consequences', 'confirmationToken', 'expiresAt'
     ], 'stop preview');
@@ -118,17 +129,135 @@ function validateAgentResult(type, payload) {
       || !CONFIRMATION_TOKEN.test(payload.preview.confirmationToken || '')
       || !Number.isFinite(Date.parse(payload.preview.expiresAt || ''))) throw new Error('Invalid stop preview');
   }
-  if (payload.ok && type === 'action_result') {
+  if (payload.ok && type === 'action_result' && payload.result?.action === 'stop_delegate') {
     exactKeys(payload.result, ['action', 'jobId', 'owner', 'status', 'signaled', 'completedAt'], 'action result');
     if (payload.result.action !== 'stop_delegate' || !JOB_ID.test(payload.result.jobId || '')
       || typeof payload.result.owner !== 'string' || payload.result.status !== 'interrupted'
       || typeof payload.result.signaled !== 'boolean'
       || !Number.isFinite(Date.parse(payload.result.completedAt || ''))) throw new Error('Invalid action result');
   }
+  if (payload.ok && type === 'preview_result' && ADMIN_ACTIONS.has(payload.preview?.action)) {
+    exactKeys(payload.preview, ['action', 'summary', 'consequences', 'confirmationToken', 'expiresAt'], 'admin preview');
+    if (!payload.preview.summary || typeof payload.preview.summary !== 'object' || Array.isArray(payload.preview.summary)
+      || !Array.isArray(payload.preview.consequences) || payload.preview.consequences.length < 2
+      || !payload.preview.consequences.every(item => typeof item === 'string' && item.length <= 200)
+      || !CONFIRMATION_TOKEN.test(payload.preview.confirmationToken || '')
+      || !Number.isFinite(Date.parse(payload.preview.expiresAt || ''))) throw new Error('Invalid admin preview');
+    validateAdminSummary(payload.preview.action, payload.preview.summary);
+  }
+  if (payload.ok && type === 'action_result' && ADMIN_ACTIONS.has(payload.result?.action)) {
+    if (!payload.result || typeof payload.result !== 'object' || Array.isArray(payload.result)
+      || typeof payload.result.outcome !== 'string' || payload.result.outcome.length > 80
+      || !Number.isFinite(Date.parse(payload.result.completedAt || ''))) throw new Error('Invalid admin action result');
+    validateAdminActionResult(payload.result);
+  }
+  if (payload.ok && !ADMIN_ACTIONS.has(payload[type === 'preview_result' ? 'preview' : 'result']?.action)
+    && payload[type === 'preview_result' ? 'preview' : 'result']?.action !== 'stop_delegate') {
+    throw new Error('Invalid monitor action result');
+  }
   if (!payload.ok && (typeof payload.error !== 'string' || !payload.error || payload.error.length > 200)) {
     throw new Error('Invalid agent error result');
   }
   assertDataMinimized(payload);
+  return payload;
+}
+
+function validCounts(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.entries(value).every(([key, count]) => CLIENT_ID.test(key) || /^[a-z_]+$/.test(key) || /^\d{4}-\d{2}-\d{2}$/.test(key)
+      ? Number.isSafeInteger(count) && count >= 0 : false);
+}
+
+function nullableTimestamp(value) {
+  return value === null || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
+}
+
+function validateAdminSummary(action, summary) {
+  if (action === 'restart_relay') {
+    exactKeys(summary, ['serviceState', 'relayHealth', 'activeDelegateCount', 'installedPlistPresent'], 'restart summary');
+    if (!['running', 'stopped', 'missing_registration', 'unknown'].includes(summary.serviceState)
+      || !['healthy', 'needs_attention', 'offline', 'unknown'].includes(summary.relayHealth)
+      || summary.activeDelegateCount !== 0 || typeof summary.installedPlistPresent !== 'boolean') throw new Error('Invalid restart summary');
+  } else if (action === 'cleanup_activity') {
+    exactKeys(summary, ['scope', 'identity', 'eligibleCount', 'countsByStatus', 'countsByOwner', 'oldestAt', 'newestAt', 'activeWorkPreserved'], 'activity cleanup summary');
+    if (!['owner', 'all'].includes(summary.scope) || (summary.scope === 'owner' ? !CLIENT_ID.test(summary.identity || '') : summary.identity !== null)
+      || !Number.isSafeInteger(summary.eligibleCount) || summary.eligibleCount < 0
+      || !validCounts(summary.countsByStatus) || !validCounts(summary.countsByOwner)
+      || !nullableTimestamp(summary.oldestAt) || !nullableTimestamp(summary.newestAt)
+      || summary.activeWorkPreserved !== true) throw new Error('Invalid activity cleanup summary');
+  } else if (action === 'repair_owner_credential') {
+    exactKeys(summary, ['identity', 'live', 'state', 'consequence'], 'credential repair summary');
+    if (!CLIENT_ID.test(summary.identity || '') || typeof summary.live !== 'boolean'
+      || summary.state !== 'credential_not_confirmed'
+      || !['live_session_reconnects', 'credential_ready_next_start'].includes(summary.consequence)) throw new Error('Invalid credential repair summary');
+  } else if (action === 'remove_identity') {
+    exactKeys(summary, ['identity', 'credentialConfirmed', 'live', 'bridgeWillStop', 'lastActivity', 'messagesPreserved', 'completedActivityPreserved'], 'identity removal summary');
+    if (!CLIENT_ID.test(summary.identity || '') || !['credentialConfirmed', 'live', 'bridgeWillStop', 'messagesPreserved', 'completedActivityPreserved'].every(key => typeof summary[key] === 'boolean')
+      || !nullableTimestamp(summary.lastActivity) || summary.messagesPreserved !== true || summary.completedActivityPreserved !== true) throw new Error('Invalid identity removal summary');
+  } else {
+    exactKeys(summary, ['scope', 'identity', 'eligibleCount', 'countsByIdentity', 'countsByUtcDate', 'oldestAt', 'newestAt', 'global'], 'message cleanup summary');
+    if (!['identity', 'all'].includes(summary.scope) || (summary.scope === 'identity' ? !CLIENT_ID.test(summary.identity || '') : summary.identity !== null)
+      || !Number.isSafeInteger(summary.eligibleCount) || summary.eligibleCount < 0
+      || !validCounts(summary.countsByIdentity) || !validCounts(summary.countsByUtcDate)
+      || !nullableTimestamp(summary.oldestAt) || !nullableTimestamp(summary.newestAt)
+      || summary.global !== (summary.scope === 'all')) throw new Error('Invalid message cleanup summary');
+  }
+}
+
+function validateAdminActionResult(result) {
+  const action = result.action;
+  if (action === 'restart_relay') {
+    exactKeys(result, ['action', 'outcome', 'healthy', 'completedAt'], 'restart result');
+    if (!['restart_requested', 'repair_requested'].includes(result.outcome) || typeof result.healthy !== 'boolean') throw new Error('Invalid restart result');
+  } else if (action === 'cleanup_activity') {
+    exactKeys(result, ['action', 'outcome', 'scope', 'identity', 'removedCount', 'activeWorkPreserved', 'remainingTerminalCount', 'completedAt'], 'activity cleanup result');
+    if (result.outcome !== 'completed' || !Number.isSafeInteger(result.removedCount) || result.removedCount < 0
+      || !Number.isSafeInteger(result.remainingTerminalCount) || result.remainingTerminalCount < 0 || result.activeWorkPreserved !== true) throw new Error('Invalid activity cleanup result');
+  } else if (action === 'repair_owner_credential') {
+    exactKeys(result, ['action', 'outcome', 'identity', 'completedAt'], 'credential repair result');
+    if (!['reconnecting_for_confirmation', 'ready_for_next_start'].includes(result.outcome) || !CLIENT_ID.test(result.identity || '')) throw new Error('Invalid credential repair result');
+  } else if (action === 'remove_identity') {
+    exactKeys(result, ['action', 'outcome', 'identity', 'bridgeStopped', 'messagesPreserved', 'completedActivityPreserved', 'completedAt'], 'identity removal result');
+    if (result.outcome !== 'identity_removed' || !CLIENT_ID.test(result.identity || '') || typeof result.bridgeStopped !== 'boolean'
+      || result.messagesPreserved !== true || result.completedActivityPreserved !== true) throw new Error('Invalid identity removal result');
+  } else {
+    exactKeys(result, ['action', 'outcome', 'scope', 'identity', 'removedCount', 'remainingMessageCount', 'atomicRewrite', 'completedAt'], 'message cleanup result');
+    if (result.outcome !== 'completed' || !Number.isSafeInteger(result.removedCount) || result.removedCount < 0
+      || !Number.isSafeInteger(result.remainingMessageCount) || result.remainingMessageCount < 0 || result.atomicRewrite !== true) throw new Error('Invalid message cleanup result');
+  }
+}
+
+function validateAdminTargetShape(action, target) {
+  if (action === 'restart_relay') {
+    exactKeys(target, [], 'restart target');
+    return target;
+  }
+  if (action === 'repair_owner_credential' || action === 'remove_identity') {
+    exactKeys(target, ['identity'], 'identity target');
+    if (!CLIENT_ID.test(target.identity || '') || target.identity === 'all') throw new Error('Invalid identity target');
+    return target;
+  }
+  if (action === 'cleanup_activity' || action === 'cleanup_messages') {
+    if (target?.scope === 'all') exactKeys(target, ['scope'], 'cleanup target');
+    else {
+      exactKeys(target, ['scope', 'identity'], 'cleanup target');
+      const expected = action === 'cleanup_activity' ? 'owner' : 'identity';
+      if (target.scope !== expected || !CLIENT_ID.test(target.identity || '') || target.identity === 'all') {
+        throw new Error('Invalid cleanup target');
+      }
+    }
+    return target;
+  }
+  throw new Error('Unknown admin action');
+}
+
+function validateAgentCapabilities(payload) {
+  exactKeys(payload, ['revision', 'actions'], 'agent capabilities');
+  if (payload.revision !== 1 || !Array.isArray(payload.actions)
+    || payload.actions.some(action => !ADMIN_ACTIONS.has(action))
+    || payload.actions.join(',') !== [...new Set(payload.actions)].sort().join(',')) {
+    throw new Error('Invalid agent capabilities');
+  }
   return payload;
 }
 
@@ -151,7 +280,9 @@ module.exports = {
   handshakeMac,
   parseEnvelope,
   validateAgentCommand,
+  validateAgentCapabilities,
   validateAgentResult,
+  validateAdminTargetShape,
   validateSnapshot,
   verifyHandshakeMac
 };

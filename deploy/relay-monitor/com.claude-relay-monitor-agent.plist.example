@@ -25,6 +25,20 @@
     <string>__SECRET_DIR__/cf-access-client-secret</string>
     <key>MONITOR_STOP_DELEGATE_ENABLED</key>
     <string>__STOP_DELEGATE_ENABLED__</string>
+    <key>MONITOR_ADMIN_RESTART_ENABLED</key>
+    <string>__ADMIN_RESTART_ENABLED__</string>
+    <key>MONITOR_ADMIN_ACTIVITY_CLEANUP_ENABLED</key>
+    <string>__ADMIN_ACTIVITY_CLEANUP_ENABLED__</string>
+    <key>MONITOR_ADMIN_CREDENTIAL_REPAIR_ENABLED</key>
+    <string>__ADMIN_CREDENTIAL_REPAIR_ENABLED__</string>
+    <key>MONITOR_ADMIN_IDENTITY_REMOVAL_ENABLED</key>
+    <string>__ADMIN_IDENTITY_REMOVAL_ENABLED__</string>
+    <key>MONITOR_ADMIN_MESSAGE_CLEANUP_ENABLED</key>
+    <string>__ADMIN_MESSAGE_CLEANUP_ENABLED__</string>
+    <key>MONITOR_ADMIN_ACTIVITY_CLEANUP_ALL_ENABLED</key>
+    <string>__ADMIN_ACTIVITY_CLEANUP_ALL_ENABLED__</string>
+    <key>MONITOR_ADMIN_MESSAGE_CLEANUP_ALL_ENABLED</key>
+    <string>__ADMIN_MESSAGE_CLEANUP_ALL_ENABLED__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const { buildMonitorSnapshot, createStopDelegateController } = require('../monitor-model');
+const { actionGates, createAdminController, enabledActions } = require('../monitor-admin');
 const {
   envelope, handshakeMac, parseEnvelope, validateAgentCommand
 } = require('../monitor-protocol');
@@ -34,6 +35,9 @@ function createMonitorAgent(options = {}) {
   const allowInsecure = options.allowInsecure || process.env.MONITOR_ALLOW_INSECURE === '1';
   const enableStopDelegate = options.enableStopDelegate === undefined
     ? process.env.MONITOR_STOP_DELEGATE_ENABLED === '1' : options.enableStopDelegate;
+  const adminGates = options.adminGates || actionGates(options.env || process.env);
+  const adminActions = enabledActions(adminGates);
+  const enableCommands = enableStopDelegate || adminActions.length > 0;
   if (!url || !installationId) throw new Error('Monitor web URL and installation ID are required');
   const parsed = new URL(url);
   if (parsed.protocol !== 'wss:' && !(allowInsecure && parsed.protocol === 'ws:')) {
@@ -55,6 +59,9 @@ function createMonitorAgent(options = {}) {
     heartbeatTimer: null, publishing: false, expectedServerSequence: 0
   };
   const stopController = options.stopController || createStopDelegateController(dataRoot, options.stopControllerOptions);
+  const adminController = options.adminController || createAdminController(dataRoot, {
+    gates: adminGates, installationId, ...(options.adminControllerOptions || {})
+  });
 
   function clearConnectionTimers() {
     clearInterval(state.snapshotTimer);
@@ -89,6 +96,8 @@ function createMonitorAgent(options = {}) {
     state.sequence = 1;
     state.expectedServerSequence = 1;
     state.retryMs = 1_000;
+    adminController.setConnectionGeneration(`${installationId}:${Date.now()}:${Math.random()}`);
+    send('agent_capabilities', { revision: 1, actions: adminActions });
     publishSnapshot();
     state.snapshotTimer = setInterval(publishSnapshot, snapshotIntervalMs);
     state.heartbeatTimer = setInterval(() => send('agent_heartbeat', {}), heartbeatIntervalMs);
@@ -100,13 +109,26 @@ function createMonitorAgent(options = {}) {
     if (/state changed/i.test(value)) return 'Delegate state changed; preview it again before confirming';
     if (/expired/i.test(value)) return 'Confirmation has expired';
     if (/invalid|already used/i.test(value)) return 'Confirmation is invalid or already used';
+    const bounded = new Set([
+      'action_disabled', 'scope_disabled', 'invalid_target', 'identity_not_pending',
+      'identity_not_removable', 'active_work', 'job_store_unreadable', 'action_busy',
+      'confirmation_invalid', 'confirmation_expired', 'state_changed', 'restart_failed'
+    ]);
+    if (bounded.has(value)) return value;
     return 'The local relay could not complete the requested action';
   }
 
   async function handleCommand(message) {
     const payload = validateAgentCommand(message.type, message.payload);
     try {
-      if (message.type === 'preview_request') {
+      if (payload.action !== 'stop_delegate' && message.type === 'preview_request') {
+        const preview = await adminController.preview(payload.action, payload.target);
+        send('preview_result', { requestId: payload.requestId, ok: true, preview });
+      } else if (payload.action !== 'stop_delegate') {
+        const result = await adminController.confirm(payload.action, payload.confirmationToken);
+        send('action_result', { requestId: payload.requestId, ok: true, result });
+        await publishSnapshot();
+      } else if (message.type === 'preview_request') {
         const preview = stopController.preview(payload.jobId);
         send('preview_result', { requestId: payload.requestId, ok: true, preview });
       } else {
@@ -147,7 +169,7 @@ function createMonitorAgent(options = {}) {
     });
     socket.on('message', raw => {
       try {
-        const message = parseEnvelope(raw, { readOnlyAgent: !enableStopDelegate });
+        const message = parseEnvelope(raw, { readOnlyAgent: !enableCommands });
         if (!state.authenticated) {
           if (message.type !== 'agent_hello' || message.sequence !== 0) throw new Error('Monitor handshake rejected');
           const { challenge, installationId: expectedInstallation } = message.payload;
@@ -160,7 +182,7 @@ function createMonitorAgent(options = {}) {
           beginPublishing();
           return;
         }
-        if (!enableStopDelegate || message.sequence !== state.expectedServerSequence) {
+        if (!enableCommands || message.sequence !== state.expectedServerSequence) {
           throw new Error('Monitor command protocol rejected');
         }
         state.expectedServerSequence += 1;

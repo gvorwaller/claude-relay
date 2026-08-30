@@ -31,6 +31,11 @@
       <div class="section-heading"><h2 id="identity-title">Identities</h2><span id="identity-count"></span></div>
       <div id="identities" class="identity-grid"></div>
     </section>
+    <section id="admin-section" aria-labelledby="admin-title" hidden>
+      <div class="section-heading"><h2 id="admin-title">Admin</h2><span>Local authority · preview required</span></div>
+      <div id="admin-notice" class="admin-notice" role="status" hidden></div>
+      <div id="admin" class="admin-grid"></div>
+    </section>
   </main>
   <dialog id="detail">
     <div class="dialog-heading"><h2 id="detail-title">Delegate detail</h2><button id="close-detail" type="button" aria-label="Close">×</button></div>
@@ -46,6 +51,21 @@
       <div class="action-buttons">
         <button id="cancel-stop" type="button" class="secondary-button">Cancel</button>
         <button id="confirm-stop" type="button" class="danger-button">Stop exact delegate</button>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="admin-confirm">
+    <div class="dialog-heading"><h2 id="admin-confirm-title">Confirm admin action</h2><button id="close-admin-confirm" type="button" aria-label="Close">×</button></div>
+    <div class="action-body">
+      <p id="admin-confirm-intro">A fresh preview will be created by the local Mac agent.</p>
+      <dl id="admin-facts" class="detail-facts"></dl>
+      <ul id="admin-consequences" class="timeline"></ul>
+      <label id="admin-phrase-label" for="admin-phrase" hidden>Type DELETE ALL MESSAGE HISTORY to continue</label>
+      <input id="admin-phrase" type="text" autocomplete="off" hidden>
+      <p id="admin-error" class="action-error" role="alert"></p>
+      <div class="action-buttons">
+        <button id="cancel-admin" type="button" class="secondary-button">Cancel</button>
+        <button id="confirm-admin" type="button" class="danger-button" disabled>Confirm action</button>
       </div>
     </div>
   </dialog>

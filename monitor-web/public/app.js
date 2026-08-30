@@ -6,10 +6,16 @@ const elements = Object.fromEntries([
   'detail-body', 'close-detail', 'stop-confirm', 'close-stop', 'cancel-stop',
   'confirm-stop', 'stop-facts',
   'stop-consequences', 'stop-error'
+  , 'admin-section', 'admin', 'admin-notice', 'admin-confirm', 'admin-confirm-title',
+  'close-admin-confirm', 'admin-confirm-intro', 'admin-facts', 'admin-consequences',
+  'admin-phrase-label', 'admin-phrase', 'admin-error', 'cancel-admin', 'confirm-admin'
 ].map(id => [id, document.getElementById(id)]));
 let csrfToken = '';
-let features = { stopDelegate: false };
+let features = { stopDelegate: false, admin: {} };
 let pendingPreview = null;
+let pendingAdminPreview = null;
+let lastPayload = null;
+let adminBusy = false;
 
 function age(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return 'unknown';
@@ -94,7 +100,188 @@ function renderIdentities(identities) {
   }));
 }
 
+const ADMIN_ACTIONS = {
+  restartRelay: {
+    action: 'restart_relay', route: 'restart-relay', title: 'Restart or repair relay',
+    description: 'Restart only the fixed per-user relay service when no delegated work is active.',
+    confirm: 'Restart exact relay'
+  },
+  cleanupActivity: {
+    action: 'cleanup_activity', route: 'cleanup-activity', title: 'Clean completed activity',
+    description: 'Remove terminal delegate records while preserving every active run.',
+    confirm: 'Remove completed activity'
+  },
+  repairCredential: {
+    action: 'repair_owner_credential', route: 'repair-owner-credential', title: 'Repair owner credential',
+    description: 'Rotate one pending identity credential locally; no credential leaves the Mac.',
+    confirm: 'Repair this identity'
+  },
+  removeIdentity: {
+    action: 'remove_identity', route: 'remove-identity', title: 'Remove identity',
+    description: 'Remove one locally eligible identity while preserving messages and completed activity.',
+    confirm: 'Remove this identity'
+  },
+  cleanupMessages: {
+    action: 'cleanup_messages', route: 'cleanup-messages', title: 'Clean message history',
+    description: 'Irreversibly remove durable messages for one exact identity.',
+    confirm: 'Remove message history'
+  }
+};
+
+function adminTargets(name, payload) {
+  const identities = [...new Set([
+    ...(payload.identities || []).map(item => item.identity),
+    ...(payload.activeWork || []).map(item => item.owner),
+    ...(payload.recentWork || []).map(item => item.owner)
+  ])].filter(Boolean).sort();
+  if (name === 'repairCredential') return (payload.identities || [])
+    .filter(item => item.credentialWarning).map(item => ({ label: item.identity, target: { identity: item.identity } }));
+  if (name === 'removeIdentity') return identities.map(identity => ({ label: identity, target: { identity } }));
+  if (name === 'cleanupActivity') {
+    const values = identities.map(identity => ({ label: `${identity} only`, target: { scope: 'owner', identity } }));
+    if (features.admin.cleanupActivityAll) values.push({ label: 'All owners', target: { scope: 'all' }, global: true });
+    return values;
+  }
+  if (name === 'cleanupMessages') {
+    const values = identities.map(identity => ({ label: `${identity} only`, target: { scope: 'identity', identity } }));
+    if (features.admin.cleanupMessagesAll) values.push({ label: 'All message history', target: { scope: 'all' }, global: true });
+    return values;
+  }
+  return [];
+}
+
+function renderAdmin(payload) {
+  const available = Object.entries(ADMIN_ACTIONS).filter(([name]) => features.admin?.[name]);
+  elements['admin-section'].hidden = available.length === 0;
+  if (!available.length) return elements.admin.replaceChildren();
+  const cards = available.map(([name, config]) => {
+    const card = node('article', `admin-card${name === 'cleanupMessages' ? ' highest-risk' : ''}`);
+    card.append(node('h3', '', config.title), node('p', '', config.description));
+    if (name === 'restartRelay') {
+      const button = node('button', 'secondary-button admin-action', 'Preview restart…');
+      button.type = 'button';
+      button.disabled = adminBusy;
+      button.addEventListener('click', () => previewAdmin(name, {}));
+      card.append(button);
+      return card;
+    }
+    const targets = adminTargets(name, payload);
+    const select = node('select', 'admin-select');
+    const placeholder = node('option', '', targets.length ? 'Choose one exact target' : 'No eligible target in this snapshot');
+    placeholder.value = '';
+    select.append(placeholder);
+    targets.forEach((item, index) => {
+      const option = node('option', '', item.label);
+      option.value = String(index);
+      if (item.global) option.className = 'global-option';
+      select.append(option);
+    });
+    const button = node('button', 'secondary-button admin-action', 'Request preview…');
+    button.type = 'button';
+    button.disabled = adminBusy || !targets.length;
+    button.addEventListener('click', () => {
+      const selected = targets[Number(select.value)];
+      if (selected) previewAdmin(name, selected.target);
+    });
+    card.append(select, button);
+    return card;
+  });
+  elements.admin.replaceChildren(...cards);
+}
+
+function humanize(value) {
+  return String(value).replace(/([A-Z])/g, ' $1').replace(/^./, letter => letter.toUpperCase());
+}
+
+function displayValue(value) {
+  if (value === null) return 'None';
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value === 'object') return Object.entries(value).map(([key, count]) => `${key}: ${count}`).join(', ') || 'None';
+  if (typeof value === 'string' && Number.isFinite(Date.parse(value))) return new Date(value).toLocaleString();
+  return String(value);
+}
+
+async function previewAdmin(name, target) {
+  const config = ADMIN_ACTIONS[name];
+  pendingAdminPreview = null;
+  elements['admin-confirm-title'].textContent = config.title;
+  elements['admin-confirm-intro'].textContent = 'Requesting a fresh, state-bound preview from the local Mac agent…';
+  elements['admin-facts'].replaceChildren();
+  elements['admin-consequences'].replaceChildren(node('li', '', 'No action occurs until you explicitly confirm.'));
+  elements['admin-error'].textContent = '';
+  elements['confirm-admin'].textContent = config.confirm;
+  elements['confirm-admin'].disabled = true;
+  elements['admin-phrase'].value = '';
+  elements['admin-phrase'].hidden = true;
+  elements['admin-phrase-label'].hidden = true;
+  elements['admin-confirm'].showModal();
+  elements['cancel-admin'].focus();
+  let response;
+  let value;
+  try {
+    response = await actionRequest(`/api/v1/actions/${config.route}/preview`, target);
+    value = await response.json();
+  } catch {
+    elements['admin-error'].textContent = 'The preview request failed. No action was taken.';
+    return;
+  }
+  if (!response.ok) {
+    elements['admin-error'].textContent = value.error || 'This action is not currently eligible.';
+    return;
+  }
+  pendingAdminPreview = { name, config, value };
+  const facts = [];
+  Object.entries(value.summary || {}).forEach(([key, item]) => {
+    facts.push(node('dt', '', humanize(key)), node('dd', '', displayValue(item)));
+  });
+  facts.push(node('dt', '', 'Preview expires'), node('dd', '', new Date(value.expiresAt).toLocaleTimeString()));
+  elements['admin-facts'].replaceChildren(...facts);
+  elements['admin-consequences'].replaceChildren(...value.consequences.map(item => node('li', '', item)));
+  elements['admin-confirm-intro'].textContent = 'Review the local-agent preview. Cancel remains the safe default.';
+  const globalMessages = name === 'cleanupMessages' && value.summary?.global === true;
+  elements['admin-phrase'].hidden = !globalMessages;
+  elements['admin-phrase-label'].hidden = !globalMessages;
+  elements['confirm-admin'].disabled = globalMessages;
+}
+
+async function confirmAdmin() {
+  if (!pendingAdminPreview || adminBusy) return;
+  const pending = pendingAdminPreview;
+  pendingAdminPreview = null;
+  adminBusy = true;
+  elements['confirm-admin'].disabled = true;
+  elements['confirm-admin'].textContent = 'Working…';
+  elements['admin-error'].textContent = '';
+  try {
+    const response = await actionRequest(`/api/v1/actions/${pending.config.route}/confirm`, {
+      confirmationToken: pending.value.confirmationToken
+    });
+    const value = await response.json();
+    if (!response.ok) {
+      elements['admin-error'].textContent = value.resultUnknown
+        ? 'The result is unknown. The action will not be retried; reconcile from a fresh snapshot.'
+        : `${value.error || 'The action was rejected.'} Request a new preview before trying again.`;
+      elements['admin-notice'].hidden = false;
+      elements['admin-notice'].textContent = elements['admin-error'].textContent;
+      return;
+    }
+    elements['admin-confirm'].close();
+    elements['admin-notice'].hidden = false;
+    elements['admin-notice'].textContent = `${pending.config.title}: ${humanize(value.outcome)}. Snapshot reconciliation requested.`;
+    await loadSnapshot();
+  } catch {
+    elements['admin-error'].textContent = 'The result is unknown. The action was not retried.';
+    elements['admin-notice'].hidden = false;
+    elements['admin-notice'].textContent = elements['admin-error'].textContent;
+  } finally {
+    adminBusy = false;
+    elements['confirm-admin'].textContent = pending.config.confirm;
+    if (lastPayload) renderAdmin(lastPayload);
+  }
+}
+
 function render(payload) {
+  lastPayload = payload;
   const agent = payload.agent;
   features = payload.features || { stopDelegate: false };
   renderAgent(agent);
@@ -111,6 +298,7 @@ function render(payload) {
   renderJobs(elements.active, elements['active-count'], payload.activeWork, 'No active delegated work.');
   renderJobs(elements.recent, elements['recent-count'], payload.recentWork, 'No recent delegated work.');
   renderIdentities(payload.identities);
+  renderAdmin(payload);
 }
 
 async function showDetail(jobId) {
@@ -222,14 +410,35 @@ elements['close-stop'].addEventListener('click', () => elements['stop-confirm'].
 elements['cancel-stop'].addEventListener('click', () => elements['stop-confirm'].close());
 elements['confirm-stop'].addEventListener('click', confirmStop);
 elements['stop-confirm'].addEventListener('close', () => { pendingPreview = null; });
+elements['close-admin-confirm'].addEventListener('click', () => elements['admin-confirm'].close());
+elements['cancel-admin'].addEventListener('click', () => elements['admin-confirm'].close());
+elements['confirm-admin'].addEventListener('click', confirmAdmin);
+elements['admin-confirm'].addEventListener('close', () => { pendingAdminPreview = null; elements['admin-phrase'].value = ''; });
+elements['admin-confirm'].addEventListener('cancel', event => {
+  event.preventDefault();
+  elements['admin-confirm'].close();
+});
+elements['admin-confirm'].addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    elements['admin-confirm'].close();
+  }
+});
+elements['admin-phrase'].addEventListener('input', () => {
+  elements['confirm-admin'].disabled = elements['admin-phrase'].value !== 'DELETE ALL MESSAGE HISTORY';
+});
+
+async function loadSnapshot() {
+  const response = await fetch('/api/v1/snapshot');
+  if (response.status === 401) return window.location.replace('/login');
+  render(await response.json());
+}
 
 async function load() {
   const session = await fetch('/api/v1/session');
   if (session.status === 401) return window.location.replace('/login');
   csrfToken = (await session.json()).csrf;
-  const response = await fetch('/api/v1/snapshot');
-  if (response.status === 401) return window.location.replace('/login');
-  render(await response.json());
+  await loadSnapshot();
 }
 
 load();
@@ -238,5 +447,9 @@ events.addEventListener('snapshot', event => render(JSON.parse(event.data)));
 events.addEventListener('agent', event => {
   const agent = JSON.parse(event.data);
   renderAgent(agent);
-  if (!agent.connected || agent.state !== 'fresh') features.stopDelegate = false;
+  if (!agent.connected || agent.state !== 'fresh') {
+    features.stopDelegate = false;
+    features.admin = {};
+    if (lastPayload) renderAdmin(lastPayload);
+  }
 });

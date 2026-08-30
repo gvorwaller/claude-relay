@@ -361,3 +361,103 @@ test('agent disconnect after confirmation reports unknown and never retries the 
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(confirmations, 1);
 });
+
+test('Phase 4 requires server-agent capability intersection and confirms without resending a target', async t => {
+  const serverGates = {
+    restart_relay: false, cleanup_activity: true, repair_owner_credential: false,
+    remove_identity: false, cleanup_messages: false,
+    cleanup_activity_all: false, cleanup_messages_all: false
+  };
+  const app = await startWeb(t, { browserAuth: passwordAuth(), adminGates: serverGates });
+  const confirmationToken = 'P'.repeat(43);
+  let confirmed = 0;
+  const adminController = {
+    setConnectionGeneration() {},
+    async preview(action, target) {
+      assert.equal(action, 'cleanup_activity');
+      assert.deepEqual(target, { scope: 'owner', identity: 'CODEX1' });
+      return {
+        action, summary: {
+          scope: 'owner', identity: 'CODEX1', eligibleCount: 1,
+          countsByStatus: { completed: 1 }, countsByOwner: { CODEX1: 1 },
+          oldestAt: null, newestAt: null, activeWorkPreserved: true
+        },
+        consequences: ['Only completed activity is removed.', 'Active work is preserved.'],
+        confirmationToken, expiresAt: new Date(Date.now() + 60_000).toISOString()
+      };
+    },
+    async confirm(action, token) {
+      assert.equal(action, 'cleanup_activity');
+      assert.equal(token, confirmationToken);
+      confirmed += 1;
+      return {
+        action, outcome: 'completed', scope: 'owner', identity: 'CODEX1',
+        removedCount: 1, activeWorkPreserved: true, remainingTerminalCount: 0,
+        completedAt: new Date().toISOString()
+      };
+    }
+  };
+  const agent = createMonitorAgent({
+    url: app.wsUrl, installationId: 'home-relay', secret: AGENT_SECRET,
+    allowInsecure: true, adminGates: serverGates, adminController,
+    snapshotIntervalMs: 60_000, heartbeatIntervalMs: 60_000,
+    buildSnapshot: async () => snapshot(), logger: { info() {}, warn() {} }
+  });
+  t.after(() => agent.stop());
+  agent.start();
+  await waitFor(() => app.publicSnapshot().features.admin.cleanupActivity === true);
+  const cookie = await login(app.base);
+  const csrf = await sessionCsrf(app.base, cookie);
+  const headers = { Cookie: cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf };
+  const capabilities = await fetch(`${app.base}/api/v1/admin/capabilities`, { headers: { Cookie: cookie } });
+  assert.equal((await capabilities.json()).cleanupActivity, true);
+  const previewResponse = await fetch(`${app.base}/api/v1/actions/cleanup-activity/preview`, {
+    method: 'POST', headers, body: JSON.stringify({ scope: 'owner', identity: 'CODEX1' })
+  });
+  assert.equal(previewResponse.status, 200);
+  const preview = await previewResponse.json();
+  assert.equal(preview.confirmationToken, confirmationToken);
+  const confirmResponse = await fetch(`${app.base}/api/v1/actions/cleanup-activity/confirm`, {
+    method: 'POST', headers, body: JSON.stringify({ confirmationToken })
+  });
+  assert.equal(confirmResponse.status, 200);
+  assert.equal((await confirmResponse.json()).removedCount, 1);
+  assert.equal(confirmed, 1);
+});
+
+test('Phase 4 server-only enablement stays unavailable to the browser', async t => {
+  const app = await startWeb(t, {
+    browserAuth: passwordAuth(),
+    adminGates: { ...actionGatesForTest(), restart_relay: true }
+  });
+  const connection = await connectAgent(app.wsUrl);
+  connection.ws.send(JSON.stringify(envelope('snapshot', 1, snapshot())));
+  await waitFor(() => app.state.snapshot);
+  assert.equal(app.publicSnapshot().features.admin.restartRelay, false);
+  connection.ws.close();
+});
+
+function actionGatesForTest() {
+  return {
+    restart_relay: false, cleanup_activity: false, repair_owner_credential: false,
+    remove_identity: false, cleanup_messages: false,
+    cleanup_activity_all: false, cleanup_messages_all: false
+  };
+}
+
+test('Admin browser UI is cancel-focused, phone-safe, persistent, and confirms with token only', () => {
+  const publicRoot = path.join(__dirname, '..', 'monitor-web', 'public');
+  const html = fs.readFileSync(path.join(publicRoot, 'index.html'), 'utf8');
+  const script = fs.readFileSync(path.join(publicRoot, 'app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(publicRoot, 'styles.css'), 'utf8');
+  assert.match(html, /<section id="admin-section"/);
+  assert.match(html, /id="admin-notice"[^>]*role="status"/);
+  assert.match(html, /id="cancel-admin"/);
+  assert.match(html, /DELETE ALL MESSAGE HISTORY/);
+  assert.match(script, /elements\['cancel-admin'\]\.focus\(\)/);
+  assert.match(script, /confirmationToken: pending\.value\.confirmationToken/);
+  assert.doesNotMatch(script, /confirmationToken: pending\.value\.confirmationToken[\s\S]{0,80}(identity|target|scope):/);
+  assert.match(script, /The result is unknown\. The action was not retried/);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.admin-grid/);
+  assert.match(css, /flex-direction: column-reverse/);
+});

@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   assertDataMinimized, envelope, handshakeMac, parseEnvelope, validateSnapshot,
-  validateAgentCommand, validateAgentResult, verifyHandshakeMac
+  validateAgentCapabilities, validateAgentCommand, validateAgentResult, verifyHandshakeMac
 } = require('../monitor-protocol');
 
 test('agent handshake is installation- and nonce-bound with constant-shape verification', () => {
@@ -14,6 +14,29 @@ test('agent handshake is installation- and nonce-bound with constant-shape verif
   assert.equal(verifyHandshakeMac(secret, 'other-relay', 'challenge-a', mac), false);
   assert.equal(verifyHandshakeMac(secret, 'home-relay', 'challenge-b', mac), false);
   assert.equal(verifyHandshakeMac('wrong-secret', 'home-relay', 'challenge-a', mac), false);
+});
+
+test('Phase 4 capabilities and commands use sorted enums and action-specific exact schemas', () => {
+  assert.deepEqual(validateAgentCapabilities({
+    revision: 1, actions: ['cleanup_activity', 'restart_relay']
+  }).actions, ['cleanup_activity', 'restart_relay']);
+  assert.throws(() => validateAgentCapabilities({
+    revision: 1, actions: ['restart_relay', 'cleanup_activity']
+  }), /capabilities/);
+  assert.throws(() => validateAgentCapabilities({ revision: 1, actions: ['shell'] }), /capabilities/);
+  const requestId = 'request_admin_1';
+  assert.deepEqual(validateAgentCommand('preview_request', {
+    requestId, action: 'cleanup_activity', target: { scope: 'owner', identity: 'CODEX1' }
+  }).target, { scope: 'owner', identity: 'CODEX1' });
+  assert.throws(() => validateAgentCommand('preview_request', {
+    requestId, action: 'restart_relay', target: { label: 'other-service' }
+  }), /restart target/);
+  assert.throws(() => validateAgentCommand('preview_request', {
+    requestId, action: 'cleanup_messages', target: { scope: 'identity', identity: '../CC1' }
+  }), /cleanup target/);
+  assert.equal(validateAgentCommand('confirm_request', {
+    requestId, action: 'remove_identity', confirmationToken: 'Q'.repeat(43)
+  }).action, 'remove_identity');
 });
 
 test('action protocol accepts only exact minimized stop payloads', () => {
