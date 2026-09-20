@@ -22,6 +22,7 @@
 #
 # --dry-run prints the resolved session id and exits without resuming.
 set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="/Users/gaylonvorwaller/.local/bin:/Users/gaylonvorwaller/.nvm/versions/node/v24.3.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 REGISTRY="${RELAY_REGISTRY:-$HOME/claude-relay/sessions/registry.json}"
@@ -71,6 +72,15 @@ if [[ "$IS_CODEX" == "0" ]]; then
   [[ "$DRY_RUN" == "1" ]] && echo "$FOR -> not a codex peer; nothing to exec (wakes via its own watcher)"
   exit 64
 fi
+
+# A projectless Desktop conversation is a valid relay workspace. Never fall
+# back to the daemon's directory when its registered workspace is unavailable.
+fail_startup() {
+  node "$SCRIPT_DIR/../delegate-startup-failure.js" "$1"
+  exit 78
+}
+[[ -n "$PEER_CWD" && "$PEER_CWD" == /* && -d "$PEER_CWD" ]] || fail_startup workspace_missing
+command -v codex >/dev/null 2>&1 || fail_startup executable_missing
 
 # Every live Codex conversation has an active thread-store writer. That is true
 # for both Desktop app-server sessions and interactive CLI sessions; attempting
@@ -170,7 +180,7 @@ if [[ "$FRESH_DELEGATE" == "0" && -z "$SESSION_ID" ]]; then
       -e 'end run' \
       "$FOR" 2>/dev/null
   fi
-  exit 1
+  fail_startup session_missing
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -201,15 +211,22 @@ fi
 # submit the result.
 LAST_MESSAGE_FILE="$(mktemp -t relay-lastmsg)"
 chmod 600 "$LAST_MESSAGE_FILE"
-RESULT_SCHEMA="$(dirname "${BASH_SOURCE[0]}")/delegate-result-schema.json"
+RESULT_SCHEMA="$SCRIPT_DIR/delegate-result-schema.json"
+# Scope the Git preflight override to the explicit registered workspace. This
+# changes neither Codex sandbox permissions nor its approval policy.
+cd "$PEER_CWD" || fail_startup workspace_missing
+GIT_ARGS=()
+if ! git -C "$PEER_CWD" rev-parse --show-toplevel >/dev/null 2>&1; then
+  GIT_ARGS+=(--skip-git-repo-check)
+fi
 if [[ "$FRESH_DELEGATE" == "1" ]]; then
-  node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
-    codex exec --json "${CODEX_ARGS[@]}" -C "$PEER_CWD" \
+  node "$SCRIPT_DIR/run-codex-delegate.js" -- \
+    codex exec --json "${CODEX_ARGS[@]}" ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$PEER_CWD" \
     --output-schema "$RESULT_SCHEMA" \
     --output-last-message "$LAST_MESSAGE_FILE" "$PROMPT"
 else
-  node "$(dirname "${BASH_SOURCE[0]}")/run-codex-delegate.js" -- \
-    codex exec --json "${CODEX_ARGS[@]}" --output-schema "$RESULT_SCHEMA" \
+  node "$SCRIPT_DIR/run-codex-delegate.js" -- \
+    codex exec --json "${CODEX_ARGS[@]}" ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} --output-schema "$RESULT_SCHEMA" \
     --output-last-message "$LAST_MESSAGE_FILE" \
     resume "$SESSION_ID" "$PROMPT"
 fi
@@ -218,7 +235,7 @@ CODEX_EXIT=$?
 if [[ -n "${RELAY_JOB_ID:-}" && -n "${RELAY_JOB_RESULT_SECRET_FILE:-}" ]]; then
   RESULT_RECORDED=0
   for ATTEMPT in 1 2 3; do
-    if node "$(dirname "${BASH_SOURCE[0]}")/submit-job-result.js" \
+    if node "$SCRIPT_DIR/submit-job-result.js" \
       --job-id "$RELAY_JOB_ID" \
       --secret-file "$RELAY_JOB_RESULT_SECRET_FILE" \
       --last-message "$LAST_MESSAGE_FILE" \

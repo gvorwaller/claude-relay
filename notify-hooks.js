@@ -6,6 +6,7 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 const { notifyDelegate } = require('./delegate-notifier');
+const { STARTUP_FAILURE_EXIT, readStartupFailure } = require('./delegate-startup-failure');
 
 const EXEC_TIMEOUT_MS = 60 * 60 * 1000;
 const EXEC_KILL_GRACE_MS = 5000;
@@ -192,6 +193,13 @@ class NotifyHooks {
       error: outcome.error || null,
       exitCode: outcome.code === undefined ? null : outcome.code
     });
+    if (outcome.retryable === false) {
+      this.retryCounts.delete(key);
+      this.logger.error('notify_hook_permanent_failure', {
+        target: job.target, kind: entry.type, reason: outcome.error || 'Startup configuration failed'
+      });
+      return;
+    }
     this.scheduleRetry(key, entry, index, job, context, outcome.error || `exit ${outcome.code}`);
   }
 
@@ -245,6 +253,8 @@ class NotifyHooks {
       let jobKey = null;
       let jobRecord = null;
       let resultSecretFile = null;
+      let failureFile = null;
+      const cleanupFailure = () => { if (failureFile) { try { fs.unlinkSync(failureFile); } catch {} } };
       if (this.capabilities && target !== 'all') {
         try {
           // The job record exists BEFORE the wake is spawned, so a process
@@ -267,12 +277,17 @@ class NotifyHooks {
           }
           tokenFile = path.join(os.tmpdir(), `relay-job-${randomUUID()}.token`);
           fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+          failureFile = path.join(os.tmpdir(), `relay-failure-${randomUUID()}.code`);
+          fs.writeFileSync(failureFile, '', { mode: 0o600, flag: 'wx' });
+          setTimeout(cleanupFailure, this.capabilities.jobSessionMaxMs).unref();
           // A single wake may launch several short-lived MCP bridges. Keep
           // the handoff file for the bounded job lease; settle() removes it
           // immediately when the wake process terminates.
           setTimeout(() => { try { fs.unlinkSync(tokenFile); } catch {} }, this.capabilities.jobSessionMaxMs)
             .unref();
         } catch (err) {
+          cleanupFailure();
+          if (resultSecretFile) { try { fs.unlinkSync(resultSecretFile); } catch {} }
           this.logger.error('job_capability_mint_failed', { target, error: err.message });
           if (jobKey) this.capabilities.revokeJobByKey(jobKey);
           if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
@@ -297,12 +312,15 @@ class NotifyHooks {
           RELAY_FROM: from,
           RELAY_MESSAGE_ID: messageId || '',
           RELAY_DELIVERED: delivered ? '1' : '0',
+          ...(failureFile ? { RELAY_JOB_FAILURE_FILE: failureFile } : {}),
           ...(tokenFile ? { RELAY_JOB_TOKEN_FILE: tokenFile } : {}),
           ...(jobRecord ? { RELAY_JOB_ID: jobRecord.jobId } : {}),
           ...(resultSecretFile ? { RELAY_JOB_RESULT_SECRET_FILE: resultSecretFile } : {})
         }
       });
       } catch (err) {
+        cleanupFailure();
+        if (resultSecretFile) { try { fs.unlinkSync(resultSecretFile); } catch {} }
         if (jobKey) this.capabilities.revokeJobByKey(jobKey);
         if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
         if (jobRecord && this.jobStore) {
@@ -342,6 +360,7 @@ class NotifyHooks {
         settled = true;
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (forceKillTimer && !outcome.keepForceKill) clearTimeout(forceKillTimer);
+        cleanupFailure();
         // Exit 64: the wake script determined there is nothing to wake here
         // (a Claude Code peer wakes via its own watcher; a broadcast has no
         // single owner). Nothing ran, so no receipt is owed — discard the
@@ -350,6 +369,8 @@ class NotifyHooks {
           this.jobStore.discard(jobRecord.jobId);
           if (tokenFile) { try { fs.unlinkSync(tokenFile); } catch {} }
           if (jobKey) this.capabilities.revokeJobByKey(jobKey);
+          if (resultSecretFile) { try { fs.unlinkSync(resultSecretFile); } catch {} }
+          if (this.capabilities) this.capabilities.consumeResultSecret(jobRecord.jobId);
           onOutcome({ ok: true, code: outcome.code });
           return;
         }
@@ -369,7 +390,7 @@ class NotifyHooks {
           }
           const transitioned = this.jobStore.transition(jobRecord.jobId, terminal, {
             exitCode,
-            reason: outcome.error || null
+            reason: outcome.error || (exitCode ? `Wake process exited with code ${exitCode}. See the local wake log for details.` : null)
           });
           const actualTerminal = transitioned?.status || terminal;
           this.notifier({
@@ -396,6 +417,11 @@ class NotifyHooks {
       child.on('exit', (code, signal) => {
         if (signal) {
           settle({ ok: true, terminal: 'interrupted', error: `Delegate process ended by ${signal}` });
+          return;
+        }
+        if (code === STARTUP_FAILURE_EXIT) {
+          settle({ ok: false, code, retryable: false,
+            error: readStartupFailure(failureFile) || 'Wake startup configuration failed. See the local wake log for details.' });
           return;
         }
         // A wake command legitimately runs long (a resumed agent turn). Only

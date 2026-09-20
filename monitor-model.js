@@ -69,6 +69,7 @@ function projectJob(job, options = {}) {
   const startedAt = timestamp(job.startedAt);
   const lastActivityAt = timestamp(latestEvent?.at) || startedAt || requestedAt;
   const active = ACTIVE_JOB_STATES.has(job.status);
+  const completedAt = timestamp(job.completedAt) || timestamp(job.reportedAt);
   const lastActivityAgeMs = ageMs(lastActivityAt, now);
   const stalled = !active || lastActivityAgeMs === null ? null
     : lastActivityAgeMs >= 20 * 60 * 1000 ? 'possibly_stuck'
@@ -81,9 +82,11 @@ function projectJob(job, options = {}) {
     status: typeof job.status === 'string' ? job.status : 'unknown',
     requestedAt,
     startedAt,
-    completedAt: timestamp(job.completedAt || job.reportedAt),
+    completedAt,
+    completedAgeMs: ageMs(completedAt, now),
     requestedAgeMs: ageMs(requestedAt, now),
-    runAgeMs: ageMs(startedAt || requestedAt, now),
+    runAgeMs: active ? ageMs(startedAt || requestedAt, now)
+      : completedAt ? ageMs(startedAt || requestedAt, Date.parse(completedAt)) : null,
     lastActivityAt,
     lastActivityAgeMs,
     latestActivity: latestEvent
@@ -185,7 +188,8 @@ function projectJobDetail(job, options = {}) {
     verification: (Array.isArray(job.verification) ? job.verification : [])
       .slice(0, 20).map(item => safeText(item, 500)).filter(Boolean),
     error: ['failed', 'interrupted', 'exited_no_delegate'].includes(job.status)
-      ? { status: job.status, reason: safeText(job.reason, 500) || 'No bounded failure reason was captured.' }
+      ? { status: job.status, reason: safeText(job.reason, 500)
+        || (Number.isInteger(job.exitCode) ? `Wake process exited with code ${job.exitCode}. No specific failure reason was captured.` : 'No bounded failure reason was captured.') }
       : null
   };
 }
@@ -280,13 +284,17 @@ async function buildMonitorSnapshot(dataRoot, options = {}) {
       topologyError = safeText(error?.message, 200) || 'Live relay topology is unavailable.';
     }
   }
+  const identities = projectIdentities(topology);
+  const directories = new Map(identities.map(identity => [identity.identity, identity.cwdBasename]));
+  // This is current registration metadata, not a claim about historical runs.
+  for (const job of details) job.currentCwdBasename = directories.get(job.owner) || null;
   return {
     version: 1,
     generatedAt: new Date(now).toISOString(),
     health: projectHealth(dataRoot, options),
     activeWork: details.filter(job => ACTIVE_JOB_STATES.has(job.status)),
     recentWork: details.filter(job => !ACTIVE_JOB_STATES.has(job.status)),
-    identities: projectIdentities(topology),
+    identities,
     topologyError
   };
 }

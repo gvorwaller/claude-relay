@@ -12,6 +12,16 @@ const {
 
 const NOW = Date.parse('2026-08-29T16:00:00.000Z');
 
+test('terminal duration stops at completion while elapsed-since-completion keeps advancing', () => {
+  const job = { owner: 'CODEX', status: 'failed', exitCode: 1,
+    requestedAt: '2026-08-29T15:00:00.000Z', completedAt: '2026-08-29T15:00:00.330Z' };
+  assert.equal(projectJob(job, { now: NOW }).runAgeMs, 330);
+  assert.equal(projectJob(job, { now: NOW + 60000 }).runAgeMs, 330);
+  assert.equal(projectJob(job, { now: NOW + 60000 }).completedAgeMs - projectJob(job, { now: NOW }).completedAgeMs, 60000);
+  assert.equal(projectJob({ ...job, completedAt: null }, { now: NOW }).runAgeMs, null);
+  assert.match(projectJobDetail(job).error.reason, /code 1/);
+});
+
 test('shared monitor model orders work and exposes only sanitized job fields', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-model-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

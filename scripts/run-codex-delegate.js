@@ -5,6 +5,7 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
 const { projectCodexEvent } = require('../delegate-activity');
+const { STARTUP_FAILURE_EXIT, classifyStartupFailure, writeStartupFailure } = require('../delegate-startup-failure');
 
 const args = process.argv.slice(2);
 const separator = args.indexOf('--');
@@ -36,6 +37,9 @@ function submitActivity(activityType) {
 const child = spawn(command, commandArgs, { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
 let buffer = '';
 let stderrBytes = 0;
+let startupStderr = '';
+let workStarted = false;
+let spawnFailure = null;
 const pending = new Set();
 let submitted = 0;
 child.stdout.setEncoding('utf8');
@@ -47,6 +51,7 @@ child.stdout.on('data', chunk => {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     const projected = projectCodexEvent(event);
+    if (projected && projected !== 'error') workStarted = true;
     if (projected && submitted < 100) {
       submitted += 1;
       const request = submitActivity(projected);
@@ -57,16 +62,22 @@ child.stdout.on('data', chunk => {
 });
 // The runner used to discard stderr, turning configuration and resume errors
 // into opaque exit-code-only jobs. Keep it out of the durable monitor record,
-// but forward a bounded amount to wake-codex.log for operator diagnosis.
+// but forward a bounded amount to the local wake log for operator diagnosis.
 child.stderr.on('data', chunk => {
   if (stderrBytes >= 65536) return;
   const slice = chunk.subarray(0, 65536 - stderrBytes);
   stderrBytes += slice.length;
+  if (!workStarted) startupStderr += slice.toString('utf8');
   process.stderr.write(slice);
 });
-child.on('error', () => process.exit(1));
-child.on('exit', code => {
+child.on('error', error => {
+  if (['ENOENT', 'EACCES'].includes(error.code)) spawnFailure = 'executable_missing';
+});
+// close, unlike exit, guarantees that the stderr pipe has drained.
+child.on('close', code => {
+  const failure = spawnFailure || (!workStarted && code !== 0 && classifyStartupFailure(startupStderr));
+  if (failure) writeStartupFailure(failure);
   const settle = Promise.allSettled(Array.from(pending));
   const deadline = new Promise(resolve => setTimeout(resolve, 3000));
-  Promise.race([settle, deadline]).finally(() => process.exit(code === null ? 1 : code));
+  Promise.race([settle, deadline]).finally(() => process.exit(failure ? STARTUP_FAILURE_EXIT : code === null ? 1 : code));
 });

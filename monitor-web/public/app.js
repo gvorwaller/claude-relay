@@ -20,6 +20,7 @@ const adminSelections = new Map();
 
 function age(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return 'unknown';
+  if (milliseconds > 0 && milliseconds < 1000) return '<1s';
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
@@ -68,8 +69,14 @@ function jobCard(job) {
   button.dataset.jobId = job.jobId;
   const top = node('div', 'job-top');
   top.append(node('strong', '', job.owner), node('span', `pill ${job.status}`, job.status));
-  button.append(top, node('p', 'job-meta', `From ${job.requester} · running ${age(job.runAgeMs)}`));
-  const activity = job.latestActivity?.label || 'No sanitized activity yet';
+  const active = ['spawned', 'running'].includes(job.status);
+  const timing = active
+    ? `${job.status === 'spawned' ? 'starting' : 'running'} ${age(job.runAgeMs)}`
+    : `ended ${age(job.completedAgeMs)} ago · duration ${age(job.runAgeMs)}`;
+  button.append(top, node('p', 'job-meta', `From ${job.requester} · ${timing}`));
+  button.append(node('p', 'job-meta', `Current working directory: ${job.currentCwdBasename || 'Unknown'}`));
+  if (job.error?.reason) button.append(node('p', 'warning', job.error.reason));
+  const activity = job.latestActivity?.label || (active ? 'No sanitized activity yet' : 'No activity captured');
   button.append(node('p', 'activity', `${activity} · ${age(job.lastActivityAgeMs)} ago`));
   const facts = node('div', 'facts');
   facts.append(node('span', job.processAlive ? 'live' : '', job.processAlive ? 'Process alive' : 'Process not alive'));
@@ -94,8 +101,9 @@ function renderIdentities(identities) {
     const heading = node('div', 'identity-heading');
     heading.append(node('strong', '', identity.identity), node('span', identity.live ? 'live' : 'offline', identity.live ? 'Live' : 'Offline'));
     card.append(heading);
-    const parts = [identity.host, identity.cwdBasename, identity.source].filter(Boolean);
+    const parts = [identity.host, identity.source].filter(Boolean);
     card.append(node('p', '', parts.join(' · ') || 'No connection details'));
+    card.append(node('p', 'working-directory', `Working directory: ${identity.cwdBasename || 'Unknown'}`));
     if (identity.credentialWarning) card.append(node('p', 'warning', 'Owner credential not confirmed'));
     return card;
   }));
@@ -328,11 +336,13 @@ async function showDetail(jobId) {
   body.replaceChildren();
   const fields = [
     ['Job', job.jobId], ['Requester', job.requester], ['Started', job.startedAt || job.requestedAt],
+    ['Current working directory', job.currentCwdBasename || 'Unknown'],
     ['Process', job.processAlive ? 'Alive' : 'Not alive']
   ];
   const dl = node('dl', 'detail-facts');
   fields.forEach(([label, value]) => { dl.append(node('dt', '', label), node('dd', '', value)); });
   body.append(dl);
+  if (job.error?.reason) body.append(node('h3', '', 'Failure'), node('p', 'warning', job.error.reason));
   if (features.stopDelegate && job.actions?.stopDelegate) {
     const action = node('button', 'danger-button', 'Stop this delegate…');
     action.type = 'button';

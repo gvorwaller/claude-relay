@@ -154,7 +154,9 @@ function releaseWake(outDir, base) {
 test('local operator can terminate one active delegate process group', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-terminate-'));
   fs.mkdirSync(path.join(root, 'messages'));
-  const durableMail = path.join(root, 'messages', '2026-08-29.jsonl');
+  // Keep this fixture inside the message-retention window as the calendar
+  // advances; expiry at startup is unrelated to delegate termination.
+  const durableMail = path.join(root, 'messages', `${new Date().toISOString().slice(0, 10)}.jsonl`);
   fs.writeFileSync(durableMail, `${JSON.stringify({ id: 'preserved', from: 'TERMINATE-SOURCE', to: 'CODEX1', content: 'durable' })}\n`);
   const configPath = path.join(root, 'notify.json');
   fs.writeFileSync(configPath, JSON.stringify({
