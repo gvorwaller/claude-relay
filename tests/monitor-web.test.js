@@ -461,6 +461,10 @@ test('Admin browser UI preserves exact/all selections and never treats its place
   assert.match(script, /button\.disabled = adminBusy \|\| !select\.value/);
   assert.doesNotMatch(script, /targets\[Number\(select\.value\)\]/);
   assert.match(script, /All identities/);
+  assert.ok(script.indexOf("label: 'All identities'") < script.indexOf('`${identity} only`'));
+  assert.match(script, /All offline/);
+  assert.match(script, /document\.activeElement\?\.classList\?\.contains\('admin-select'\)/);
+  assert.match(script, /renderSignature === adminRenderSignature/);
   assert.match(script, /confirmationToken: pending\.value\.confirmationToken/);
   assert.doesNotMatch(script, /confirmationToken: pending\.value\.confirmationToken[\s\S]{0,80}(identity|target|scope):/);
   assert.match(script, /The result is unknown\. The action was not retried/);

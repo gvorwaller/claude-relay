@@ -232,11 +232,17 @@ The only target shapes are:
 | `restart_relay` | `{}` |
 | `cleanup_activity` | `{ "scope": "owner", "identity": "NAME" }` or `{ "scope": "all" }` |
 | `repair_owner_credential` | `{ "identity": "NAME" }` |
-| `remove_identity` | `{ "identity": "NAME" }` |
+| `remove_identity` | `{ "identity": "NAME" }` or `{ "scope": "offline" }` |
 | `cleanup_messages` | `{ "scope": "identity", "identity": "NAME" }` or `{ "scope": "all" }` |
 
 Identity values must pass the existing exact client-ID validator. `all` is not
 a valid identity. The two `all` targets require their separate all-scope gates.
+The `offline` removal scope is available only when identity removal itself is
+enabled. It previews and rechecks the exact offline local-registry set, excludes
+identities with live sessions, locally live bridge PIDs, or active work, takes a
+registry backup under the cross-process lock, and removes only those stale
+session mappings. Owner credentials, messages, and completed activity remain
+intact.
 
 ### Preview result
 

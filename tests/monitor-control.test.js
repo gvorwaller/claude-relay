@@ -8,7 +8,8 @@ const path = require('path');
 const {
   activeJobChoices, delegateJobDetail, delegateJobReportLines, operatorOwnerRepair,
   operatorOwnerRemoval, operatorTerminateDelegate,
-  previewJobCleanup, purgeJobCleanup, restartRelay, scrollWindow, topologyLines
+  previewJobCleanup, purgeJobCleanup, registryRemovalPreview, removeRegistrySessions,
+  restartRelay, scrollWindow, topologyLines
 } = require('../monitor-control');
 
 function writeJob(root, id, owner, status) {
@@ -118,6 +119,36 @@ test('identity removal requires one exact named identity and is visible in the T
   assert.match(source, /Stop bridge and remove identity/);
   assert.match(source, /parent agent is not terminated/);
   assert.match(source, /Messages and completed delegate activity are preserved/);
+});
+
+test('offline registry removal is preview-bound, locked, backed up, and exact', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-monitor-registry-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dataRoot = path.join(root, 'data');
+  const sessions = path.join(root, 'sessions');
+  const registryPath = path.join(sessions, 'registry.json');
+  fs.mkdirSync(dataRoot);
+  fs.mkdirSync(sessions);
+  fs.writeFileSync(registryPath, JSON.stringify({
+    OFFLINE1: { pid: 111, cwd: '/one' }, OFFLINE2: { pid: 222, cwd: '/two' },
+    LIVE1: { pid: process.pid, cwd: '/live' }
+  }), { mode: 0o600 });
+  const registryOptions = { pidAlive: info => info.pid === process.pid };
+  const preview = registryRemovalPreview(dataRoot, ['OFFLINE2', 'LIVE1', 'OFFLINE1'], registryOptions);
+  assert.deepEqual(preview.identities, ['OFFLINE1', 'OFFLINE2']);
+  assert.throws(() => removeRegistrySessions(dataRoot, preview.identities, 'wrong', registryOptions), /state_changed/);
+  const changed = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  changed.OFFLINE1.cwd = '/changed';
+  fs.writeFileSync(registryPath, JSON.stringify(changed), { mode: 0o600 });
+  assert.throws(() => removeRegistrySessions(dataRoot, preview.identities, preview.confirmation, registryOptions), /state_changed/);
+  const refreshed = registryRemovalPreview(dataRoot, preview.identities, registryOptions);
+  const result = removeRegistrySessions(dataRoot, refreshed.identities, refreshed.confirmation, registryOptions);
+  assert.equal(result.removedCount, 2);
+  assert.equal(fs.existsSync(result.backup), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')), {
+    LIVE1: { pid: process.pid, cwd: '/live' }
+  });
+  assert.equal(fs.existsSync(`${registryPath}.lock`), false);
 });
 
 test('stuck-delegate choices include only active canonical jobs', async t => {

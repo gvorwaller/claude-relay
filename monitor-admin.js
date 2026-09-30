@@ -11,7 +11,8 @@ const {
 const {
   activeJobChoices, healthAssessment, operatorJobRequest, operatorMessageRequest,
   operatorOwnerRepair, operatorOwnerRemoval, operatorRemovableOwners,
-  pendingOwnerLabels, readJobRecords, readMessageRecords, relayTopology, restartRelay
+  pendingOwnerLabels, readJobRecords, readMessageRecords, registryRemovalPreview,
+  relayTopology, removeRegistrySessions, restartRelay
 } = require('./monitor-control');
 
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
@@ -91,7 +92,8 @@ function createAdminController(dataRoot, options = {}) {
   const ops = {
     activeJobChoices, healthAssessment, operatorJobRequest, operatorMessageRequest,
     operatorOwnerRepair, operatorOwnerRemoval, operatorRemovableOwners,
-    pendingOwnerLabels, readJobRecords, readMessageRecords, relayTopology, restartRelay,
+    pendingOwnerLabels, readJobRecords, readMessageRecords, registryRemovalPreview,
+    relayTopology, removeRegistrySessions, restartRelay,
     ...options.operations
   };
   const confirmations = new Map();
@@ -152,6 +154,23 @@ function createAdminController(dataRoot, options = {}) {
       return { summary, binding: summary, local: {} };
     }
     if (action === 'remove_identity') {
+      if (target.scope === 'offline') {
+        const topology = await ops.relayTopology(dataRoot, options.topologyOptions);
+        const live = new Set(Array.isArray(topology.peers) ? topology.peers : []);
+        const active = new Set(ops.readJobRecords(dataRoot)
+          .filter(job => ['spawned', 'running'].includes(job.status)).map(job => job.owner));
+        const candidates = Object.keys(topology.registeredSessions || {})
+          .filter(identity => !live.has(identity) && !active.has(identity)).sort();
+        const local = ops.registryRemovalPreview(dataRoot, candidates, options.registryOptions || {});
+        const identities = local.identities;
+        if (!identities.length) throw new Error('identity_not_removable');
+        const summary = {
+          scope: 'offline', identity: null, eligibleCount: identities.length, identities,
+          liveSessionsPreserved: true, activeWorkPreserved: true,
+          messagesPreserved: true, completedActivityPreserved: true
+        };
+        return { summary, binding: { identities, confirmation: local.confirmation }, local: { identities, confirmation: local.confirmation } };
+      }
       const candidates = await ops.operatorRemovableOwners(dataRoot, options.operatorOptions || {});
       const candidate = candidates.find(item => item.identity === target.identity);
       if (!candidate) throw new Error('identity_not_removable');
@@ -197,7 +216,10 @@ function createAdminController(dataRoot, options = {}) {
       action, target: structuredClone(target), fingerprint: digest({ installationId, action, target, binding: state.binding }),
       local: state.local, summary: state.summary, expiresAtMs, connectionGeneration
     });
-    return { action, summary: state.summary, consequences: CONSEQUENCES[action], confirmationToken, expiresAt: new Date(expiresAtMs).toISOString() };
+    const consequences = action === 'remove_identity' && target.scope === 'offline'
+      ? ['Every still-offline registry entry is forgotten.', 'Live sessions and active work are preserved.', 'Messages and completed activity are preserved.']
+      : CONSEQUENCES[action];
+    return { action, summary: state.summary, consequences, confirmationToken, expiresAt: new Date(expiresAtMs).toISOString() };
   }
 
   async function confirm(action, confirmationToken) {
@@ -240,9 +262,19 @@ function createAdminController(dataRoot, options = {}) {
         await ops.operatorOwnerRepair(dataRoot, entry.target.identity, options.operatorOptions || {});
         result = { action, outcome: entry.summary.live ? 'reconnecting_for_confirmation' : 'ready_for_next_start', identity: entry.target.identity };
       } else if (action === 'remove_identity') {
-        const response = await ops.operatorOwnerRemoval(dataRoot, 'remove', entry.target.identity,
-          { confirmation: current.local.confirmation, disconnectLive: current.local.disconnectLive }, options.operatorOptions || {});
-        result = { action, outcome: 'identity_removed', identity: entry.target.identity, bridgeStopped: response.liveConnectionStopped === true, messagesPreserved: true, completedActivityPreserved: true };
+        if (entry.target.scope === 'offline') {
+          const response = ops.removeRegistrySessions(dataRoot, current.local.identities,
+            current.local.confirmation, options.registryOptions || {});
+          result = {
+            action, outcome: 'offline_identities_removed', scope: 'offline', identity: null,
+            removedCount: Number(response.removedCount) || 0, liveSessionsPreserved: true,
+            activeWorkPreserved: true, messagesPreserved: true, completedActivityPreserved: true
+          };
+        } else {
+          const response = await ops.operatorOwnerRemoval(dataRoot, 'remove', entry.target.identity,
+            { confirmation: current.local.confirmation, disconnectLive: current.local.disconnectLive }, options.operatorOptions || {});
+          result = { action, outcome: 'identity_removed', identity: entry.target.identity, bridgeStopped: response.liveConnectionStopped === true, messagesPreserved: true, completedActivityPreserved: true };
+        }
       } else {
         const response = await ops.operatorMessageRequest(dataRoot, 'purge', current.local, options.operatorOptions || {});
         const removed = Number(response.purged) || 0;

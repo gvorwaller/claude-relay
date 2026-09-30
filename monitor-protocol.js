@@ -191,9 +191,18 @@ function validateAdminSummary(action, summary) {
       || summary.state !== 'credential_not_confirmed'
       || !['live_session_reconnects', 'credential_ready_next_start'].includes(summary.consequence)) throw new Error('Invalid credential repair summary');
   } else if (action === 'remove_identity') {
-    exactKeys(summary, ['identity', 'credentialConfirmed', 'live', 'bridgeWillStop', 'lastActivity', 'messagesPreserved', 'completedActivityPreserved'], 'identity removal summary');
-    if (!CLIENT_ID.test(summary.identity || '') || !['credentialConfirmed', 'live', 'bridgeWillStop', 'messagesPreserved', 'completedActivityPreserved'].every(key => typeof summary[key] === 'boolean')
-      || !nullableTimestamp(summary.lastActivity) || summary.messagesPreserved !== true || summary.completedActivityPreserved !== true) throw new Error('Invalid identity removal summary');
+    if (summary.scope === 'offline') {
+      exactKeys(summary, ['scope', 'identity', 'eligibleCount', 'identities', 'liveSessionsPreserved', 'activeWorkPreserved', 'messagesPreserved', 'completedActivityPreserved'], 'offline identity removal summary');
+      if (summary.identity !== null || !Number.isSafeInteger(summary.eligibleCount) || summary.eligibleCount < 1
+        || !Array.isArray(summary.identities) || summary.identities.length !== summary.eligibleCount
+        || !summary.identities.every(identity => CLIENT_ID.test(identity) && identity !== 'all')
+        || summary.liveSessionsPreserved !== true || summary.activeWorkPreserved !== true || summary.messagesPreserved !== true
+        || summary.completedActivityPreserved !== true) throw new Error('Invalid offline identity removal summary');
+    } else {
+      exactKeys(summary, ['identity', 'credentialConfirmed', 'live', 'bridgeWillStop', 'lastActivity', 'messagesPreserved', 'completedActivityPreserved'], 'identity removal summary');
+      if (!CLIENT_ID.test(summary.identity || '') || !['credentialConfirmed', 'live', 'bridgeWillStop', 'messagesPreserved', 'completedActivityPreserved'].every(key => typeof summary[key] === 'boolean')
+        || !nullableTimestamp(summary.lastActivity) || summary.messagesPreserved !== true || summary.completedActivityPreserved !== true) throw new Error('Invalid identity removal summary');
+    }
   } else {
     exactKeys(summary, ['scope', 'identity', 'eligibleCount', 'countsByIdentity', 'countsByUtcDate', 'oldestAt', 'newestAt', 'global'], 'message cleanup summary');
     if (!['identity', 'all'].includes(summary.scope) || (summary.scope === 'identity' ? !CLIENT_ID.test(summary.identity || '') : summary.identity !== null)
@@ -217,9 +226,17 @@ function validateAdminActionResult(result) {
     exactKeys(result, ['action', 'outcome', 'identity', 'completedAt'], 'credential repair result');
     if (!['reconnecting_for_confirmation', 'ready_for_next_start'].includes(result.outcome) || !CLIENT_ID.test(result.identity || '')) throw new Error('Invalid credential repair result');
   } else if (action === 'remove_identity') {
-    exactKeys(result, ['action', 'outcome', 'identity', 'bridgeStopped', 'messagesPreserved', 'completedActivityPreserved', 'completedAt'], 'identity removal result');
-    if (result.outcome !== 'identity_removed' || !CLIENT_ID.test(result.identity || '') || typeof result.bridgeStopped !== 'boolean'
-      || result.messagesPreserved !== true || result.completedActivityPreserved !== true) throw new Error('Invalid identity removal result');
+    if (result.scope === 'offline') {
+      exactKeys(result, ['action', 'outcome', 'scope', 'identity', 'removedCount', 'liveSessionsPreserved', 'activeWorkPreserved', 'messagesPreserved', 'completedActivityPreserved', 'completedAt'], 'offline identity removal result');
+      if (result.outcome !== 'offline_identities_removed' || result.identity !== null
+        || !Number.isSafeInteger(result.removedCount) || result.removedCount < 0
+        || result.liveSessionsPreserved !== true || result.activeWorkPreserved !== true || result.messagesPreserved !== true
+        || result.completedActivityPreserved !== true) throw new Error('Invalid offline identity removal result');
+    } else {
+      exactKeys(result, ['action', 'outcome', 'identity', 'bridgeStopped', 'messagesPreserved', 'completedActivityPreserved', 'completedAt'], 'identity removal result');
+      if (result.outcome !== 'identity_removed' || !CLIENT_ID.test(result.identity || '') || typeof result.bridgeStopped !== 'boolean'
+        || result.messagesPreserved !== true || result.completedActivityPreserved !== true) throw new Error('Invalid identity removal result');
+    }
   } else {
     exactKeys(result, ['action', 'outcome', 'scope', 'identity', 'removedCount', 'remainingMessageCount', 'atomicRewrite', 'completedAt'], 'message cleanup result');
     if (result.outcome !== 'completed' || !Number.isSafeInteger(result.removedCount) || result.removedCount < 0
@@ -232,9 +249,17 @@ function validateAdminTargetShape(action, target) {
     exactKeys(target, [], 'restart target');
     return target;
   }
-  if (action === 'repair_owner_credential' || action === 'remove_identity') {
+  if (action === 'repair_owner_credential') {
     exactKeys(target, ['identity'], 'identity target');
     if (!CLIENT_ID.test(target.identity || '') || target.identity === 'all') throw new Error('Invalid identity target');
+    return target;
+  }
+  if (action === 'remove_identity') {
+    if (target?.scope === 'offline') exactKeys(target, ['scope'], 'offline identity target');
+    else {
+      exactKeys(target, ['identity'], 'identity target');
+      if (!CLIENT_ID.test(target.identity || '') || target.identity === 'all') throw new Error('Invalid identity target');
+    }
     return target;
   }
   if (action === 'cleanup_activity' || action === 'cleanup_messages') {

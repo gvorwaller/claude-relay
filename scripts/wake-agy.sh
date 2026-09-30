@@ -65,7 +65,7 @@ chmod 600 "$LAST_MESSAGE_FILE"
 
 node "$ROOT/scripts/run-agy-delegate.js" --last-message "$LAST_MESSAGE_FILE" -- \
   agy -p "$PROMPT" --output-format stream-json --json-schema "$RESULT_SCHEMA" \
-  --print-timeout 10m --dangerously-skip-permissions
+  --print-timeout 0 --dangerously-skip-permissions
 AGY_EXIT=$?
 
 if [[ -n "${RELAY_JOB_ID:-}" && -n "${RELAY_JOB_RESULT_SECRET_FILE:-}" ]]; then

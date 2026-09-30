@@ -17,6 +17,7 @@ let pendingAdminPreview = null;
 let lastPayload = null;
 let adminBusy = false;
 const adminSelections = new Map();
+let adminRenderSignature = '';
 
 function age(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return 'unknown';
@@ -145,10 +146,15 @@ function adminTargets(name, payload) {
   ])].filter(Boolean).sort();
   if (name === 'repairCredential') return (payload.identities || [])
     .filter(item => item.credentialWarning).map(item => ({ label: item.identity, target: { identity: item.identity } }));
-  if (name === 'removeIdentity') return identities.map(identity => ({ label: identity, target: { identity } }));
+  if (name === 'removeIdentity') {
+    const values = [{ label: 'All offline', target: { scope: 'offline' }, global: true }];
+    values.push(...identities.map(identity => ({ label: identity, target: { identity } })));
+    return values;
+  }
   if (name === 'cleanupActivity') {
-    const values = identities.map(identity => ({ label: `${identity} only`, target: { scope: 'owner', identity } }));
+    const values = [];
     if (features.admin.cleanupActivityAll) values.push({ label: 'All identities', target: { scope: 'all' }, global: true });
+    values.push(...identities.map(identity => ({ label: `${identity} only`, target: { scope: 'owner', identity } })));
     return values;
   }
   if (name === 'cleanupMessages') {
@@ -166,7 +172,23 @@ function adminTargetKey(target) {
 function renderAdmin(payload) {
   const available = Object.entries(ADMIN_ACTIONS).filter(([name]) => features.admin?.[name]);
   elements['admin-section'].hidden = available.length === 0;
-  if (!available.length) return elements.admin.replaceChildren();
+  if (!available.length) {
+    adminRenderSignature = '';
+    return elements.admin.replaceChildren();
+  }
+  if (document.activeElement?.classList?.contains('admin-select')) return;
+  const renderSignature = JSON.stringify(available.map(([name]) => [name,
+    adminTargets(name, payload).map(item => [item.label, adminTargetKey(item.target)])
+  ]));
+  if (renderSignature === adminRenderSignature && elements.admin.children.length === available.length) {
+    elements.admin.querySelectorAll('.admin-select').forEach(select => {
+      select.disabled = adminBusy || select.dataset.hasTargets !== 'true';
+    });
+    elements.admin.querySelectorAll('.admin-action').forEach(button => {
+      button.disabled = adminBusy || (button.previousElementSibling?.classList.contains('admin-select') && !button.previousElementSibling.value);
+    });
+    return;
+  }
   const cards = available.map(([name, config]) => {
     const card = node('article', `admin-card${name === 'cleanupMessages' ? ' highest-risk' : ''}`);
     card.append(node('h3', '', config.title), node('p', '', config.description));
@@ -200,10 +222,14 @@ function renderAdmin(payload) {
     button.type = 'button';
     button.disabled = adminBusy || !select.value;
     select.disabled = adminBusy || !targets.length;
+    select.dataset.hasTargets = String(targets.length > 0);
     select.addEventListener('change', () => {
       if (select.value && targetsByKey.has(select.value)) adminSelections.set(name, select.value);
       else adminSelections.delete(name);
       button.disabled = adminBusy || !select.value;
+    });
+    select.addEventListener('blur', () => {
+      queueMicrotask(() => { if (lastPayload) renderAdmin(lastPayload); });
     });
     button.addEventListener('click', () => {
       const selected = targetsByKey.get(select.value);
@@ -213,6 +239,7 @@ function renderAdmin(payload) {
     return card;
   });
   elements.admin.replaceChildren(...cards);
+  adminRenderSignature = renderSignature;
 }
 
 function humanize(value) {

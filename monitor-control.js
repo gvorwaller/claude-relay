@@ -366,6 +366,90 @@ function operatorRemovableOwners(dataRoot, options = {}) {
     .then(result => Array.isArray(result.owners) ? result.owners : []);
 }
 
+function registryFile(dataRoot, options = {}) {
+  return options.registryPath || path.join(path.dirname(dataRoot), 'sessions', 'registry.json');
+}
+
+function registryRemovalPreview(dataRoot, identities, options = {}) {
+  const selected = [...new Set(identities)].sort();
+  if (!selected.every(identity => CLIENT_ID_PATTERN.test(identity) && identity !== 'all')) {
+    throw new Error('Invalid registry identity');
+  }
+  let registry = {};
+  try { registry = JSON.parse(fs.readFileSync(registryFile(dataRoot, options), 'utf8')); } catch {}
+  const pidAlive = options.pidAlive || (info => {
+    const pid = Number(info?.pid);
+    if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+    try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+  });
+  const records = Object.fromEntries(selected.filter(identity => registry[identity] && pidAlive(registry[identity]) !== true)
+    .map(identity => [identity, registry[identity]]));
+  return {
+    identities: Object.keys(records),
+    confirmation: createHash('sha256').update(JSON.stringify(records)).digest('hex')
+  };
+}
+
+function withRegistryLock(filePath, callback) {
+  const lockPath = `${filePath}.lock`;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const deadline = Date.now() + 5000;
+  let held = false;
+  while (Date.now() < deadline) {
+    try {
+      fs.mkdirSync(lockPath);
+      fs.writeFileSync(path.join(lockPath, 'owner'), `${token}\n${process.pid}`, { mode: 0o600 });
+      held = true;
+      break;
+    } catch {
+      try {
+        const [, holderPid] = fs.readFileSync(path.join(lockPath, 'owner'), 'utf8').split('\n');
+        const pid = Number(holderPid);
+        let holderAlive = true;
+        if (pid) {
+          try { process.kill(pid, 0); } catch (error) { holderAlive = error.code !== 'ESRCH'; }
+        } else {
+          holderAlive = Date.now() - fs.statSync(lockPath).mtimeMs <= 10_000;
+        }
+        if (!holderAlive) { fs.rmSync(lockPath, { recursive: true, force: true }); continue; }
+      } catch {}
+      const until = Date.now() + 5;
+      while (Date.now() < until) { /* registry critical sections are sub-millisecond */ }
+    }
+  }
+  if (!held) throw new Error('registry_lock_timeout');
+  try { return callback(); } finally {
+    try {
+      const [owner] = fs.readFileSync(path.join(lockPath, 'owner'), 'utf8').split('\n');
+      if (owner === token) fs.rmSync(lockPath, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+function removeRegistrySessions(dataRoot, identities, confirmation, options = {}) {
+  const filePath = registryFile(dataRoot, options);
+  return withRegistryLock(filePath, () => {
+    const preview = registryRemovalPreview(dataRoot, identities, options);
+    if (!confirmation || confirmation !== preview.confirmation) throw new Error('state_changed');
+    if (!preview.identities.length) return { removedCount: 0, backup: null };
+    const registry = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const backupDir = path.join(path.dirname(filePath), 'backups');
+    fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+    const backup = path.join(backupDir, `registry-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    fs.copyFileSync(filePath, backup);
+    for (const identity of preview.identities) delete registry[identity];
+    const temporary = `${filePath}.${process.pid}.tmp`;
+    const handle = fs.openSync(temporary, 'w', 0o600);
+    try {
+      fs.writeSync(handle, JSON.stringify(registry, null, 2));
+      fs.fsyncSync(handle);
+    } finally { fs.closeSync(handle); }
+    fs.renameSync(temporary, filePath);
+    fs.chmodSync(filePath, 0o600);
+    return { removedCount: preview.identities.length, backup };
+  });
+}
+
 function operatorOwnerRemoval(dataRoot, action, clientId, details = {}, options = {}) {
   if (!CLIENT_ID_PATTERN.test(clientId) || clientId === 'all') {
     return Promise.reject(new Error('Choose one exact named identity.'));
@@ -437,7 +521,9 @@ module.exports = {
   purgeJobCleanup,
   readJobRecords,
   readMessageRecords,
+  registryRemovalPreview,
   relayTopology,
+  removeRegistrySessions,
   restartRelay,
   scrollWindow,
   selectableJobs,

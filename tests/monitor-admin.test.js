@@ -44,9 +44,11 @@ function fixture(t, overrides = {}) {
         : { purged: 1, confirmed: true };
     },
     pendingOwnerLabels: () => ['CODEX1'],
-    relayTopology: async () => ({ peers: ['CODEX1'] }),
+    relayTopology: async () => ({ peers: ['CODEX1'], registeredSessions: {} }),
     operatorOwnerRepair: async (_root, identity) => { calls.push(['repair', identity]); return {}; },
     operatorRemovableOwners: async () => [{ identity: 'CODEX2', live: false }],
+    registryRemovalPreview: (_root, identities) => ({ identities: identities.slice(), confirmation: 'registry-confirmation' }),
+    removeRegistrySessions: (_root, identities) => ({ removedCount: identities.length, backup: '/private/backup' }),
     operatorOwnerRemoval: async (_root, action, identity) => {
       calls.push(['owner', action, identity]);
       return action === 'preview'
@@ -88,9 +90,36 @@ test('admin target schemas reject unknown fields, hostile identities, and separa
   assert.deepEqual(validateAdminTarget('restart_relay', {}, gates), {});
   assert.throws(() => validateAdminTarget('restart_relay', { service: 'other' }, gates), /invalid_target/);
   assert.throws(() => validateAdminTarget('remove_identity', { identity: '../CC1' }, gates), /invalid_target/);
+  assert.deepEqual(validateAdminTarget('remove_identity', { scope: 'offline' }, gates), { scope: 'offline' });
   assert.throws(() => validateAdminTarget('cleanup_activity', { scope: 'all' }, gates), /scope_disabled/);
   assert.throws(() => validateAdminTarget('cleanup_messages', { scope: 'all' }, gates), /scope_disabled/);
   assert.deepEqual(validateAdminTarget('cleanup_activity', { scope: 'owner', identity: 'CODEX1' }, gates), { scope: 'owner', identity: 'CODEX1' });
+});
+
+test('all-offline identity removal rechecks the registry and preserves live and active sessions', async t => {
+  const removals = [];
+  const { controller } = fixture(t, {
+    operations: {
+      relayTopology: async () => ({
+        peers: ['LIVE1'], registeredSessions: { CODEX2: {}, LIVE1: {}, STALE1: {}, BUSY1: {} }
+      }),
+      readJobRecords: () => [{ owner: 'BUSY1', status: 'running' }],
+      registryRemovalPreview: (_root, identities) => ({
+        identities: identities.slice(), confirmation: 'registry-confirmation'
+      }),
+      removeRegistrySessions: (_root, identities, confirmation) => {
+        removals.push([identities.slice(), confirmation]);
+        return { removedCount: identities.length, backup: '/private/backup' };
+      }
+    }
+  });
+  const preview = await controller.preview('remove_identity', { scope: 'offline' });
+  assert.deepEqual(preview.summary.identities, ['CODEX2', 'STALE1']);
+  assert.equal(preview.summary.liveSessionsPreserved, true);
+  assert.equal(preview.summary.activeWorkPreserved, true);
+  const result = await controller.confirm('remove_identity', preview.confirmationToken);
+  assert.equal(result.removedCount, 2);
+  assert.deepEqual(removals, [[['CODEX2', 'STALE1'], 'registry-confirmation']]);
 });
 
 test('all five exact actions return metadata-only previews and invoke existing local operations', async t => {

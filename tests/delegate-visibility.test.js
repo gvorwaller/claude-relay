@@ -119,6 +119,7 @@ test('AGY wake is a fresh same-cwd delegate and never resumes foreground session
   assert.match(source, /agy -p "\$PROMPT" --output-format stream-json/);
   assert.match(source, /--dangerously-skip-permissions/);
   assert.match(source, /--json-schema "\$RESULT_SCHEMA"/);
+  assert.match(source, /--print-timeout 0/);
   assert.doesNotMatch(source, /--continue|--conversation/);
 });
 

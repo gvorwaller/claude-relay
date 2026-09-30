@@ -39,7 +39,10 @@ function validateAdminTarget(action, target, gates = {}) {
   if (!ADMIN_ACTION_SET.has(action)) throw new Error('unknown_action');
   if (action === 'restart_relay') {
     if (!exactObject(target, [])) throw new Error('invalid_target');
-  } else if (action === 'repair_owner_credential' || action === 'remove_identity') {
+  } else if (action === 'repair_owner_credential') {
+    if (!exactObject(target, ['identity']) || !exactIdentity(target.identity)) throw new Error('invalid_target');
+  } else if (action === 'remove_identity') {
+    if (exactObject(target, ['scope']) && target.scope === 'offline') return target;
     if (!exactObject(target, ['identity']) || !exactIdentity(target.identity)) throw new Error('invalid_target');
   } else if (action === 'cleanup_activity') {
     if (exactObject(target, ['scope']) && target.scope === 'all') {

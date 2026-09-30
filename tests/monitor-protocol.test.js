@@ -28,6 +28,9 @@ test('Phase 4 capabilities and commands use sorted enums and action-specific exa
   assert.deepEqual(validateAgentCommand('preview_request', {
     requestId, action: 'cleanup_activity', target: { scope: 'owner', identity: 'CODEX1' }
   }).target, { scope: 'owner', identity: 'CODEX1' });
+  assert.deepEqual(validateAgentCommand('preview_request', {
+    requestId, action: 'remove_identity', target: { scope: 'offline' }
+  }).target, { scope: 'offline' });
   assert.throws(() => validateAgentCommand('preview_request', {
     requestId, action: 'restart_relay', target: { label: 'other-service' }
   }), /restart target/);
@@ -37,6 +40,29 @@ test('Phase 4 capabilities and commands use sorted enums and action-specific exa
   assert.equal(validateAgentCommand('confirm_request', {
     requestId, action: 'remove_identity', confirmationToken: 'Q'.repeat(43)
   }).action, 'remove_identity');
+});
+
+test('all-offline removal protocol carries only bounded identities and counts', () => {
+  const requestId = 'request_offline_1';
+  const confirmationToken = 'O'.repeat(43);
+  const preview = {
+    action: 'remove_identity',
+    summary: {
+      scope: 'offline', identity: null, eligibleCount: 2, identities: ['CODEX2', 'STALE1'],
+      liveSessionsPreserved: true, activeWorkPreserved: true,
+      messagesPreserved: true, completedActivityPreserved: true
+    },
+    consequences: ['Offline identities must enroll again.', 'Live sessions are preserved.'],
+    confirmationToken,
+    expiresAt: '2026-08-29T16:01:00.000Z'
+  };
+  assert.equal(validateAgentResult('preview_result', { requestId, ok: true, preview }).preview, preview);
+  const result = {
+    action: 'remove_identity', outcome: 'offline_identities_removed', scope: 'offline', identity: null,
+    removedCount: 2, liveSessionsPreserved: true, activeWorkPreserved: true, messagesPreserved: true,
+    completedActivityPreserved: true, completedAt: '2026-08-29T16:00:30.000Z'
+  };
+  assert.equal(validateAgentResult('action_result', { requestId, ok: true, result }).result, result);
 });
 
 test('action protocol accepts only exact minimized stop payloads', () => {
