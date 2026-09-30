@@ -121,10 +121,27 @@ acquire_lock || exit 0
 echo "$$ $CLAUDE_PID $TOKEN" > "$LOCK/owner"
 trap release_lock EXIT
 
-# Millisecond precision matters: a whole-second cursor makes the freshly armed
-# watcher see the message this session JUST processed (stored with ms) as
-# "newer" and re-wake immediately (2026-08-05 review finding #8).
-SINCE="$("$NODE_BIN" -e 'console.log(new Date().toISOString())')"
+# Start from this session's LAST-READ message (the id relay_receive saved in
+# sessions/read-cursors.json), not from "now": mail that landed while the
+# model was mid-turn is already unread when this hook arms, and a "now"
+# cursor made it invisible — the listener then waited for the NEXT message
+# (2026-09-29: two CODEX1 replies sat unread; the design had assumed a
+# synchronous exchange). The server's subscribe-time backfill pings at once
+# if anything addressed to us is newer than the cursor (our own outbound is
+# excluded). An exact message id also avoids the old whole-second re-wake
+# (2026-08-05 review finding #8). No saved cursor (fresh session) or an
+# unreadable file: fall back to "now" with millisecond precision, as before.
+CURSORS="$HOME/claude-relay/sessions/read-cursors.json"
+SINCE="$(python3 - "$CURSORS" "$ID" <<'PY2' 2>/dev/null
+import json, sys
+try:
+    c = json.load(open(sys.argv[1])).get(sys.argv[2], {}).get("cursor")
+    print(c if isinstance(c, str) and c.strip() else "")
+except Exception:
+    print("")
+PY2
+)"
+[[ -n "$SINCE" ]] || SINCE="$("$NODE_BIN" -e 'console.log(new Date().toISOString())')"
 while true; do
   if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
     exit 0
