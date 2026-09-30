@@ -46,3 +46,31 @@ test('monitor renders terminal timing, failure reason, directory and active timi
   await vm.runInContext('showDetail("wake_test")', context);
   assert.match(elements.get('detail-body').textContent, /Failure Codex refused/);
 });
+
+test('monitor preserves work-card nodes across snapshot refreshes so clicks survive', () => {
+  const elements = new Map();
+  const context = vm.createContext({
+    document: {
+      getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
+      createElement() { return new Element(); }
+    },
+    EventSource: class { addEventListener() {} },
+    fetch: async () => new Promise(() => {}),
+    window: { location: { replace() {} } }
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../monitor-web/public/app.js'), 'utf8'), context);
+  vm.runInContext(`
+    const testContainer = document.getElementById('test-jobs');
+    const testCount = document.getElementById('test-count');
+    const firstJob = {
+      jobId: 'wake_stable', owner: 'CODEX1', requester: 'OWNER', status: 'completed',
+      completedAgeMs: 1000, runAgeMs: 2000, lastActivityAgeMs: 1000, processAlive: false
+    };
+    renderJobs(testContainer, testCount, [firstJob], 'Empty');
+    globalThis.firstCard = testContainer.children[0];
+    renderJobs(testContainer, testCount, [{ ...firstJob, completedAgeMs: 6000 }], 'Empty');
+    globalThis.secondCard = testContainer.children[0];
+  `, context);
+  assert.strictEqual(context.firstCard, context.secondCard);
+  assert.match(context.secondCard.textContent, /ended 6s ago/);
+});

@@ -18,6 +18,7 @@ let lastPayload = null;
 let adminBusy = false;
 const adminSelections = new Map();
 let adminRenderSignature = '';
+const jobListStates = new WeakMap();
 
 function age(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return 'unknown';
@@ -64,34 +65,69 @@ function renderHealth(snapshot) {
   elements.health.append(checks);
 }
 
-function jobCard(job) {
-  const button = node('button', 'job-card');
-  button.type = 'button';
+function updateJobCard(button, job) {
+  const view = button.jobView;
   button.dataset.jobId = job.jobId;
-  const top = node('div', 'job-top');
-  top.append(node('strong', '', job.owner), node('span', `pill ${job.status}`, job.status));
+  view.owner.textContent = job.owner;
+  view.status.className = `pill ${job.status}`;
+  view.status.textContent = job.status;
   const active = ['spawned', 'running'].includes(job.status);
   const timing = active
     ? `${job.status === 'spawned' ? 'starting' : 'running'} ${age(job.runAgeMs)}`
     : `ended ${age(job.completedAgeMs)} ago · duration ${age(job.runAgeMs)}`;
-  button.append(top, node('p', 'job-meta', `From ${job.requester} · ${timing}`));
-  button.append(node('p', 'job-meta', `Current working directory: ${job.currentCwdBasename || 'Unknown'}`));
-  if (job.error?.reason) button.append(node('p', 'warning', job.error.reason));
+  view.meta.textContent = `From ${job.requester} · ${timing}`;
+  view.cwd.textContent = `Current working directory: ${job.currentCwdBasename || 'Unknown'}`;
+  view.error.textContent = job.error?.reason || '';
+  view.error.hidden = !job.error?.reason;
   const activity = job.latestActivity?.label || (active ? 'No sanitized activity yet' : 'No activity captured');
-  button.append(node('p', 'activity', `${activity} · ${age(job.lastActivityAgeMs)} ago`));
-  const facts = node('div', 'facts');
-  facts.append(node('span', job.processAlive ? 'live' : '', job.processAlive ? 'Process alive' : 'Process not alive'));
-  if (job.stalled === 'inactive') facts.append(node('span', 'warning', 'Inactive 10m+'));
-  if (job.stalled === 'possibly_stuck') facts.append(node('span', 'danger', 'Possibly stuck'));
-  button.append(facts);
-  button.addEventListener('click', () => showDetail(job.jobId));
+  view.activity.textContent = `${activity} · ${age(job.lastActivityAgeMs)} ago`;
+  view.process.className = job.processAlive ? 'live' : '';
+  view.process.textContent = job.processAlive ? 'Process alive' : 'Process not alive';
+  view.inactive.hidden = job.stalled !== 'inactive';
+  view.stuck.hidden = job.stalled !== 'possibly_stuck';
   return button;
+}
+
+function jobCard(job) {
+  const button = node('button', 'job-card');
+  button.type = 'button';
+  const top = node('div', 'job-top');
+  const owner = node('strong');
+  const status = node('span');
+  top.append(owner, status);
+  const meta = node('p', 'job-meta');
+  const cwd = node('p', 'job-meta');
+  const error = node('p', 'warning');
+  const activity = node('p', 'activity');
+  const facts = node('div', 'facts');
+  const process = node('span');
+  const inactive = node('span', 'warning', 'Inactive 10m+');
+  const stuck = node('span', 'danger', 'Possibly stuck');
+  facts.append(process, inactive, stuck);
+  button.append(top, meta, cwd, error, activity, facts);
+  button.jobView = { owner, status, meta, cwd, error, activity, process, inactive, stuck };
+  button.addEventListener('click', () => showDetail(button.dataset.jobId));
+  return updateJobCard(button, job);
 }
 
 function renderJobs(container, count, jobs, emptyText) {
   count.textContent = String(jobs.length);
-  if (!jobs.length) return empty(container, emptyText);
-  container.replaceChildren(...jobs.map(jobCard));
+  if (!jobs.length) {
+    jobListStates.delete(container);
+    return empty(container, emptyText);
+  }
+  const previous = jobListStates.get(container) || new Map();
+  const next = new Map();
+  const cards = jobs.map(job => {
+    const card = previous.get(job.jobId) || jobCard(job);
+    next.set(job.jobId, updateJobCard(card, job));
+    return card;
+  });
+  jobListStates.set(container, next);
+  const current = Array.from(container.children);
+  if (current.length !== cards.length || current.some((card, index) => card !== cards[index])) {
+    container.replaceChildren(...cards);
+  }
 }
 
 function renderIdentities(identities) {
