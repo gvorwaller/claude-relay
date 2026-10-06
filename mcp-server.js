@@ -603,6 +603,23 @@ function writeStoredCursor(cursor, label = CLIENT_ID) {
   });
 }
 
+function resetCursorOnRename(oldId, newId) {
+  // A message ID read under oldId may be invisible to newId. Likewise, a
+  // previous holder's cursor under newId can be pruned or can hide mail for
+  // this holder. Begin the new mailbox without either cursor. This happens
+  // only after the server confirms the rename.
+  return withRegistryLock(() => {
+    let cursors = {};
+    try { cursors = JSON.parse(fs.readFileSync(READ_CURSORS_FILE, 'utf8')); } catch {}
+    delete cursors[oldId];
+    delete cursors[newId];
+    const tmp = `${READ_CURSORS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cursors, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, READ_CURSORS_FILE);
+    return true;
+  });
+}
+
 /**
  * Clear the local session registry, keeping only sessions that are currently
  * online (this session plus live peers). Backs up the registry first.
@@ -779,12 +796,19 @@ let shuttingDown = false;
 
 function commitRename(rename, suffix = '') {
   clearTimeout(rename.timer);
+  let cursorReset = true;
   if (!rename.reclaiming) {
     // CLIENT_ID is still the old identity here — nothing changed
     // speculatively. Release the wrong mapping, then record the new one.
     updateRegistry('release');
     CLIENT_ID = rename.newId;
     CLIENT_ID_SOURCE = 'rename';
+    try {
+      cursorReset = resetCursorOnRename(rename.oldId, rename.newId) === true;
+    } catch (error) {
+      cursorReset = false;
+      console.error(`[Claude Relay MCP] Could not reset cursors after rename: ${error.message}`);
+    }
     updateRegistry('connect');
   }
   displaced = false;
@@ -792,6 +816,7 @@ function commitRename(rename, suffix = '') {
   let text = rename.reclaiming
     ? `Reclaimed relay identity "${rename.newId}". ${suffix}`
     : `Renamed relay identity: ${rename.oldId} → ${rename.newId}, confirmed by the relay server. ${suffix}`;
+  if (!cursorReset) text += '\nWarning: saved cursor reset failed. Use unfiltered relay_receive with replay=true to resync this mailbox.';
   text += `\nNote: tool descriptions cached by this client may still show "${rename.oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
   sendToolText(rename.requestId, text.trim());
   pendingRename = null;
@@ -1782,7 +1807,7 @@ function connectToRelay() {
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
             if (msg.unknownCursor) {
-              text = `Warning: the saved or supplied cursor was not found (expired, pruned, or foreign) — nothing was replayed. The saved cursor was retained to prevent an accidental replay. Call relay_receive with replay=true once to resync intentionally.\n${text}`;
+              text = `Warning: the saved or supplied cursor was not found (expired, pruned, or foreign) — nothing was replayed. The saved cursor was retained to prevent an accidental replay. Call relay_receive with replay=true and no from/to/after filter once to resync intentionally.\n${text}`;
             }
             if (msg.cursor) text += `\n\nCursor: ${msg.cursor}`;
             sendMcpResponse({

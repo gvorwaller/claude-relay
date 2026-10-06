@@ -4,6 +4,7 @@
 # Re-arms relay-watch.js until real mail arrives for --for TARGET, then exits
 # printing exactly one status line on stdout:
 #   new-message   mail arrived (exit 0) — run relay_receive
+#   unknown-cursor retained mail may exist (exit 0) — unfiltered replay=true
 #   timeout       --max-minutes elapsed with no mail (exit 0)
 #   error: ...    relay stayed unreachable (exit 2)
 #
@@ -52,6 +53,10 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
     --for "$FOR" --timeout "$WATCH_TIMEOUT" --since "$SINCE" \
     --relay-url "$RELAY_URL" 2>/dev/null)"
   case "$OUT" in
+    unknown-cursor)
+      echo "unknown-cursor"
+      exit 0
+      ;;
     new-message)
       echo "new-message"
       exit 0

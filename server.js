@@ -108,6 +108,10 @@ const duplicateLogTimes = new Map();
 // Watchers receive only an existence ping; they never inherit target history
 // visibility or message content.
 const watchers = new Map();
+// One recovery wake per retained mailbox tail for an unknown watch cursor.
+// A new message changes the tail and may wake again; an unchanged stale
+// cursor must not make each Stop-hook re-arm wake the model repeatedly.
+const unknownWatchAlerts = new Map();
 // Small, content-free usage counters reported by MCP bridges. They reset with
 // the relay process and never retain prompts or tool results.
 const relayUsage = new Map();
@@ -948,11 +952,42 @@ wss.on('connection', (ws, req) => {
           // immediately if mail already arrived, so gap mail wakes the next
           // watcher the instant it arms instead of sitting silent.
           if (typeof msg.since === 'string' && msg.since.trim()) {
-            const pending = messageStore.query({
+            const backfill = messageStore.query({
               requester: ws.watchTarget,
               after: msg.since.trim(),
               count: 50
-            }).messages.filter(m =>
+            });
+            if (backfill.unknownCursor) {
+              // A pruned opaque ID cannot establish an ordering boundary.
+              // Signal recovery once for this subscription if retained mail
+              // exists; never treat the unknown ID as "from the beginning".
+              const retained = messageStore.query({
+                requester: ws.watchTarget,
+                inboundOnly: true,
+                count: 1
+              }).messages;
+              const alertKey = createHash('sha256')
+                .update(ws.watchTarget).update('\u0000').update(msg.since.trim()).digest('hex');
+              const latestId = retained[0]?.id;
+              const shouldWake = Boolean(latestId && unknownWatchAlerts.get(alertKey) !== latestId);
+              if (shouldWake) {
+                unknownWatchAlerts.delete(alertKey);
+                unknownWatchAlerts.set(alertKey, latestId);
+                if (unknownWatchAlerts.size > 500) {
+                  unknownWatchAlerts.delete(unknownWatchAlerts.keys().next().value);
+                }
+              }
+              logger.warn('watch_unknown_cursor', {
+                clientId, for: ws.watchTarget, since: msg.since.trim().slice(0, 128),
+                retainedMail: retained.length > 0, recoveryWake: shouldWake
+              });
+              ws.send(JSON.stringify({
+                type: 'watch_unknown_cursor', for: ws.watchTarget,
+                retainedMail: shouldWake
+              }));
+              break;
+            }
+            const pending = backfill.messages.filter(m =>
               m.from !== ws.watchTarget && (m.to === ws.watchTarget || m.to === 'all'));
             if (pending.length > 0) {
               ws.send(JSON.stringify({

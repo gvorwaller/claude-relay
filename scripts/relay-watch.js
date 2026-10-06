@@ -52,6 +52,8 @@ ws.on('message', data => {
     ws.send(JSON.stringify(watchRequest));
   } else if (message.type === 'new_message' && message.for === target) {
     finish('new-message', 0);
+  } else if (message.type === 'watch_unknown_cursor' && message.for === target && message.retainedMail) {
+    finish('unknown-cursor', 0);
   } else if (message.type === 'error') {
     finish(`error: ${message.message}`, 2);
   }

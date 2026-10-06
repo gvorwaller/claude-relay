@@ -353,3 +353,45 @@ test('rename onto an owned label is rejected transactionally: old identity intac
   assert.ok(peerList.includes('OTHER'), 'OTHER survived the rejected rename');
   assert.ok(peerList.includes('TARGET'), 'TARGET was never displaced');
 });
+
+for (const priorTargetCursor of ['pruned', 'never-used']) {
+  test(`rename to ${priorTargetCursor} label opens its mailbox without a foreign cursor`, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-cursor-'));
+    const port = startServer(t, root);
+    const peer = await connectWithRetry(port, 'PEER');
+    t.after(() => peer.close());
+    const cursorFile = path.join(root, 'claude-relay', 'sessions', 'read-cursors.json');
+    fs.mkdirSync(path.dirname(cursorFile), { recursive: true });
+    const cursors = { WRONG: { cursor: 'old-label-message' } };
+    if (priorTargetCursor === 'pruned') cursors.RIGHT = { cursor: 'pruned-target-message' };
+    fs.writeFileSync(cursorFile, JSON.stringify(cursors));
+
+    const ack = waitForMessage(peer, msg => msg.type === 'sent' && msg.to === 'RIGHT');
+    peer.send(JSON.stringify({ type: 'message', to: 'RIGHT', content: 'unread before rename' }));
+    await ack;
+
+    const joined = waitForMessage(peer, msg => msg.type === 'peer_joined' && msg.clientId === 'WRONG');
+    const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+      '--client-id=WRONG', `--relay-url=ws://127.0.0.1:${port}`], {
+      env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    t.after(() => mcp.kill('SIGTERM'));
+    const next = mcpLines(mcp.stdout);
+    const send = (id, name, args = {}) => mcp.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args }
+    })}\n`);
+    mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+    await next(msg => msg.id === 1);
+    await joined;
+    send(2, 'relay_rename', { to: 'RIGHT' });
+    assert.match((await next(msg => msg.id === 2)).result.content[0].text, /confirmed by the relay server/);
+    const afterRename = JSON.parse(fs.readFileSync(cursorFile, 'utf8'));
+    assert.equal(afterRename.WRONG, undefined);
+    assert.equal(afterRename.RIGHT, undefined);
+    send(3, 'relay_receive');
+    const received = (await next(msg => msg.id === 3)).result.content[0].text;
+    assert.match(received, /PEER: unread before rename/);
+    assert.doesNotMatch(received, /cursor was not found/);
+  });
+}

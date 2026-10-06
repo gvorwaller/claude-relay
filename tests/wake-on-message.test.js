@@ -164,6 +164,78 @@ test('watch with since backfills a ping for mail that arrived while deaf', async
   );
 });
 
+test('unknown watch cursor logs and wakes once for retained gap mail', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-watch-unknown-'));
+  const port = startServer(t, root);
+  const sender = await connectWithRetry(port, 'A');
+  t.after(() => sender.close());
+  const ack = nextMessage(sender, 'sent');
+  sender.send(JSON.stringify({ type: 'message', to: 'C', content: 'mail in gap' }));
+  await ack;
+
+  const watcher = await connect(port, 'C-watch-unknown');
+  t.after(() => watcher.close());
+  const recovery = nextMessage(watcher, 'watch_unknown_cursor');
+  let notices = 0;
+  watcher.on('message', data => {
+    if (JSON.parse(data).type === 'watch_unknown_cursor') notices += 1;
+  });
+  watcher.send(JSON.stringify({ type: 'watch', for: 'C', since: 'pruned-message-id' }));
+  assert.deepEqual(await recovery, {
+    type: 'watch_unknown_cursor', for: 'C', retainedMail: true
+  });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(notices, 1);
+  const logFiles = fs.readdirSync(path.join(root, 'logs'));
+  assert.ok(logFiles.some(file => fs.readFileSync(path.join(root, 'logs', file), 'utf8')
+    .includes('watch_unknown_cursor')));
+
+  const repeated = nextMessage(watcher, 'watch_unknown_cursor');
+  watcher.send(JSON.stringify({ type: 'watch', for: 'C', since: 'pruned-message-id' }));
+  assert.equal((await repeated).retainedMail, false, 'unchanged stale cursor does not wake again');
+
+  watcher.close();
+  const nextAck = nextMessage(sender, 'sent');
+  sender.send(JSON.stringify({ type: 'message', to: 'C', content: 'new gap mail' }));
+  await nextAck;
+  const rearmed = await connect(port, 'C-watch-rearmed');
+  t.after(() => rearmed.close());
+  const newRecovery = nextMessage(rearmed, 'watch_unknown_cursor');
+  rearmed.send(JSON.stringify({ type: 'watch', for: 'C', since: 'pruned-message-id' }));
+  assert.equal((await newRecovery).retainedMail, true, 'new mail permits one more recovery wake');
+
+  // A valid cursor past the gap mail does not cause another recovery wake.
+  const latest = nextMessage(sender, 'history');
+  sender.send(JSON.stringify({ type: 'get_history', count: 1 }));
+  const cursor = (await latest).cursor;
+  const watching = nextMessage(rearmed, 'watching');
+  rearmed.send(JSON.stringify({ type: 'watch', for: 'C', since: cursor }));
+  await watching;
+  await assert.rejects(waitForMessage(rearmed, m =>
+    m.type === 'watch_unknown_cursor' || m.type === 'new_message', 300), /Timed out/);
+});
+
+test('relay-watch helper reports unknown cursor so the caller can resync', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-watch-helper-'));
+  const port = startServer(t, root);
+  const sender = await connectWithRetry(port, 'A');
+  t.after(() => sender.close());
+  const ack = nextMessage(sender, 'sent');
+  sender.send(JSON.stringify({ type: 'message', to: 'C', content: 'mail in gap' }));
+  await ack;
+  const helper = spawn(process.execPath, [
+    path.join(__dirname, '..', 'scripts', 'relay-watch.js'), '--for', 'C',
+    '--since', 'pruned-message-id', '--timeout', '2',
+    '--relay-url', `ws://127.0.0.1:${port}`
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => helper.kill('SIGTERM'));
+  let output = '';
+  helper.stdout.on('data', chunk => { output += chunk; });
+  const code = await new Promise(resolve => helper.once('close', resolve));
+  assert.equal(code, 0);
+  assert.equal(output.trim(), 'unknown-cursor');
+});
+
 test('relay-watch-loop.sh exits new-message when mail arrives', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
   const port = startServer(t, root);

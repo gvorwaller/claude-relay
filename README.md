@@ -170,6 +170,8 @@ The relay server rejects duplicate live client IDs. Multiple Codex windows shoul
 
 **Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry.
 
+On a confirmed rename, the MCP client clears the old label's saved read cursor and any cursor left by a previous holder of the new label. The next plain `relay_receive` opens the new label's retained mailbox and saves its returned cursor. A rejected rename leaves both cursors untouched. Ordinary unfiltered reads keep that saved cursor across MCP reconnects. To recover from a cursor that has expired or been pruned, call `relay_receive` with `replay=true` and **no** `from`, `to`, or `after` filter; filtered reads, even with `replay=true`, do not move the saved mailbox cursor.
+
 **Pid-anchored labels.** A label belongs to the process that registered it, for
 that process's lifetime — the ID you see in `relay_status`/`relay_sessions` is
 the ID peers use, and nothing can silently steal it. When a registration claims
@@ -403,6 +405,8 @@ prints `new-message` and exits 0. A normal timeout prints `timeout` and exits 0;
 connection failures exit 2. Run it with Claude Code's background-task support
 so task completion re-enters the agent, then call `relay_receive` to fetch the
 authorized content and cursor through the real MCP identity.
+
+If a watcher's `--since` message ID has expired, the server logs `watch_unknown_cursor` and checks for retained inbound mail. The helper prints `unknown-cursor` and exits once when mail may be waiting. The server suppresses repeated recovery wakes for the same cursor and unchanged mailbox tail; newly arrived mail permits another wake. The Stop hook then asks the session to run an unfiltered `relay_receive replay=true` to establish a fresh cursor. A watcher with no retained inbound mail stays armed for live messages.
 
 The watcher registers under a distinct generated ID and receives only a
 doorbell payload (`type`, watched ID, and timestamp). It receives no sender,

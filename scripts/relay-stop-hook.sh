@@ -148,6 +148,10 @@ while true; do
   fi
   OUT="$("$NODE_BIN" "$WATCH" --for "$ID" --timeout 300 --since "$SINCE" 2>/dev/null)"
   case "$OUT" in
+    unknown-cursor)
+      echo "Relay mail may be waiting for $ID, but its saved cursor expired. Run relay_receive with replay=true and no from/to/after filter to resync, then act on the returned mail." >&2
+      exit 2
+      ;;
     new-message)
       echo "Relay mail is waiting for $ID. Run relay_receive now and act on what it says; reply to the sender via relay_send if a reply is warranted." >&2
       exit 2

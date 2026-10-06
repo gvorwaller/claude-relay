@@ -341,8 +341,15 @@ test('unfiltered relay_receive resumes from its saved cursor after MCP restart',
     }});
     const pinned = (await second.next(message => message.id === id)).result.content[0].text;
     assert.match(pinned, /saved cursor was retained/);
+    assert.match(pinned, /replay=true and no from\/to\/after filter/);
     assert.doesNotMatch(pinned, /first|second/);
   }
+  second.send({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: {
+    name: 'relay_receive', arguments: { replay: true, to: 'CURSOR' }
+  }});
+  await second.next(message => message.id === 8);
+  assert.equal(JSON.parse(fs.readFileSync(cursorsFile, 'utf8')).CURSOR.cursor,
+    '00000000-0000-4000-8000-000000000000', 'filtered replay does not move the mailbox cursor');
   second.send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: {
     name: 'relay_receive', arguments: { replay: true }
   }});
