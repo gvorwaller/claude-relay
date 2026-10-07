@@ -18,3 +18,6 @@ sessions/backups/
 .sidecar-base
 .td-root
 sessions/owners/
+# Interrupted atomic-write temp files and retired local scripts
+sessions/*.tmp
+*.old.*

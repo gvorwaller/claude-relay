@@ -206,6 +206,27 @@ if [[ -n "${RELAY_JOB_TOKEN_FILE:-}" ]]; then
   CODEX_ARGS+=(-c "mcp_servers.claude-relay.env.RELAY_JOB_TOKEN_FILE=$RELAY_JOB_TOKEN_FILE")
 fi
 
+# One-shot reasoning effort for THIS wake (owner decision 2026-09-26): the
+# relay prompt never carries the message text, so a sender that wants a
+# deeper review writes the level to data/codex-effort/<PEER> before sending.
+# The wake consumes (deletes) it, so it applies to exactly one run; without
+# it, Codex uses its configured default (~/.codex/config.toml). Only known
+# levels pass, and the peer name must be a plain identifier (path safety).
+if [[ "$FOR" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  EFFORT_FILE="$SCRIPT_DIR/../data/codex-effort/$FOR"
+  if [[ -f "$EFFORT_FILE" ]]; then
+    EFFORT="$(tr -d '[:space:]' < "$EFFORT_FILE")"
+    rm -f "$EFFORT_FILE"
+    case "$EFFORT" in
+      low|medium|high|xhigh)
+        CODEX_ARGS+=(-c "model_reasoning_effort=\"$EFFORT\"")
+        echo "note: $FOR wake uses reasoning effort $EFFORT (one-shot)"
+        ;;
+      *) echo "warning: ignoring unknown reasoning effort '$EFFORT' for $FOR" ;;
+    esac
+  fi
+fi
+
 # Capture the run's final message so the job receipt can say what happened,
 # rather than only that a process exited. NOT exec: we must outlive codex to
 # submit the result.
