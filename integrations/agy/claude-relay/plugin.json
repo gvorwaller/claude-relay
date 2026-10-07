@@ -1,0 +1,9 @@
+{
+  "name": "claude-relay",
+  "version": "1.0.0",
+  "description": "Rules for using the claude-relay peer network from Antigravity (AGY) through the sanctioned MCP bridge only",
+  "author": {
+    "name": "Gaylon Vorwaller"
+  },
+  "keywords": ["claude-relay", "relay", "peers"]
+}

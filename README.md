@@ -88,6 +88,26 @@ For Antigravity CLI (`agy`), use its global MCP file at
 AGY reloads this global file automatically in current releases. Confirm under
 **Additional Options (...) > MCP Servers** or ask it to call `relay_status`.
 
+AGY also needs the relay rules, because nothing else tells it how to behave on
+the relay. Without them it once wrote its own CLIs that read the message store
+directly and opened raw relay sockets (retired 2026-10-07). The rules ship as a
+global AGY plugin in `integrations/agy/claude-relay/`. Install it, or reinstall
+it after editing:
+
+```bash
+agy plugin validate integrations/agy/claude-relay
+agy plugin install integrations/agy/claude-relay   # copies to ~/.gemini/config/plugins/claude-relay
+```
+
+The plugin's rule tells AGY to use only the MCP tools: plain `relay_receive`
+for its mailbox, `relay_send` with honest acks, and no polling. It must not
+touch `data/` or `sessions/`, open its own relay sockets, or write helper
+scripts. It also covers how to behave as a one-shot wake delegate.
+Optionally, add `"RELAY_TOOL_PROFILE": "claude-core"` to the bridge's `env`
+above. That limits AGY to `relay_send`, `relay_receive`, `relay_peers`,
+`relay_status`, and `relay_rename`, the same set Claude Code sessions get, and
+removes the history-purge and session-clear admin tools.
+
 ### 3. Connect Remote Machines via SSH Tunnel
 
 The relay intentionally listens only on loopback. Every remote machine uses an
