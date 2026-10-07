@@ -354,44 +354,75 @@ test('rename onto an owned label is rejected transactionally: old identity intac
   assert.ok(peerList.includes('TARGET'), 'TARGET was never displaced');
 });
 
-for (const priorTargetCursor of ['pruned', 'never-used']) {
-  test(`rename to ${priorTargetCursor} label opens its mailbox without a foreign cursor`, async t => {
+async function sendFrom(peer, to, content) {
+  const ack = waitForMessage(peer, msg => msg.type === 'sent' && msg.to === to);
+  peer.send(JSON.stringify({ type: 'message', to, content }));
+  await ack;
+  const history = waitForMessage(peer, msg => msg.type === 'history');
+  peer.send(JSON.stringify({ type: 'get_history', count: 1 }));
+  return (await history).messages[0].id;
+}
+
+async function renamingBridge(t, port, root) {
+  const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
+    '--client-id=WRONG', `--relay-url=ws://127.0.0.1:${port}`], {
+    env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => mcp.kill('SIGTERM'));
+  const next = mcpLines(mcp.stdout);
+  const call = async (id, name, args = {}) => {
+    mcp.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args }
+    })}\n`);
+    return (await next(msg => msg.id === id)).result.content[0].text;
+  };
+  mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+  await next(msg => msg.id === 1);
+  return call;
+}
+
+// td-98eecf: deleting both cursors on rename made the next plain receive
+// replay mail already handled. The server now hands back a read position.
+for (const prior of ['pruned', 'never-used', 'used']) {
+  test(`rename onto a ${prior} label returns no handled mail and later mail exactly once`, async t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-cursor-'));
     const port = startServer(t, root);
     const peer = await connectWithRetry(port, 'PEER');
     t.after(() => peer.close());
     const cursorFile = path.join(root, 'claude-relay', 'sessions', 'read-cursors.json');
     fs.mkdirSync(path.dirname(cursorFile), { recursive: true });
-    const cursors = { WRONG: { cursor: 'old-label-message' } };
-    if (priorTargetCursor === 'pruned') cursors.RIGHT = { cursor: 'pruned-target-message' };
-    fs.writeFileSync(cursorFile, JSON.stringify(cursors));
 
-    const ack = waitForMessage(peer, msg => msg.type === 'sent' && msg.to === 'RIGHT');
-    peer.send(JSON.stringify({ type: 'message', to: 'RIGHT', content: 'unread before rename' }));
-    await ack;
+    const handled = await sendFrom(peer, 'RIGHT', 'handled before rename');
+    const cursors = { WRONG: { cursor: 'old-label-message' } };
+    if (prior === 'pruned') cursors.RIGHT = { cursor: 'pruned-target-message' };
+    if (prior === 'used') cursors.RIGHT = { cursor: handled };
+    fs.writeFileSync(cursorFile, JSON.stringify(cursors));
+    // For a used label this is genuinely unread (after its saved position).
+    if (prior === 'used') await sendFrom(peer, 'RIGHT', 'unread under RIGHT');
 
     const joined = waitForMessage(peer, msg => msg.type === 'peer_joined' && msg.clientId === 'WRONG');
-    const mcp = spawn(process.execPath, [path.join(__dirname, '..', 'mcp-server.js'),
-      '--client-id=WRONG', `--relay-url=ws://127.0.0.1:${port}`], {
-      env: { ...process.env, HOME: root, CLAUDE_RELAY_SESSION_ID: '', RELAY_CLIENT_ID: '' },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    t.after(() => mcp.kill('SIGTERM'));
-    const next = mcpLines(mcp.stdout);
-    const send = (id, name, args = {}) => mcp.stdin.write(`${JSON.stringify({
-      jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args }
-    })}\n`);
-    mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
-    await next(msg => msg.id === 1);
+    const call = await renamingBridge(t, port, root);
     await joined;
-    send(2, 'relay_rename', { to: 'RIGHT' });
-    assert.match((await next(msg => msg.id === 2)).result.content[0].text, /confirmed by the relay server/);
+    const renamed = await call(2, 'relay_rename', { to: 'RIGHT' });
+    assert.match(renamed, /confirmed by the relay server/);
     const afterRename = JSON.parse(fs.readFileSync(cursorFile, 'utf8'));
-    assert.equal(afterRename.WRONG, undefined);
-    assert.equal(afterRename.RIGHT, undefined);
-    send(3, 'relay_receive');
-    const received = (await next(msg => msg.id === 3)).result.content[0].text;
-    assert.match(received, /PEER: unread before rename/);
-    assert.doesNotMatch(received, /cursor was not found/);
+    assert.equal(afterRename.WRONG, undefined, 'old label cursor is dropped');
+    assert.equal(typeof afterRename.RIGHT?.cursor, 'string', 'new label has a read position');
+
+    const first = await call(3, 'relay_receive');
+    assert.doesNotMatch(first, /handled before rename/);
+    assert.doesNotMatch(first, /cursor was not found/);
+    if (prior === 'used') {
+      assert.match(renamed, /kept RIGHT's saved position/);
+      assert.match(first, /PEER: unread under RIGHT/);
+    } else {
+      assert.match(renamed, /1 direct message\(s\) to RIGHT from before this rename/);
+      assert.match(first, /No messages in history/);
+    }
+
+    await sendFrom(peer, 'RIGHT', 'after rename');
+    assert.match(await call(4, 'relay_receive'), /PEER: after rename/);
+    assert.match(await call(5, 'relay_receive'), /No messages in history/);
   });
 }

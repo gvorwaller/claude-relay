@@ -359,3 +359,217 @@ test('unfiltered relay_receive resumes from its saved cursor after MCP restart',
   assert.notEqual(JSON.parse(fs.readFileSync(cursorsFile, 'utf8')).CURSOR.cursor,
     '00000000-0000-4000-8000-000000000000');
 });
+
+// td-49c1df: a label set with relay_rename is never the configured base ID,
+// so a replacement bridge used to come back under the hostname-pid default.
+function claudeEnv(session, extra = {}) {
+  return {
+    CLAUDE_RELAY_SESSION_ID: '',
+    CLAUDE_CODE_BRIDGE_SESSION_ID: '',
+    RELAY_BACKGROUND_FORK: '',
+    CLAUDE_CODE_SESSION_ID: session,
+    ...extra
+  };
+}
+
+async function callTool(bridge, id, name, args = {}) {
+  bridge.send({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+  return (await bridge.next(message => message.id === id)).result.content[0].text;
+}
+
+async function initialized(bridge) {
+  bridge.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  await bridge.next(message => message.id === 1);
+  return bridge;
+}
+
+async function registeredStatus(bridge, firstId) {
+  for (let id = firstId; id < firstId + 50; id += 1) {
+    const status = await callTool(bridge, id, 'relay_status');
+    if (/^Connected to /.test(status)) return status;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error('bridge never registered');
+}
+
+// A bridge whose parent is NOT this test process (as when Claude Code's
+// /mcp reconnect spawns it from a background host).
+function startWrappedMcp(t, { root, port, cwd, env = {} }) {
+  const wrapped = spawn('/bin/sh', ['-c', '"$0" "$@"; :', process.execPath,
+    path.join(__dirname, '..', 'mcp-server.js'), `--relay-url=ws://127.0.0.1:${port}`], {
+    cwd,
+    env: { ...process.env, HOME: root, RELAY_CLIENT_ID: '', ...env },
+    stdio: ['pipe', 'pipe', 'ignore']
+  });
+  t.after(() => wrapped.kill('SIGTERM'));
+  return {
+    mcp: wrapped,
+    next: nextLine(wrapped.stdout),
+    send: value => wrapped.stdin.write(`${JSON.stringify(value)}\n`)
+  };
+}
+
+async function stopBridge(bridge) {
+  const exited = new Promise(resolve => bridge.mcp.once('exit', resolve));
+  bridge.mcp.kill('SIGTERM');
+  await exited;
+}
+
+const autoLabel = new RegExp(`^${os.hostname().split('.')[0].toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[0-9a-z]+$`);
+
+test('a runtime-renamed label survives an MCP restart in the same Claude session', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-reconnect-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'birds');
+  fs.mkdirSync(project, { recursive: true });
+  const { port, observer } = await startRelay(t, root);
+  const env = claudeEnv('55555555-5555-4555-8555-555555555555');
+
+  const firstJoined = wsMessage(observer, message => message.type === 'peer_joined' && autoLabel.test(message.clientId));
+  const first = await initialized(startMcp(t, { root, port, cwd: project, env }));
+  await firstJoined;
+  assert.match(await callTool(first, 2, 'relay_rename', { to: 'CC9' }), /confirmed by the relay server/);
+  const sent = wsMessage(observer, message => message.type === 'sent' && message.to === 'CC9');
+  observer.send(JSON.stringify({ type: 'message', to: 'CC9', content: 'read before reconnect' }));
+  await sent;
+  assert.match(await callTool(first, 3, 'relay_receive'), /read before reconnect/);
+  await stopBridge(first);
+
+  const joined = wsMessage(observer, message => message.type === 'peer_joined' && message.clientId === 'CC9');
+  const second = await initialized(startMcp(t, { root, port, cwd: project, env }));
+  await joined;
+  assert.match(await registeredStatus(second, 2), /as "CC9"/);
+  const resumed = await callTool(second, 60, 'relay_receive');
+  assert.match(resumed, /No messages in history/);
+  assert.doesNotMatch(resumed, /cursor was not found/);
+
+  const registry = JSON.parse(fs.readFileSync(path.join(root, 'claude-relay', 'sessions', 'registry.json'), 'utf8'));
+  assert.equal(registry.CC9.source, 'claude-session');
+  assert.deepEqual(Object.keys(registry).filter(id => autoLabel.test(id)), [], 'no orphan default label');
+
+  const later = wsMessage(observer, message => message.type === 'sent' && message.to === 'CC9');
+  observer.send(JSON.stringify({ type: 'message', to: 'CC9', content: 'after reconnect' }));
+  await later;
+  assert.match(await callTool(second, 61, 'relay_receive'), /after reconnect/);
+});
+
+test('another Claude session never inherits a runtime-renamed label', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-isolation-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'birds');
+  fs.mkdirSync(project, { recursive: true });
+  const { port, observer } = await startRelay(t, root);
+  const session = '66666666-6666-4666-8666-666666666666';
+
+  const ownerJoined = wsMessage(observer, message => message.type === 'peer_joined' && autoLabel.test(message.clientId));
+  const owner = await initialized(startMcp(t, { root, port, cwd: project, env: claudeEnv(session) }));
+  await ownerJoined;
+  assert.match(await callTool(owner, 2, 'relay_rename', { to: 'CCOWN' }), /confirmed/);
+  await stopBridge(owner);
+
+  // Same parent process and cwd, different Claude session.
+  const other = await initialized(startMcp(t, {
+    root, port, cwd: project, env: claudeEnv('77777777-7777-4777-8777-777777777777')
+  }));
+  assert.match(await registeredStatus(other, 2), new RegExp(`as "${autoLabel.source.slice(1, -1)}"`));
+  await stopBridge(other);
+
+  // Same Claude session id, but served by a different parent process.
+  const foreign = await initialized(startWrappedMcp(t, { root, port, cwd: project, env: claudeEnv(session) }));
+  assert.match(await registeredStatus(foreign, 2), new RegExp(`as "${autoLabel.source.slice(1, -1)}"`));
+});
+
+test('two dead labels claiming the same Claude session fail closed', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-ambiguous-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'birds');
+  fs.mkdirSync(project, { recursive: true });
+  const { port } = await startRelay(t, root);
+  const parentStarted = require('child_process')
+    .execSync(`ps -o lstart= -p ${process.pid}`, { encoding: 'utf8' }).trim();
+  const dead = spawn(process.execPath, ['-e', '']);
+  await new Promise(resolve => dead.once('exit', resolve));
+  const entry = { pid: dead.pid, cwd: project, source: 'rename', parentPid: process.pid, parentStarted };
+  const sessions = path.join(root, 'claude-relay', 'sessions');
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.writeFileSync(path.join(sessions, 'registry.json'), JSON.stringify({ CCA: entry, CCB: entry }));
+
+  const bridge = await initialized(startMcp(t, {
+    root, port, cwd: project, env: claudeEnv('88888888-8888-4888-8888-888888888888')
+  }));
+  assert.match(await registeredStatus(bridge, 2), new RegExp(`as "${autoLabel.source.slice(1, -1)}"`));
+  assert.match(bridge.errors(), /Several registry labels match this Claude session \(CCA, CCB\)/);
+});
+
+for (const token of ['session_same_bridge', 'session_other_bridge']) {
+  test(`/mcp reconnect from a background host after the bridge died: ${token === 'session_same_bridge' ? 'same bridge token reclaims' : 'other bridge token does not reclaim'}`, async t => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-dead-reconnect-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const project = path.join(root, 'birds');
+    fs.mkdirSync(project, { recursive: true });
+    const { port, observer } = await startRelay(t, root);
+    const rootSession = '99999999-9999-4999-8999-999999999999';
+    const currentSession = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const transcriptDir = path.join(root, '.claude', 'projects', '-test-birds');
+    fs.mkdirSync(transcriptDir, { recursive: true });
+    fs.writeFileSync(path.join(transcriptDir, `${currentSession}.jsonl`),
+      `${JSON.stringify({ session_id: rootSession })}\n`);
+
+    const joined = wsMessage(observer, message => message.type === 'peer_joined' && autoLabel.test(message.clientId));
+    const first = await initialized(startMcp(t, { root, port, cwd: project, env: claudeEnv(rootSession, {
+      CLAUDE_CODE_BRIDGE_SESSION_ID: 'session_same_bridge', CLAUDE_PROJECT_DIR: project
+    }) }));
+    await joined;
+    assert.match(await callTool(first, 2, 'relay_rename', { to: 'CC7' }), /confirmed/);
+    const sent = wsMessage(observer, message => message.type === 'sent' && message.to === 'CC7');
+    observer.send(JSON.stringify({ type: 'message', to: 'CC7', content: 'read before reconnect' }));
+    await sent;
+    assert.match(await callTool(first, 3, 'relay_receive'), /read before reconnect/);
+    await stopBridge(first);
+
+    // The replacement looks like background work (different parent, fork
+    // marker, inherited foreign CLAUDE_RELAY_SESSION_ID) and its transcript
+    // is a continuation of the original root.
+    const replacement = await initialized(startWrappedMcp(t, { root, port, cwd: project, env: claudeEnv(currentSession, {
+      CLAUDE_RELAY_SESSION_ID: 'CC2',
+      CLAUDE_CODE_BRIDGE_SESSION_ID: token,
+      CLAUDE_PROJECT_DIR: project,
+      RELAY_BACKGROUND_FORK: '1'
+    }) }));
+    const status = await registeredStatus(replacement, 2);
+    if (token === 'session_same_bridge') {
+      assert.match(status, /as "CC7"/);
+      const resumed = await callTool(replacement, 60, 'relay_receive');
+      assert.match(resumed, /No messages in history/);
+      assert.doesNotMatch(resumed, /cursor was not found/);
+    } else {
+      assert.match(status, /as "CC2-bg[0-9a-z]+"/);
+    }
+  });
+}
+
+test('two live Claude sessions in one cwd each keep their runtime label across reconnects', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-rename-concurrent-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'birds');
+  fs.mkdirSync(project, { recursive: true });
+  const { port, observer } = await startRelay(t, root);
+  const sessions = {
+    CCA: claudeEnv('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+    CCB: claudeEnv('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+  };
+  const bridges = {};
+  for (const [label, env] of Object.entries(sessions)) {
+    const joined = wsMessage(observer, message => message.type === 'peer_joined' && autoLabel.test(message.clientId));
+    bridges[label] = await initialized(startMcp(t, { root, port, cwd: project, env }));
+    await joined;
+    assert.match(await callTool(bridges[label], 2, 'relay_rename', { to: label }), /confirmed/);
+  }
+  // Each reconnects while the other stays live.
+  for (const label of ['CCA', 'CCB']) {
+    await stopBridge(bridges[label]);
+    bridges[label] = await initialized(startMcp(t, { root, port, cwd: project, env: sessions[label] }));
+    assert.match(await registeredStatus(bridges[label], 2), new RegExp(`as "${label}"`));
+  }
+  assert.match(await registeredStatus(bridges.CCA, 80), /as "CCA"/);
+});

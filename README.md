@@ -170,7 +170,7 @@ The relay server rejects duplicate live client IDs. Multiple Codex windows shoul
 
 **Wrong identity at startup?** Startup resolution can pick the wrong ID when the spawning app (e.g. Codex) sets a fixed `RELAY_CLIENT_ID` and launches the MCP process from a cwd that matches no registry entry. No restart is needed to fix it: ask the session to call `relay_rename` with the correct ID (e.g. `relay_rename to=CODEX1`). The MCP client re-registers with the relay server under the new ID (the server drops the old identity from its live peer list immediately) and rewrites the local registry entry.
 
-On a confirmed rename, the MCP client clears the old label's saved read cursor and any cursor left by a previous holder of the new label. The next plain `relay_receive` opens the new label's retained mailbox and saves its returned cursor. A rejected rename leaves both cursors untouched. Ordinary unfiltered reads keep that saved cursor across MCP reconnects. To recover from a cursor that has expired or been pruned, call `relay_receive` with `replay=true` and **no** `from`, `to`, or `after` filter; filtered reads, even with `replay=true`, do not move the saved mailbox cursor.
+On a confirmed rename, the relay server reports where the new label's mailbox stands, computed at the instant it confirms the claim, and the MCP client saves that as the new label's read cursor. If the label's saved cursor still places in its retained history, it is kept, so mail the label has not read is still returned. Otherwise (never used, pruned, or foreign) the cursor starts at the newest visible message. The rename result then says how many direct messages to the label predate the rename; audit them with `relay_receive replay=true` if they might matter. Either way the next plain `relay_receive` never replays mail already handled, mail arriving after the rename is returned exactly once, and the Stop hook arms from that position, so nothing landing mid-turn is missed. The old label's cursor is dropped. A rejected rename leaves both cursors untouched. A relay server too old to report a position falls back to clearing both cursors, and the rename result warns that a replay may follow. Ordinary unfiltered reads keep that saved cursor across MCP reconnects. To recover from a cursor that has expired or been pruned, call `relay_receive` with `replay=true` and **no** `from`, `to`, or `after` filter; filtered reads, even with `replay=true`, do not move the saved mailbox cursor.
 
 **Pid-anchored labels.** A label belongs to the process that registered it, for
 that process's lifetime — the ID you see in `relay_status`/`relay_sessions` is
@@ -193,6 +193,29 @@ restarting a session in the same directory lands directly back on its old
 label, no `relay_rename` needed. Entries whose pid is still alive are skipped
 (that label is owned; the new session auto-numbers instead of fighting), and
 `relay_rename` away from a wrong identity still deletes the bad mapping.
+
+**A runtime `relay_rename` survives `/mcp` reconnect.** A renamed label is never
+the configured base ID, so the rule above cannot find it. Each registry entry
+therefore also records the Claude Code process its bridge served (`parentPid`
+plus that process's start time, since a pid alone can be reused). A replacement
+bridge for the same Claude session (`/mcp` reconnect, MCP subprocess restart)
+reclaims the label when exactly one entry has a dead previous bridge, the same
+project dir, the same transcript root (when recorded), and one of two anchors:
+the same parent Claude process, or the same Claude bridge-session token. The
+token anchor also requires the transcript root to have been recorded. It covers
+`/mcp` reconnects that spawn the replacement from a background host, where the
+parent differs and the bridge looks like background work. This takes precedence
+over `CLAUDE_RELAY_SESSION_ID`, because the rename was the session's later,
+deliberate choice. Another session never matches. Neither does background work
+without the bridge token, or the same transcript in a different Claude process.
+More than one match fails closed and logs the candidates. The label's read
+cursor is keyed by label, so it carries over with no replay. A new Claude
+transcript in the same process (after `/clear`) does not match; that session
+comes back under its configured or default ID as before.
+Throwaway identities whose bridge has exited (hostname-pid defaults and
+`-bg` forks) are pruned from `registry.json` and `read-cursors.json` when any
+bridge connects. Delegate `~wake-` cursors are pruned a day after their last
+write.
 
 **Displacement backoff (unverifiable holders only).** When newest-wins does
 displace a client, the displaced side does **not** auto-reconnect — that
@@ -406,7 +429,7 @@ connection failures exit 2. Run it with Claude Code's background-task support
 so task completion re-enters the agent, then call `relay_receive` to fetch the
 authorized content and cursor through the real MCP identity.
 
-If a watcher's `--since` message ID has expired, the server logs `watch_unknown_cursor` and checks for retained inbound mail. The helper prints `unknown-cursor` and exits once when mail may be waiting. The server suppresses repeated recovery wakes for the same cursor and unchanged mailbox tail; newly arrived mail permits another wake. The Stop hook then asks the session to run an unfiltered `relay_receive replay=true` to establish a fresh cursor. A watcher with no retained inbound mail stays armed for live messages.
+If a watcher's `--since` message ID has expired, the server logs `watch_unknown_cursor` and checks for retained inbound mail. The helper prints `unknown-cursor` and exits once when mail may be waiting. The server suppresses repeated recovery wakes for the same cursor and unchanged mailbox tail; newly arrived mail permits another wake. That suppression is in memory, so a relay server restart permits at most one more recovery wake per still-stale cursor. The Stop hook then asks the session to run an unfiltered `relay_receive replay=true` to establish a fresh cursor. That replay returns recent mail that may already have been handled, so the wake text tells the model to act only on messages it has not already seen. A watcher with no retained inbound mail stays armed for live messages.
 
 The watcher registers under a distinct generated ID and receives only a
 doorbell payload (`type`, watched ID, and timestamp). It receives no sender,
@@ -435,10 +458,17 @@ have to remember to arm anything, so `scripts/relay-stop-hook.sh` is installed
 as an async-rewake `Stop` hook in `~/.claude/settings.json`. Every time any
 Claude Code session ends a turn, the hook resolves which relay peer that
 session is (by process ancestry against the registry — no env vars, no
-per-project config), takes a per-label lock, and listens until mail arrives —
+per-project config), takes a per-session lock (keyed by the claude pid), and
+listens until mail arrives —
 then exits code 2, which makes the harness wake the model with instructions to
 run `relay_receive`. Sessions without a relay bridge exit instantly; the
-listener stands down if its session dies. With this installed, every CC
+listener stands down if its session dies. Each re-arm re-reads the saved
+read cursor, so mail the model read in the meantime never re-wakes it. Each
+re-arm also re-resolves the label: after a `relay_rename`, the old listener
+stands down, and the next Stop takes over any listener still watching the
+abandoned label, so a session never runs two. Listeners left by the older
+per-label lock version are reaped the first time the new hook runs in their
+session. With this installed, every CC
 session is always reachable while idle, automatically.
 
 ### Usage guardrails

@@ -323,6 +323,57 @@ function nextAvailableNumberedId(baseId, registry) {
   return `${baseId}${maxN + 1}`;
 }
 
+// The Claude Code process this bridge serves, by pid AND start time (a pid
+// alone can be reused). Recorded in the registry so a replacement bridge —
+// /mcp reconnect, MCP subprocess restart — can find the label its own
+// session last held (td-49c1df).
+const PARENT_STARTED = psField(process.ppid, 'lstart') || null;
+
+// A label set at runtime with relay_rename is never the configured baseId, so
+// findRegisteredSessionId() cannot reclaim it, and a reconnect used to come
+// back under the default hostname-pid label. Reclaim it when a registry entry
+// provably belonged to THIS Claude session and its bridge is dead. Either
+// anchor proves it:
+//   process — same parent Claude process (pid + start time), outside any
+//             background-fork context (a bridge spawned straight by claude);
+//   bridge  — the same Claude bridge-session token. This is the proof
+//             findClaudeReconnectIdentity() already requires, and it is the
+//             only one available when /mcp reconnect spawns the replacement
+//             from a background host with a different parent.
+// Both also require same project dir and, when recorded, the same transcript
+// root (the bridge anchor requires it to be recorded). A live predecessor is
+// left to findClaudeReconnectIdentity(); more than one match fails closed.
+function findSameSessionIdentity(registry = readRegistry()) {
+  const current = (process.env.CLAUDE_CODE_SESSION_ID || '').trim();
+  if (!current || detectCodexHeadless()) return null;
+  const bridge = (process.env.CLAUDE_CODE_BRIDGE_SESSION_ID || '').trim();
+  const forked = Boolean(detectBackgroundFork());
+  if (forked && !bridge) return null;
+  const root = claudeRootSessionId(current);
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const sameProcess = info => !forked && Boolean(PARENT_STARTED)
+    && Number(info.parentPid) === process.ppid
+    && info.parentStarted === PARENT_STARTED
+    && (!info.agentRootSessionId || info.agentRootSessionId === root);
+  const sameBridge = info => Boolean(bridge)
+    && info.agentBridgeSessionId === bridge
+    && info.agentRootSessionId === root;
+  const matches = Object.entries(registry).filter(([, info]) =>
+    info
+    && !['auto', 'background-fork', 'delegate'].includes(info.source)
+    && (sameCwd(projectDir, info.cwd) || sameCwd(process.cwd(), info.cwd))
+    && registryPidAlive(info) === false
+    && (sameProcess(info) || sameBridge(info))
+  ).map(([id]) => id);
+  if (matches.length > 1) {
+    return {
+      id: null,
+      note: `Several registry labels match this Claude session (${matches.join(', ')}); not reclaiming any.`
+    };
+  }
+  return matches.length === 1 ? { id: matches[0] } : null;
+}
+
 function resolveClientIdentity() {
   const reconnect = findClaudeReconnectIdentity();
   if (reconnect) {
@@ -349,6 +400,18 @@ function resolveClientIdentity() {
         + `retiring bridge pid ${codexReconnect.pid}.`
     };
   }
+  // Before configured IDs: a runtime relay_rename is the session's latest
+  // deliberate choice and must survive a reconnect.
+  const sameSession = findSameSessionIdentity();
+  if (sameSession?.id) {
+    return {
+      id: sameSession.id,
+      source: 'claude-session',
+      note: `Reclaimed ${sameSession.id}: its registry entry belongs to this Claude session `
+        + 'and its previous bridge has exited.'
+    };
+  }
+  if (sameSession?.note) console.error(`[Claude Relay MCP] ${sameSession.note}`);
   if (sessionId) {
     return { id: sessionId, source: 'CLAUDE_RELAY_SESSION_ID' };
   }
@@ -460,7 +523,7 @@ if (!DELEGATE_FOR) {
 // (potentially) inherited environment, so a background fork gets a derived,
 // collision-free identity instead.
 if (resolvedIdentity.source !== '--client-id'
-    && !['claude-reconnect', 'codex-reconnect'].includes(resolvedIdentity.source)
+    && !['claude-reconnect', 'codex-reconnect', 'claude-session'].includes(resolvedIdentity.source)
     && !DELEGATE_FOR) {
   const forkReason = detectBackgroundFork();
   if (forkReason) {
@@ -526,6 +589,43 @@ function prepareCanonicalReconnect() {
   }
 }
 
+// Throwaway identities (hostname-pid, background-fork suffixes) never recur,
+// so once their bridge is gone their registry entries and read cursors are
+// clutter — every reconnect that fell back to a default label used to leave
+// one of each behind (td-49c1df). Delegate wake cursors (`<label>~wake-…`)
+// are likewise single-use; drop them a day after their last write. Runs
+// inside the registry lock held by updateRegistry('connect').
+const AUTO_ID_PATTERN = new RegExp(
+  `^${escapeRegExp(os.hostname().split('.')[0].toUpperCase())}-[0-9a-z]+(-bg[0-9a-z]+)?$`);
+const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
+
+function pruneOrphanIdentities(registry) {
+  for (const [id, info] of Object.entries(registry)) {
+    if (id === CLIENT_ID) continue;
+    if (['auto', 'background-fork'].includes(info?.source) && registryPidAlive(info) === false) {
+      delete registry[id];
+    }
+  }
+  try {
+    const cursors = JSON.parse(fs.readFileSync(READ_CURSORS_FILE, 'utf8'));
+    let changed = false;
+    for (const [label, entry] of Object.entries(cursors)) {
+      if (label === CLIENT_ID || registry[label]) continue;
+      const age = Date.now() - Date.parse(entry?.updatedAt || 0);
+      if (AUTO_ID_PATTERN.test(label) || /-bg[0-9a-z]+$/.test(label)
+          || (label.includes('~wake-') && age > WAKE_CURSOR_TTL_MS)) {
+        delete cursors[label];
+        changed = true;
+      }
+    }
+    if (changed) {
+      const tmp = `${READ_CURSORS_FILE}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(cursors, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, READ_CURSORS_FILE);
+    }
+  } catch { /* no cursor file yet, or unreadable: nothing to prune */ }
+}
+
 /**
  * Update the session registry with this client's info
  */
@@ -538,6 +638,7 @@ function updateRegistry(action = 'connect') {
     let registry = readRegistry();
 
     if (action === 'connect') {
+      pruneOrphanIdentities(registry);
       registry[CLIENT_ID] = {
         pid: process.pid,
         started: new Date().toISOString(),
@@ -545,6 +646,7 @@ function updateRegistry(action = 'connect') {
         relayUrl: RELAY_URL,
         source: CLIENT_ID_SOURCE,
         toolProfile: TOOL_PROFILE,
+        ...(PARENT_STARTED ? { parentPid: process.ppid, parentStarted: PARENT_STARTED } : {}),
         ...((process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId)
           ? { agentSessionId: process.env.CLAUDE_CODE_SESSION_ID || resolvedIdentity.agentSessionId }
           : {}),
@@ -603,21 +705,46 @@ function writeStoredCursor(cursor, label = CLIENT_ID) {
   });
 }
 
-function resetCursorOnRename(oldId, newId) {
-  // A message ID read under oldId may be invisible to newId. Likewise, a
-  // previous holder's cursor under newId can be pruned or can hide mail for
-  // this holder. Begin the new mailbox without either cursor. This happens
-  // only after the server confirms the rename.
-  return withRegistryLock(() => {
+// Apply the read position the relay server computed when it confirmed a
+// rename (message-store.js renameCursor). The old label's cursor goes: a
+// message read under oldId means nothing to whoever holds oldId next. The new
+// label gets the server's position — never "no cursor", which replayed mail
+// already handled (td-98eecf), and never the old label's id, which newId may
+// not be able to see. A server that predates the field gets the old reset,
+// and the caller says so.
+function applyRenameCursor(oldId, newId, position) {
+  const cursor = position && typeof position.cursor === 'string' ? position.cursor : null;
+  const written = withRegistryLock(() => {
     let cursors = {};
     try { cursors = JSON.parse(fs.readFileSync(READ_CURSORS_FILE, 'utf8')); } catch {}
     delete cursors[oldId];
-    delete cursors[newId];
+    if (cursor) cursors[newId] = { cursor, updatedAt: new Date().toISOString() };
+    else delete cursors[newId];
     const tmp = `${READ_CURSORS_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(cursors, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, READ_CURSORS_FILE);
     return true;
-  });
+  }) === true;
+  return { written, positioned: written && Boolean(cursor) };
+}
+
+function renameCursorNote(newId, position, applied) {
+  if (!applied.written) {
+    return 'Warning: saved cursor update failed. Use unfiltered relay_receive with replay=true to resync this mailbox.';
+  }
+  if (!applied.positioned) {
+    return 'Warning: the relay server did not report a read position for the new label (restart it to pick up '
+      + 'rename cursors). The saved cursor was cleared, so the next plain relay_receive may return mail already handled.';
+  }
+  if (position.source === 'kept') {
+    return `Read cursor: kept ${newId}'s saved position, so mail ${newId} has not read yet is still returned by relay_receive.`;
+  }
+  if (position.source === 'tail' && position.skippedDirect > 0) {
+    return `Read cursor: ${newId} had no usable saved position, so it starts at its current mailbox tail. `
+      + `${position.skippedDirect} direct message(s) to ${newId} from before this rename are not returned as unread; `
+      + 'audit them with relay_receive replay=true if they might matter.';
+  }
+  return `Read cursor: ${newId} starts at its current mailbox tail; only mail arriving from now on is returned.`;
 }
 
 /**
@@ -794,21 +921,22 @@ const pendingToolCalls = new Map();
 let reconnectTimer = null;
 let shuttingDown = false;
 
-function commitRename(rename, suffix = '') {
+function commitRename(rename, position, suffix = '') {
   clearTimeout(rename.timer);
-  let cursorReset = true;
+  let cursorNote = '';
   if (!rename.reclaiming) {
     // CLIENT_ID is still the old identity here — nothing changed
     // speculatively. Release the wrong mapping, then record the new one.
     updateRegistry('release');
     CLIENT_ID = rename.newId;
     CLIENT_ID_SOURCE = 'rename';
+    let applied = { written: false, positioned: false };
     try {
-      cursorReset = resetCursorOnRename(rename.oldId, rename.newId) === true;
+      applied = applyRenameCursor(rename.oldId, rename.newId, position);
     } catch (error) {
-      cursorReset = false;
-      console.error(`[Claude Relay MCP] Could not reset cursors after rename: ${error.message}`);
+      console.error(`[Claude Relay MCP] Could not update cursors after rename: ${error.message}`);
     }
+    cursorNote = renameCursorNote(rename.newId, position, applied);
     updateRegistry('connect');
   }
   displaced = false;
@@ -816,7 +944,7 @@ function commitRename(rename, suffix = '') {
   let text = rename.reclaiming
     ? `Reclaimed relay identity "${rename.newId}". ${suffix}`
     : `Renamed relay identity: ${rename.oldId} → ${rename.newId}, confirmed by the relay server. ${suffix}`;
-  if (!cursorReset) text += '\nWarning: saved cursor reset failed. Use unfiltered relay_receive with replay=true to resync this mailbox.';
+  if (cursorNote) text += `\n${cursorNote}`;
   text += `\nNote: tool descriptions cached by this client may still show "${rename.oldId}" until the tool list refreshes; relay_status always shows the current identity.`;
   sendToolText(rename.requestId, text.trim());
   pendingRename = null;
@@ -1566,9 +1694,13 @@ const JOB_TOKEN = readJobToken();
 function registerWithServer(idOverride) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   const claimedId = DELEGATE_FOR || idOverride || (desiredRename ? desiredRename.newId : CLIENT_ID);
+  // Claiming a label other than our own is a rename: ask the server for the
+  // new mailbox's read position, offering that label's saved cursor.
+  const renaming = !DELEGATE_FOR && claimedId !== CLIENT_ID;
   const registration = {
     type: 'register',
     clientId: claimedId,
+    ...(renaming ? { renameCursor: { previous: readStoredCursor(claimedId) } } : {}),
     ...(DELEGATE_FOR
       ? (JOB_TOKEN ? { jobToken: JOB_TOKEN } : {})
       : (readOwnerSecret(claimedId) ? { ownerSecret: readOwnerSecret(claimedId) } : {})),
@@ -1690,6 +1822,12 @@ function connectToRelay() {
             updateRegistry('release');
             CLIENT_ID = desiredRename.newId;
             CLIENT_ID_SOURCE = 'rename';
+            try {
+              const applied = applyRenameCursor(desiredRename.oldId, desiredRename.newId, msg.renameCursor);
+              console.error(`[Claude Relay MCP] ${renameCursorNote(CLIENT_ID, msg.renameCursor, applied)}`);
+            } catch (error) {
+              console.error(`[Claude Relay MCP] Could not update cursors after rename: ${error.message}`);
+            }
             updateRegistry('connect');
             console.error(`[Claude Relay MCP] Rename confirmed on reconnect: ${previous} → ${CLIENT_ID}`);
             desiredRename = null;
@@ -1702,7 +1840,7 @@ function connectToRelay() {
           }
           if (pendingRename && msg.clientId === pendingRename.newId) {
             // Server confirmed the rename: commit identity + registry now.
-            commitRename(pendingRename);
+            commitRename(pendingRename, msg.renameCursor);
             break;
           }
           // Adopt the server-assigned ID (differs from ours only in delegate
@@ -1807,7 +1945,7 @@ function connectToRelay() {
               ? messages.map(m => `[${m.timestamp}] ${m.from}: ${m.content}`).join('\n')
               : 'No messages in history';
             if (msg.unknownCursor) {
-              text = `Warning: the saved or supplied cursor was not found (expired, pruned, or foreign) — nothing was replayed. The saved cursor was retained to prevent an accidental replay. Call relay_receive with replay=true and no from/to/after filter once to resync intentionally.\n${text}`;
+              text = `Warning: the saved or supplied cursor was not found (expired, pruned, or foreign) — nothing was replayed. The saved cursor was retained to prevent an accidental replay. Call relay_receive with replay=true and no from/to/after filter once to resync intentionally; a replay returns recent mail that may already have been handled, so act only on messages you have not already seen.\n${text}`;
             }
             if (msg.cursor) text += `\n\nCursor: ${msg.cursor}`;
             sendMcpResponse({

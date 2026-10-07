@@ -84,6 +84,34 @@ class MessageStore {
     };
   }
 
+  // Read position for a mailbox a session has just renamed onto. Computed by
+  // the server at rename-confirm time, so nothing can land between "where the
+  // mailbox stands" and "the session now owns it".
+  //   kept  — the label's saved cursor still places in its visible history:
+  //           keep it, so mail the label never read is still returned.
+  //   tail  — no usable saved cursor (never used, pruned, foreign): start at
+  //           the newest visible message. Deleting the cursor instead replayed
+  //           already-handled mail (td-98eecf); skippedDirect counts direct
+  //           mail behind the tail so the caller can say how to audit it.
+  //   empty — nothing visible yet: an ISO boundary 1ms before now, so the
+  //           stop hook's backfill still covers mail landing after the rename.
+  renameCursor({ requester, previous } = {}) {
+    if (!requester) return null;
+    const visible = this.readAll().filter(message => this.isVisibleTo(message, requester));
+    // An ISO boundary (what an 'empty' rename saves) always places.
+    if (typeof previous === 'string' && previous
+        && (visible.some(message => message.id === previous)
+          || (/^\d{4}-\d{2}-\d{2}T/.test(previous) && Number.isFinite(Date.parse(previous))))) {
+      return { cursor: previous, source: 'kept' };
+    }
+    if (!visible.length) {
+      return { cursor: new Date(this.now().getTime() - 1).toISOString(), source: 'empty' };
+    }
+    const skippedDirect = visible.filter(message =>
+      message.from !== requester && message.to === requester).length;
+    return { cursor: visible[visible.length - 1].id, source: 'tail', skippedDirect };
+  }
+
   filterMessages(source, { requester, from, to, after, inboundOnly = false }) {
     let messages = source.filter(message => this.isVisibleTo(message, requester));
 

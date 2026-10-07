@@ -168,3 +168,36 @@ test('delegate floor slices by durable order, not wall clock', () => {
   assert.deepEqual(unknown.messages, []);
   assert.equal(unknown.unknownCursor, true);
 });
+
+test('rename cursor keeps a placeable saved position, otherwise starts at the tail', () => {
+  const store = new MessageStore({ dataDir: tempDir() });
+  store.initialize();
+  const read = store.append({ from: 'PEER', to: 'NEW', content: 'already read' });
+  store.append({ from: 'PEER', to: 'NEW', content: 'unread' });
+  const tail = store.append({ from: 'NEW', to: 'PEER', content: 'own send' });
+  store.append({ from: 'PEER', to: 'OTHER', content: 'invisible to NEW' });
+
+  // A saved position NEW can still place is kept: unread mail stays unread.
+  assert.deepEqual(store.renameCursor({ requester: 'NEW', previous: read.id }),
+    { cursor: read.id, source: 'kept' });
+  assert.deepEqual(store.query({ requester: 'NEW', after: read.id, inboundOnly: true })
+    .messages.map(m => m.content), ['unread']);
+
+  // Pruned, never-used, or foreign (another mailbox's id): the newest visible
+  // message, counting the direct mail left behind it.
+  for (const previous of [null, 'pruned-message-id']) {
+    assert.deepEqual(store.renameCursor({ requester: 'NEW', previous }),
+      { cursor: tail.id, source: 'tail', skippedDirect: 2 });
+  }
+  const invisible = store.query({ requester: 'OTHER' }).messages[0].id;
+  assert.equal(store.renameCursor({ requester: 'NEW', previous: invisible }).source, 'tail');
+
+  // Empty mailbox: a timestamp boundary that still admits the next message.
+  const empty = store.renameCursor({ requester: 'FRESH' });
+  assert.equal(empty.source, 'empty');
+  const next = store.append({ from: 'PEER', to: 'FRESH', content: 'first' });
+  assert.deepEqual(store.query({ requester: 'FRESH', after: empty.cursor }).messages.map(m => m.id), [next.id]);
+  // Renaming back onto it later keeps that boundary: 'first' is still unread.
+  assert.deepEqual(store.renameCursor({ requester: 'FRESH', previous: empty.cursor }),
+    { cursor: empty.cursor, source: 'kept' });
+});

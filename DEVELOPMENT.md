@@ -24,6 +24,11 @@ git checkout -b my-feature      # safe: production is a different directory
 npm test                        # tests resolve modules from THIS worktree
 ```
 
+Running the suite from inside a Claude Code session? Use
+`env -u CLAUDE_CODE_SESSION_ID npm test`. Spawned bridges otherwise inherit
+that variable, switch to the `claude-core` tool profile, and take the
+same-session label reclaim path, which some tests do not expect.
+
 `node_modules` is symlinked to the main checkout, so there is nothing to
 install. Tests use `require('../module')` and random ports — they never touch
 production data, and they cannot silently exercise the production tree (they
@@ -60,6 +65,12 @@ launchctl kickstart -k gui/501/com.claude-relay
 The restart is the only step that touches live traffic: in-flight messages are
 already durable, every client reconnects within ~5 seconds, and hook watchers
 re-arm against durable cursors. Do it in a quiet window.
+
+Not everything ships with the restart. `server.js` and `message-store.js`
+change only when the relay restarts. `mcp-server.js` reaches a session only
+when its bridge respawns (`/mcp` reconnect or a session restart). The Stop
+hook and watcher scripts are read fresh on every run, so merging them into
+this checkout makes them live at once.
 
 ## Verifying a release
 

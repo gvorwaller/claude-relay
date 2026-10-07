@@ -111,6 +111,8 @@ const watchers = new Map();
 // One recovery wake per retained mailbox tail for an unknown watch cursor.
 // A new message changes the tail and may wake again; an unchanged stale
 // cursor must not make each Stop-hook re-arm wake the model repeatedly.
+// In-memory by design: a relay restart forgets it, so each still-stale
+// cursor may produce at most one more recovery wake per restart.
 const unknownWatchAlerts = new Map();
 // Small, content-free usage counters reported by MCP bridges. They reset with
 // the relay process and never retain prompts or tool results.
@@ -699,7 +701,14 @@ wss.on('connection', (ws, req) => {
             // we waited — not merely that this socket already had one (a
             // rename legitimately re-registers an identified socket).
             if (clientId !== clientIdAtEntry) return;
-            if (clients.get(requestedClientId) !== existingClient) {
+            // Two different post-probe states (docs/2026-08-28-claude-
+            // reconnect-live-holder-race.md): a DIFFERENT socket now holds the
+            // label (reject), or the probed holder disconnected while the
+            // probe ran (the label is free — the expected reconnect handoff,
+            // so finish this claim). No await follows before clients.set(),
+            // so the free-label claim is atomic.
+            const currentHolder = clients.get(requestedClientId);
+            if (currentHolder && currentHolder !== existingClient) {
               ws.send(JSON.stringify({
                 type: 'register_rejected',
                 clientId: requestedClientId,
@@ -707,7 +716,12 @@ wss.on('connection', (ws, req) => {
               }));
               return;
             }
-            if (holderAlive) {
+            if (!currentHolder) {
+              logger.info('probed_holder_left_during_claim', {
+                clientId: requestedClientId,
+                newRemoteAddress: req.socket.remoteAddress
+              });
+            } else if (holderAlive) {
               const holderPid = (clientMeta.get(requestedClientId) || {}).pid || null;
               logger.warn('register_rejected_label_in_use', {
                 clientId: requestedClientId,
@@ -723,21 +737,22 @@ wss.on('connection', (ws, req) => {
                   + '(or as its delegate). The label frees itself as soon as that connection drops.'
               }));
               return;
+            } else {
+              // No answer: the holder is a corpse (crash, sleep, network
+              // drop). Reclaiming it is exactly the legitimate-reconnect case.
+              logger.info('unresponsive_holder_reclaimed', {
+                clientId: requestedClientId,
+                newRemoteAddress: req.socket.remoteAddress
+              });
+              try {
+                existingClient.send(JSON.stringify({
+                  type: 'error',
+                  message: `Client ID ${requestedClientId} was reclaimed after this connection failed a liveness probe`
+                }));
+              } catch (_) { /* corpse may be unwritable */ }
+              existingClient.displacedByTakeover = true;
+              existingClient.terminate();
             }
-            // No answer: the holder is a corpse (crash, sleep, network drop).
-            // Reclaiming it is exactly the legitimate-reconnect case.
-            logger.info('unresponsive_holder_reclaimed', {
-              clientId: requestedClientId,
-              newRemoteAddress: req.socket.remoteAddress
-            });
-            try {
-              existingClient.send(JSON.stringify({
-                type: 'error',
-                message: `Client ID ${requestedClientId} was reclaimed after this connection failed a liveness probe`
-              }));
-            } catch (_) { /* corpse may be unwritable */ }
-            existingClient.displacedByTakeover = true;
-            existingClient.terminate();
           }
 
           // Contest won (or uncontested): now it is safe to release the
@@ -765,6 +780,25 @@ wss.on('connection', (ws, req) => {
           });
           logger.info('client_registered', { clientId, remoteAddress: req.socket.remoteAddress });
 
+          // A renaming client asks where its new mailbox's read position
+          // stands. Computed here, synchronously with clients.set(), so no
+          // message can land between that position and the confirmation
+          // (td-98eecf). Only renames ask: it reads the whole journal.
+          let renameCursor = null;
+          if (msg.renameCursor && typeof msg.renameCursor === 'object') {
+            try {
+              renameCursor = messageStore.renameCursor({
+                requester: clientId,
+                previous: typeof msg.renameCursor.previous === 'string'
+                  ? msg.renameCursor.previous.slice(0, 128)
+                  : null
+              });
+            } catch (error) {
+              // The client falls back to an explicit resync warning.
+              logger.warn('rename_cursor_failed', { clientId, error: error.message });
+            }
+          }
+
           // Send registration confirmation. A freshly minted owner secret is
           // returned exactly once, here; the client persists it privately and
           // presents it on every later claim of this label.
@@ -772,7 +806,8 @@ wss.on('connection', (ws, req) => {
             type: 'registered',
             clientId,
             peers: Array.from(clients.keys()).filter(id => id !== clientId),
-            ...(mintedOwnerSecret ? { ownerSecret: mintedOwnerSecret } : {})
+            ...(mintedOwnerSecret ? { ownerSecret: mintedOwnerSecret } : {}),
+            ...(renameCursor ? { renameCursor } : {})
           }));
 
           // Broadcast peer update to others. On a rename, first announce the

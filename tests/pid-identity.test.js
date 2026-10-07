@@ -240,6 +240,30 @@ test('an unresponsive holder is reclaimed (legitimate reconnect after a drop)', 
   assert.equal((await registered).clientId, 'DEADSOCK');
 });
 
+// docs/2026-08-28-claude-reconnect-live-holder-race.md: a reconnecting bridge
+// raced its predecessor's socket close and was told the label "changed
+// hands", then suspended forever. A holder that merely LEAVES during the
+// probe frees the label for the claimant.
+test('a holder that disconnects during its liveness probe yields the label', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-'));
+  const port = startServer(t, root);
+
+  const holder = await connectWithRetry(port, 'HANDOFF', { pid: process.pid });
+  holder.pong = () => {};
+  holder._receiver.removeAllListeners('ping');
+  holder.pause();
+
+  const claimant = await open(port);
+  t.after(() => claimant.close());
+  const outcome = waitForMessage(claimant, msg =>
+    msg.type === 'registered' || msg.type === 'register_rejected', 25000);
+  claimant.send(JSON.stringify({ type: 'register', clientId: 'HANDOFF', meta: { pid: process.pid } }));
+  setTimeout(() => holder.terminate(), 300); // mid-probe: first retry is ~3s out
+  const result = await outcome;
+  assert.equal(result.type, 'registered', result.reason);
+  assert.equal(result.clientId, 'HANDOFF');
+});
+
 test('delegate reads and speaks as its base label without ever owning it', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-pid-')));
   const { configPath, outDir } = notifyConfigForTokens(root);

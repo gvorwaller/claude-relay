@@ -292,3 +292,122 @@ test('server fires exec notify hooks with context env, without touching message 
   }
   assert.equal(marker, 'CODEXTEST A 0');
 });
+
+// td-98eecf #2: the Stop hook resolved its label once and re-armed it forever,
+// so after relay_rename a listener kept watching the abandoned label while
+// the next Stop armed a second one. A fake "claude" process owns a fake
+// bridge (the registry pid) and runs the hook as its child on demand.
+function stopHookHarness(t, port, extraEnv = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-stop-hook-')));
+  const scripts = path.join(root, 'claude-relay', 'scripts');
+  const sessions = path.join(root, 'claude-relay', 'sessions');
+  const tmp = path.join(root, 'tmp');
+  for (const dir of [scripts, sessions, tmp]) fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(path.join(__dirname, '..', 'scripts', 'relay-watch.js'), path.join(scripts, 'relay-watch.js'));
+  const hook = path.join(__dirname, '..', 'scripts', 'relay-stop-hook.sh');
+  const claude = spawn('/bin/bash', ['-c', `
+    sleep 600 & echo $! > "$D/bridge.pid"
+    n=0
+    while :; do
+      if [ -f "$D/go" ]; then
+        rm -f "$D/go"; n=$((n+1))
+        ( /bin/bash \${HOOK_TRACE:-} "$HOOK" 2> "$D/hook$n.err"; echo $? > "$D/hook$n.code" ) &
+      fi
+      sleep 0.05
+    done`], {
+    env: {
+      ...process.env, D: root, HOOK: hook, HOME: root, TMPDIR: tmp,
+      RELAY_URL: `ws://127.0.0.1:${port}`, RELAY_NODE_BIN: process.execPath, ...extraEnv
+    },
+    stdio: 'ignore',
+    detached: true
+  });
+  t.after(() => { try { process.kill(-claude.pid, 'SIGKILL'); } catch {} });
+  const until = async (predicate, timeout = 8000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const value = await predicate();
+      if (value) return value;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('Timed out waiting for stop-hook state');
+  };
+  const read = file => { try { return fs.readFileSync(path.join(root, file), 'utf8').trim(); } catch { return null; } };
+  const lock = path.join(tmp, `claude-relay-stop-hook-session-${claude.pid}.lock`, 'owner');
+  return {
+    root, tmp, claude, read, until,
+    owner: () => { try { return fs.readFileSync(lock, 'utf8').trim().split(' '); } catch { return null; } },
+    lockExists: () => fs.existsSync(path.dirname(lock)),
+    register: label => fs.writeFileSync(path.join(sessions, 'registry.json'),
+      JSON.stringify({ [label]: { pid: Number(read('bridge.pid')), cwd: root } })),
+    stop: () => fs.writeFileSync(path.join(root, 'go'), '')
+  };
+}
+
+function alive(pid) {
+  try { process.kill(Number(pid), 0); return true; } catch { return false; }
+}
+
+test('Stop hook keeps one listener per session and follows a rename', async t => {
+  const relayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
+  const port = startServer(t, relayRoot);
+  const peer = await connectWithRetry(port, 'PEER');
+  t.after(() => peer.close());
+  const h = stopHookHarness(t, port);
+  await h.until(() => h.read('bridge.pid'));
+
+  // A listener from the per-label version, owned by this same session.
+  const legacy = spawn('/bin/bash', ['-c', 'exec -a relay-stop-hook-legacy sleep 600'], { stdio: 'ignore' });
+  t.after(() => legacy.kill('SIGKILL'));
+  const legacyLock = path.join(h.tmp, 'claude-relay-stop-hook-OLDL.lock');
+  fs.mkdirSync(legacyLock);
+  fs.writeFileSync(path.join(legacyLock, 'owner'), `${legacy.pid} ${h.claude.pid} legacy-token\n`);
+
+  h.register('OLDL');
+  h.stop();
+  const [firstHook, , , firstLabel] = await h.until(() => h.owner()?.[3] === 'OLDL' && h.owner());
+  assert.equal(firstLabel, 'OLDL');
+  await h.until(() => !alive(legacy.pid));
+  assert.equal(fs.existsSync(legacyLock), false, 'legacy per-label lock reaped');
+
+  // A repeated Stop for the same label is a no-op.
+  h.stop();
+  assert.equal(await h.until(() => h.read('hook2.code')), '0');
+  assert.equal(h.owner()[0], firstHook);
+
+  // relay_rename: the next Stop takes the session's listener over.
+  h.register('NEWL');
+  h.stop();
+  await h.until(() => h.owner()?.[3] === 'NEWL');
+  await h.until(() => !alive(firstHook));
+  const [secondHook] = h.owner();
+  assert.notEqual(secondHook, firstHook);
+
+  // Without a saved cursor the listener arms from "now": wait until its
+  // watcher is subscribed before sending.
+  await h.until(async () => {
+    const sessions = waitForMessage(peer, msg => msg.type === 'sessions');
+    peer.send(JSON.stringify({ type: 'get_sessions' }));
+    return Object.keys((await sessions).sessions).some(id => id.startsWith('NEWL-watch-'));
+  });
+  peer.send(JSON.stringify({ type: 'message', to: 'NEWL', content: 'for the new label' }));
+  assert.equal(await h.until(() => h.read('hook3.code')), '2');
+  assert.match(h.read('hook3.err'), /Relay mail is waiting for NEWL/);
+  await h.until(() => !h.lockExists());
+});
+
+test('a running Stop hook stands down when its session is renamed', async t => {
+  const relayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
+  const port = startServer(t, relayRoot);
+  const h = stopHookHarness(t, port, { RELAY_STOP_HOOK_WATCH_TIMEOUT: '1' });
+  await h.until(() => h.read('bridge.pid'));
+  h.register('OLDL');
+  h.stop();
+  await h.until(() => h.owner()?.[3] === 'OLDL');
+  // Let it get past its first pass and into 1s watch re-arms.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(h.read('hook1.code'), null, 'still listening for OLDL');
+  h.register('NEWL');
+  assert.equal(await h.until(() => h.read('hook1.code')), '0');
+  assert.equal(h.lockExists(), false, 'lock released for the next Stop');
+});
