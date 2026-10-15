@@ -28,6 +28,7 @@ test('monitor renders terminal timing, failure reason, directory and active timi
       getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
       createElement() { return new Element(); }
     },
+    setInterval() {},
     EventSource: class { addEventListener() {} },
     fetch: async url => url.includes('/jobs/') ? { ok: true, json: async () => job } : new Promise(() => {}),
     window: { location: { replace() {} } },
@@ -54,6 +55,7 @@ test('monitor preserves work-card nodes across snapshot refreshes so clicks surv
       getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
       createElement() { return new Element(); }
     },
+    setInterval() {},
     EventSource: class { addEventListener() {} },
     fetch: async () => new Promise(() => {}),
     window: { location: { replace() {} } }
@@ -73,4 +75,25 @@ test('monitor preserves work-card nodes across snapshot refreshes so clicks surv
   `, context);
   assert.strictEqual(context.firstCard, context.secondCard);
   assert.match(context.secondCard.textContent, /ended 6s ago/);
+});
+
+test('old or disconnected snapshots cannot present current healthy status', () => {
+  const elements = new Map();
+  const context = vm.createContext({
+    document: {
+      getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
+      createElement() { return new Element(); }
+    },
+    setInterval() {}, EventSource: class { addEventListener() {} },
+    fetch: async () => new Promise(() => {}), window: { location: { replace() {} } }
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../monitor-web/public/app.js'), 'utf8'), context);
+  vm.runInContext(`lastPayload = { generatedAt: new Date(Date.now()-60000).toISOString(),
+    agent: {connected:true,state:'fresh'}, health: {state:'healthy',results:[{level:'pass',text:'Relay running'}]} }; renderFreshness()`, context);
+  assert.match(elements.get('health').textContent, /Stale snapshot/);
+  assert.match(elements.get('updated').textContent, /Last updated/);
+  vm.runInContext(`lastPayload.generatedAt = new Date().toISOString(); renderFreshness()`, context);
+  assert.match(elements.get('health').textContent, /Healthy/);
+  vm.runInContext(`lastPayload.agent.connected = false; renderFreshness()`, context);
+  assert.match(elements.get('health').textContent, /Stale snapshot/);
 });

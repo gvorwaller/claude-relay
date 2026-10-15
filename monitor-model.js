@@ -258,7 +258,7 @@ function projectIdentities(topology) {
         identity,
         live: peers.has(identity),
         host: typeof meta.host === 'string' ? meta.host : null,
-        cwdBasename: typeof meta.cwd === 'string' ? path.basename(meta.cwd) : null,
+        cwdBasename: typeof meta.cwd === 'string' ? safeText(path.basename(meta.cwd)) : null,
         source: typeof meta.source === 'string' ? meta.source : null,
         credentialWarning: pending.has(identity)
       };

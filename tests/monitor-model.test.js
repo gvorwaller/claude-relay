@@ -195,3 +195,16 @@ test('stop preview is exact, state-bound, expiring, and single-use', async t => 
   await assert.rejects(controller.confirm(jobId, expired.confirmationToken), /expired/);
   assert.equal(terminated.length, 1);
 });
+
+test('credential-like directory names are redacted before protocol validation', () => {
+  const { assertDataMinimized } = require('../monitor-protocol');
+  const identities = projectIdentities({ registeredSessions: {
+    CODEX1: { cwd: '/tmp/plugin-creator-plugin-plugin-connector-1p' },
+    CODEX2: { cwd: '/tmp/birds' },
+    CODEX3: { cwd: '/tmp/sk-thiscredentialmustnotleavehost' }
+  } });
+  assert.equal(identities[0].cwdBasename, '[redacted credential]');
+  assert.equal(identities[1].cwdBasename, 'birds');
+  assert.equal(identities[2].cwdBasename, '[redacted credential]');
+  assert.doesNotThrow(() => assertDataMinimized({ identities }));
+});

@@ -34,7 +34,7 @@ main { display: grid; gap: 32px; padding-bottom: 72px; }
 .health-card { border-radius: 18px; overflow: hidden; }
 .health-state { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); }
 .health-state.healthy strong { color: var(--green); }
-.health-state.needs_attention strong { color: var(--yellow); }
+.health-state.stale strong, .health-state.needs_attention strong { color: var(--yellow); }
 .health-state.offline strong { color: var(--red); }
 .health-state span { color: var(--muted); font-size: .8rem; }
 .checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 24px; margin: 0; padding: 18px 20px; list-style: none; }

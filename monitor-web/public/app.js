@@ -49,12 +49,20 @@ function renderAgent(agent) {
     : (agent.state === 'fresh' ? 'Reconnecting' : agent.state === 'stale' ? 'Stale' : 'Offline');
 }
 
-function renderHealth(snapshot) {
+function renderFreshness() {
+  if (!lastPayload?.health) return;
+  const stale = !lastPayload.agent?.connected || lastPayload.agent?.state !== 'fresh'
+    || Date.now() - Date.parse(lastPayload.generatedAt) >= 30000;
+  elements.updated.textContent = `${stale ? 'Stale snapshot · Last updated' : 'Updated'} ${new Date(lastPayload.generatedAt).toLocaleTimeString()}`;
+  renderHealth(lastPayload, stale);
+}
+
+function renderHealth(snapshot, stale = false) {
   const health = snapshot.health;
   elements.health.replaceChildren();
-  const headline = node('div', `health-state ${health.state}`);
-  headline.append(node('strong', '', health.state === 'healthy' ? 'Healthy' : health.state === 'offline' ? 'Offline' : 'Needs attention'));
-  headline.append(node('span', '', `${health.results.filter(result => result.level === 'pass').length} checks passing`));
+  const headline = node('div', `health-state ${stale ? 'stale' : health.state}`);
+  headline.append(node('strong', '', stale ? 'Stale snapshot' : health.state === 'healthy' ? 'Healthy' : health.state === 'offline' ? 'Offline' : 'Needs attention'));
+  headline.append(node('span', '', `${health.results.filter(result => result.level === 'pass').length} checks ${stale ? 'passed at last update' : 'passing'}`));
   elements.health.append(headline);
   const checks = node('ul', 'checks');
   health.results.forEach(result => {
@@ -382,8 +390,7 @@ function render(payload) {
     empty(elements.identities, 'No identity snapshot.');
     return;
   }
-  elements.updated.textContent = `Updated ${new Date(payload.generatedAt).toLocaleTimeString()}`;
-  renderHealth(payload);
+  renderFreshness();
   renderJobs(elements.active, elements['active-count'], payload.activeWork, 'No active delegated work.');
   renderJobs(elements.recent, elements['recent-count'], payload.recentWork, 'No recent delegated work.');
   renderIdentities(payload.identities);
@@ -537,10 +544,14 @@ const events = new EventSource('/api/v1/events');
 events.addEventListener('snapshot', event => render(JSON.parse(event.data)));
 events.addEventListener('agent', event => {
   const agent = JSON.parse(event.data);
+  if (lastPayload) lastPayload.agent = agent;
   renderAgent(agent);
+  renderFreshness();
   if (!agent.connected || agent.state !== 'fresh') {
     features.stopDelegate = false;
     features.admin = {};
     if (lastPayload) renderAdmin(lastPayload);
   }
 });
+
+setInterval(renderFreshness, 5000);

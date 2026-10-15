@@ -152,7 +152,6 @@ function createMonitorAgent(options = {}) {
       state.reconnectTimer = null;
       connect();
     }, delay);
-    state.reconnectTimer.unref?.();
   }
 
   function connect() {
@@ -170,6 +169,11 @@ function createMonitorAgent(options = {}) {
     socket.on('message', raw => {
       try {
         const message = parseEnvelope(raw, { readOnlyAgent: !enableCommands });
+        if (message.type === 'protocol_error') {
+          logger.warn?.('relay-monitor-agent: server rejected monitor data');
+          socket.close(1008, 'Monitor protocol rejected');
+          return;
+        }
         if (!state.authenticated) {
           if (message.type !== 'agent_hello' || message.sequence !== 0) throw new Error('Monitor handshake rejected');
           const { challenge, installationId: expectedInstallation } = message.payload;
@@ -191,7 +195,7 @@ function createMonitorAgent(options = {}) {
         socket.close(1008, 'Monitor handshake rejected');
       }
     });
-    socket.on('error', () => {});
+    socket.on('error', error => logger.warn?.(`relay-monitor-agent transport error: ${error.code || 'connection failed'}`));
     socket.on('close', () => {
       if (state.socket === socket) state.socket = null;
       state.connected = false;
