@@ -60,6 +60,9 @@ const adminSecret = readOrCreateAdminSecret(adminSecretPath);
 const ownerAdmin = new OwnerAdmin({
   capabilities,
   dataDir: DATA_ROOT,
+  registryPath: process.env.RELAY_SESSION_REGISTRY
+    || (process.env.RELAY_MESSAGE_DIR ? path.join(DATA_ROOT, 'sessions', 'registry.json')
+      : path.join(__dirname, 'sessions', 'registry.json')),
   ownerDir: process.env.RELAY_OWNER_SECRETS_DIR
     || (process.env.RELAY_MESSAGE_DIR
       ? path.join(DATA_ROOT, 'owners')

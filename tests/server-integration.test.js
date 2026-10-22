@@ -231,6 +231,9 @@ test('server persists authorized history, preserves it on cache clear, and gates
   assert.equal(liveRemoved.identity, 'LIVEAUTO');
   assert.equal(liveRemoved.liveConnectionStopped, true);
   assert.equal((await shutdownRequested).clientId, 'LIVEAUTO');
+  const registryPath = path.join(root, 'sessions', 'registry.json');
+  fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+  fs.writeFileSync(registryPath, JSON.stringify({ REMOVE1: { pid: process.pid }, A: { pid: process.pid } }));
   operator.send(JSON.stringify({
     type: 'operator_preview_owner_removal', clientId: 'REMOVE1', adminSecret: localSecret
   }));
@@ -247,6 +250,7 @@ test('server persists authorized history, preserves it on cache clear, and gates
   }));
   assert.equal((await nextMessage(operator, 'owner_removed')).identity, 'REMOVE1');
   assert.equal(fs.existsSync(path.join(root, 'owners', 'REMOVE1.secret')), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath)), { A: { pid: process.pid } });
   const persistedOwners = JSON.parse(fs.readFileSync(path.join(root, 'owners.json'), 'utf8'));
   assert.equal(Object.hasOwn(persistedOwners, 'REMOVE1'), false);
   operator.send(JSON.stringify({

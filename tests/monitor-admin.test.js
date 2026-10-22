@@ -98,14 +98,18 @@ test('admin target schemas reject unknown fields, hostile identities, and separa
 
 test('all-offline identity removal rechecks the registry and preserves live and active sessions', async t => {
   const removals = [];
-  const { controller } = fixture(t, {
+  const { controller, calls } = fixture(t, {
     operations: {
+      operatorRemovableOwners: async () => [
+        { identity: 'CODEX2', live: false }, { identity: 'ORPHAN1', live: false },
+        { identity: 'LIVE1', live: true }, { identity: 'BUSY1', live: false }
+      ],
       relayTopology: async () => ({
         peers: ['LIVE1'], registeredSessions: { CODEX2: {}, LIVE1: {}, STALE1: {}, BUSY1: {} }
       }),
       readJobRecords: () => [{ owner: 'BUSY1', status: 'running' }],
       registryRemovalPreview: (_root, identities) => ({
-        identities: identities.slice(), confirmation: 'registry-confirmation'
+        identities: identities.filter(id => id !== 'ORPHAN1'), confirmation: 'registry-confirmation'
       }),
       removeRegistrySessions: (_root, identities, confirmation) => {
         removals.push([identities.slice(), confirmation]);
@@ -114,12 +118,14 @@ test('all-offline identity removal rechecks the registry and preserves live and 
     }
   });
   const preview = await controller.preview('remove_identity', { scope: 'offline' });
-  assert.deepEqual(preview.summary.identities, ['CODEX2', 'STALE1']);
+  assert.deepEqual(preview.summary.identities, ['CODEX2', 'ORPHAN1', 'STALE1']);
   assert.equal(preview.summary.liveSessionsPreserved, true);
   assert.equal(preview.summary.activeWorkPreserved, true);
   const result = await controller.confirm('remove_identity', preview.confirmationToken);
-  assert.equal(result.removedCount, 2);
+  assert.equal(result.removedCount, 3);
   assert.deepEqual(removals, [[['CODEX2', 'STALE1'], 'registry-confirmation']]);
+  assert.deepEqual(calls.filter(call => call[0] === 'owner' && call[1] === 'remove')
+    .map(call => call[2]), ['CODEX2', 'ORPHAN1']);
 });
 
 test('all five exact actions return metadata-only previews and invoke existing local operations', async t => {

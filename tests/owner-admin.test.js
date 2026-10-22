@@ -71,3 +71,38 @@ test('owner removal deletes the capability and saved secret after exact preview'
   assert.equal(fs.existsSync(rotated.secretPath), false);
   assert.equal(fs.readdirSync(path.join(admin.dataDir, 'owner-removals')).length, 0);
 });
+
+
+test('identity removal clears only its registry entry and preserves history', t => {
+  const { root, capabilities, admin } = setup(t);
+  admin.registryPath = path.join(root, 'registry.json');
+  const registry = { REMOVE1: { pid: process.pid }, KEEP1: { pid: process.pid } };
+  fs.writeFileSync(admin.registryPath, JSON.stringify(registry));
+  const history = path.join(root, 'history.json');
+  fs.writeFileSync(history, 'preserved history');
+  admin.rotate('REMOVE1');
+  const preview = capabilities.previewOwnerRemoval('REMOVE1');
+  admin.remove('REMOVE1', 'wrong');
+  assert.deepEqual(JSON.parse(fs.readFileSync(admin.registryPath)), registry);
+  admin.remove('REMOVE1', preview.confirmation);
+  assert.deepEqual(JSON.parse(fs.readFileSync(admin.registryPath)), { KEEP1: registry.KEEP1 });
+  assert.equal(fs.readFileSync(history, 'utf8'), 'preserved history');
+  const backups = fs.readdirSync(path.join(root, 'backups'));
+  assert.equal(backups.length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'backups', backups[0]))), registry);
+});
+
+test('interrupted registry cleanup leaves a journal and completes on recovery', t => {
+  const { root, capabilities, admin } = setup(t);
+  admin.registryPath = path.join(root, 'registry.json');
+  admin.rotate('RETRY1');
+  fs.writeFileSync(admin.registryPath, 'malformed');
+  const preview = capabilities.previewOwnerRemoval('RETRY1');
+  assert.throws(() => admin.remove('RETRY1', preview.confirmation));
+  assert.equal(capabilities.hasOwner('RETRY1'), false);
+  assert.equal(fs.existsSync(admin.removalJournalPath('RETRY1')), true);
+  fs.writeFileSync(admin.registryPath, JSON.stringify({ RETRY1: { pid: process.pid }, KEEP1: {} }));
+  admin.recover();
+  assert.deepEqual(JSON.parse(fs.readFileSync(admin.registryPath)), { KEEP1: {} });
+  assert.equal(fs.existsSync(admin.removalJournalPath('RETRY1')), false);
+});

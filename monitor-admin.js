@@ -159,17 +159,28 @@ function createAdminController(dataRoot, options = {}) {
         const live = new Set(Array.isArray(topology.peers) ? topology.peers : []);
         const active = new Set(ops.readJobRecords(dataRoot)
           .filter(job => ['spawned', 'running'].includes(job.status)).map(job => job.owner));
-        const candidates = Object.keys(topology.registeredSessions || {})
+        const owners = await ops.operatorRemovableOwners(dataRoot, options.operatorOptions || {});
+        const candidates = [...new Set([...Object.keys(topology.registeredSessions || {}),
+          ...owners.filter(owner => !owner.live).map(owner => owner.identity)])]
           .filter(identity => !live.has(identity) && !active.has(identity)).sort();
         const local = ops.registryRemovalPreview(dataRoot, candidates, options.registryOptions || {});
-        const identities = local.identities;
+        const identities = candidates.filter(identity => local.identities.includes(identity)
+          || owners.some(owner => owner.identity === identity && !owner.live));
+        const enrollments = [];
+        for (const identity of identities) {
+          if (!owners.some(owner => owner.identity === identity && !owner.live)) continue;
+          const preview = await ops.operatorOwnerRemoval(dataRoot, 'preview', identity,
+            { disconnectLive: false }, options.operatorOptions || {});
+          if (preview.live) throw new Error('state_changed');
+          enrollments.push({ identity, confirmation: preview.confirmation });
+        }
         if (!identities.length) throw new Error('identity_not_removable');
         const summary = {
           scope: 'offline', identity: null, eligibleCount: identities.length, identities,
           liveSessionsPreserved: true, activeWorkPreserved: true,
           messagesPreserved: true, completedActivityPreserved: true
         };
-        return { summary, binding: { identities, confirmation: local.confirmation }, local: { identities, confirmation: local.confirmation } };
+        return { summary, binding: { identities, enrollments, confirmation: local.confirmation }, local: { identities: local.identities, enrollments, confirmation: local.confirmation } };
       }
       const candidates = await ops.operatorRemovableOwners(dataRoot, options.operatorOptions || {});
       const candidate = candidates.find(item => item.identity === target.identity);
@@ -217,7 +228,7 @@ function createAdminController(dataRoot, options = {}) {
       local: state.local, summary: state.summary, expiresAtMs, connectionGeneration
     });
     const consequences = action === 'remove_identity' && target.scope === 'offline'
-      ? ['Every still-offline registry entry is forgotten.', 'Live sessions and active work are preserved.', 'Messages and completed activity are preserved.']
+      ? ['Offline identities are removed from the registry and credential store.', 'Live sessions and active work are preserved.', 'Messages and completed activity are preserved.']
       : CONSEQUENCES[action];
     return { action, summary: state.summary, consequences, confirmationToken, expiresAt: new Date(expiresAtMs).toISOString() };
   }
@@ -263,11 +274,15 @@ function createAdminController(dataRoot, options = {}) {
         result = { action, outcome: entry.summary.live ? 'reconnecting_for_confirmation' : 'ready_for_next_start', identity: entry.target.identity };
       } else if (action === 'remove_identity') {
         if (entry.target.scope === 'offline') {
-          const response = ops.removeRegistrySessions(dataRoot, current.local.identities,
+          ops.removeRegistrySessions(dataRoot, current.local.identities,
             current.local.confirmation, options.registryOptions || {});
+          for (const owner of current.local.enrollments) {
+            await ops.operatorOwnerRemoval(dataRoot, 'remove', owner.identity,
+              { confirmation: owner.confirmation, disconnectLive: false }, options.operatorOptions || {});
+          }
           result = {
             action, outcome: 'offline_identities_removed', scope: 'offline', identity: null,
-            removedCount: Number(response.removedCount) || 0, liveSessionsPreserved: true,
+            removedCount: current.summary.eligibleCount, liveSessionsPreserved: true,
             activeWorkPreserved: true, messagesPreserved: true, completedActivityPreserved: true
           };
         } else {

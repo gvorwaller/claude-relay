@@ -47,6 +47,7 @@ class OwnerAdmin {
     this.capabilities = options.capabilities;
     this.dataDir = options.dataDir;
     this.ownerDir = options.ownerDir;
+    this.registryPath = options.registryPath || null;
     this.logger = options.logger || { info() {}, warn() {}, error() {} };
     this.journalDir = path.join(this.dataDir, 'owner-rotations');
     this.removalJournalDir = path.join(this.dataDir, 'owner-removals');
@@ -89,6 +90,25 @@ class OwnerAdmin {
     }
   }
 
+  removeRegistration(label) {
+    if (!this.registryPath) return;
+    try {
+      const registry = JSON.parse(fs.readFileSync(this.registryPath, 'utf8'));
+      if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+        throw new Error('Invalid session registry');
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    const { registryRemovalPreview, removeRegistrySessions } = require('./monitor-control');
+    // The server has already authorized stopping this exact bridge. Its PID may
+    // still be alive until the cooperative shutdown message is processed.
+    const options = { registryPath: this.registryPath, pidAlive: () => false };
+    const preview = registryRemovalPreview(this.dataDir, [label], options);
+    removeRegistrySessions(this.dataDir, [label], preview.confirmation, options);
+  }
+
   remove(label, confirmation) {
     if (!LABEL_PATTERN.test(label) || label.toLowerCase() === 'all') {
       throw new Error('Invalid owner label');
@@ -104,6 +124,7 @@ class OwnerAdmin {
     try { fs.unlinkSync(this.secretPath(label)); } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
+    this.removeRegistration(label);
     fs.unlinkSync(journal);
     this.logger.warn('owner_identity_removed', { label, generation: result.generation });
     return result;
@@ -122,6 +143,7 @@ class OwnerAdmin {
         try { fs.unlinkSync(this.secretPath(record.label)); } catch (error) {
           if (error.code !== 'ENOENT') throw error;
         }
+        this.removeRegistration(record.label);
         fs.unlinkSync(journal);
         this.logger.warn('owner_removal_recovered', { label: record.label });
       } catch (error) {

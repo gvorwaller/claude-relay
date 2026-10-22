@@ -793,3 +793,17 @@ claude-relay/
 ## License
 
 MIT
+
+
+### Identity removal and registry cleanup
+
+The monitor's **Remove identity** action removes the identity's enrollment,
+saved owner credential, and local session-registry entry together. The
+**all offline** scope also includes orphaned enrollment records that no longer
+have a registry entry. Live sessions and active delegated work are protected;
+removing a specific live identity requires the existing explicit stop-bridge flow.
+Messages and completed activity remain available. Registry changes are backed up,
+and interrupted individual cleanup is resumed from its removal journal at startup.
+
+`relay_clear_sessions` remains a registry-only maintenance tool; use the monitor's
+identity-removal action to remove credentials and enrollment as well.
