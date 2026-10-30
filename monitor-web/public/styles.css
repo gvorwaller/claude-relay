@@ -57,6 +57,10 @@ main { display: grid; gap: 32px; padding-bottom: 72px; }
 .facts .danger { color: var(--red); background: #381c1e; }
 .identity-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .identity-card { padding: 16px; border-radius: 15px; }
+.identity-heading .ended { color: var(--muted); background: #242b33; }
+.ended-identities { grid-column: 1 / -1; }
+.ended-identities summary { padding: 12px 0; color: var(--muted); font-size: .9rem; font-weight: 750; cursor: pointer; }
+.ended-identities .identity-card { opacity: .8; }
 .admin-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
 .admin-card { padding: 18px; border-radius: 15px; }
 .admin-card.highest-risk { border-color: #603338; }

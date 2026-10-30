@@ -25,9 +25,10 @@ npm test                        # tests resolve modules from THIS worktree
 ```
 
 Running the suite from inside a Claude Code session? Use
-`env -u CLAUDE_CODE_SESSION_ID npm test`. Spawned bridges otherwise inherit
-that variable, switch to the `claude-core` tool profile, and take the
-same-session label reclaim path, which some tests do not expect.
+`env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_BRIDGE_SESSION_ID npm test`.
+Spawned bridges otherwise inherit those variables, switch to the
+`claude-core` tool profile, and take the same-session and reconnect label
+reclaim paths, which some tests do not expect.
 
 `node_modules` is symlinked to the main checkout, so there is nothing to
 install. Tests use `require('../module')` and random ports — they never touch

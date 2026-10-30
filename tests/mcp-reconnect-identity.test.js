@@ -276,6 +276,9 @@ test('ordinary background work cannot steal a matching foreground transcript ide
     env: {
       CLAUDE_RELAY_SESSION_ID: 'CC2',
       CLAUDE_CODE_SESSION_ID: currentSession,
+      // Ordinary background work has no bridge token; never inherit the
+      // token of a Claude session that happens to run this suite.
+      CLAUDE_CODE_BRIDGE_SESSION_ID: '',
       CLAUDE_PROJECT_DIR: project,
       RELAY_BACKGROUND_FORK: '1'
     }

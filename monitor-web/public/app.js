@@ -138,20 +138,39 @@ function renderJobs(container, count, jobs, emptyText) {
   }
 }
 
+function identityCard(identity) {
+  const card = node('article', 'identity-card');
+  const heading = node('div', 'identity-heading');
+  const ended = !identity.live && Number.isFinite(identity.endedAgeMs);
+  heading.append(node('strong', '', identity.identity),
+    node('span', identity.live ? 'live' : ended ? 'ended' : 'offline', identity.live ? 'Live' : ended ? 'Ended' : 'Offline'));
+  card.append(heading);
+  const parts = [identity.host, identity.source].filter(Boolean);
+  card.append(node('p', '', parts.join(' · ') || 'No connection details'));
+  card.append(node('p', 'working-directory', `Working directory: ${identity.cwdBasename || 'Unknown'}`));
+  if (ended) card.append(node('p', '', `Ended ${age(identity.endedAgeMs)} ago`));
+  if (identity.credentialWarning) card.append(node('p', 'warning', 'Owner credential not confirmed'));
+  return card;
+}
+
+// Sessions whose bridge exited stay known (a restart reclaims the name), but
+// they are history: folded below the current ones, most recent first.
 function renderIdentities(identities) {
-  elements['identity-count'].textContent = String(identities.length);
+  const ended = identities.filter(identity => !identity.live && Number.isFinite(identity.endedAgeMs))
+    .sort((a, b) => a.endedAgeMs - b.endedAgeMs);
+  const current = identities.filter(identity => !ended.includes(identity));
+  elements['identity-count'].textContent = String(current.length);
   if (!identities.length) return empty(elements.identities, 'No identities reported.');
-  elements.identities.replaceChildren(...identities.map(identity => {
-    const card = node('article', 'identity-card');
-    const heading = node('div', 'identity-heading');
-    heading.append(node('strong', '', identity.identity), node('span', identity.live ? 'live' : 'offline', identity.live ? 'Live' : 'Offline'));
-    card.append(heading);
-    const parts = [identity.host, identity.source].filter(Boolean);
-    card.append(node('p', '', parts.join(' · ') || 'No connection details'));
-    card.append(node('p', 'working-directory', `Working directory: ${identity.cwdBasename || 'Unknown'}`));
-    if (identity.credentialWarning) card.append(node('p', 'warning', 'Owner credential not confirmed'));
-    return card;
-  }));
+  const cards = current.map(identityCard);
+  if (!current.length) cards.push(node('p', 'empty', 'No current identities.'));
+  if (ended.length) {
+    const fold = node('details', 'ended-identities');
+    const list = node('div', 'identity-grid');
+    list.append(...ended.map(identityCard));
+    fold.append(node('summary', '', `Ended sessions (${ended.length})`), list);
+    cards.push(fold);
+  }
+  elements.identities.replaceChildren(...cards);
 }
 
 const ADMIN_ACTIONS = {

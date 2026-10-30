@@ -44,6 +44,25 @@ test('monitor renders terminal timing, failure reason, directory and active timi
   assert.match(vm.runInContext('jobCard({...job,status:"spawned",error:null}).textContent', context), /starting <1s/);
   vm.runInContext('renderIdentities([{identity:"CODEX20",live:true,cwdBasename:"birds"}])', context);
   assert.match(elements.get('identities').textContent, /Working directory: birds/);
+  vm.runInContext(`renderIdentities([
+    {identity:"CODEX1",live:true,cwdBasename:"birds",endedAgeMs:null},
+    {identity:"GROK",live:false,cwdBasename:"birds",endedAgeMs:null},
+    {identity:"CODEX9",live:false,cwdBasename:"giftlist",endedAgeMs:7200000},
+    {identity:"CODEX8",live:false,cwdBasename:"listsurf",endedAgeMs:60000}
+  ])`, context);
+  const shown = elements.get('identities').children;
+  assert.equal(elements.get('identity-count').textContent, '2');
+  assert.deepEqual(shown.slice(0, 2).map(card => card.className), ['identity-card', 'identity-card']);
+  assert.match(shown[1].textContent, /GROK Offline/);
+  const fold = shown[2];
+  assert.equal(shown.length, 3);
+  assert.equal(fold.className, 'ended-identities');
+  assert.equal(fold.children[0].textContent, 'Ended sessions (2)');
+  assert.deepEqual(fold.children[1].children.map(card => card.children[0].children[0].textContent), ['CODEX8', 'CODEX9']);
+  assert.match(fold.children[1].children[0].textContent, /CODEX8 Ended .*Ended 1m ago/);
+  vm.runInContext('renderIdentities([{identity:"CODEX9",live:false,cwdBasename:"giftlist",endedAgeMs:5000}])', context);
+  assert.match(elements.get('identities').children[0].textContent, /No current identities/);
+  assert.equal(elements.get('identity-count').textContent, '0');
   await vm.runInContext('showDetail("wake_test")', context);
   assert.match(elements.get('detail-body').textContent, /Failure Codex refused/);
 });

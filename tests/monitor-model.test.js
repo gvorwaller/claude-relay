@@ -88,10 +88,28 @@ test('identity projection reduces cwd to basename and omits session process deta
     registeredSessions: { CC1: { cwd: '/Users/person/other' } }
   });
   assert.deepEqual(identities, [
-    { identity: 'CC1', live: false, host: null, cwdBasename: 'other', source: null, credentialWarning: true },
-    { identity: 'CODEX', live: true, host: 'Mac', cwdBasename: 'repo', source: 'codex', credentialWarning: false }
+    { identity: 'CC1', live: false, endedAgeMs: null, host: null, cwdBasename: 'other', source: null, credentialWarning: true },
+    { identity: 'CODEX', live: true, endedAgeMs: null, host: 'Mac', cwdBasename: 'repo', source: 'codex', credentialWarning: false }
   ]);
   assert.doesNotMatch(JSON.stringify(identities), /Users|999/);
+});
+
+test('identities say how long ago an offline session ended; live and never-ended ones carry none', () => {
+  const identities = projectIdentities({
+    peers: ['CC1'],
+    sessions: { CC1: { cwd: '/tmp/birds' } },
+    registeredSessions: {
+      CC1: { cwd: '/tmp/birds', ended: '2026-08-29T15:00:00.000Z' },
+      CODEX7: { cwd: '/tmp/birds', ended: '2026-08-29T15:30:00.000Z' },
+      GROK: { cwd: '/tmp/birds' },
+      AGY: { cwd: '/tmp/birds', ended: 'not a time' }
+    }
+  }, NOW);
+  const byId = Object.fromEntries(identities.map(identity => [identity.identity, identity]));
+  assert.equal(byId.CC1.endedAgeMs, null, 'a live session reconnected after its old entry ended');
+  assert.equal(byId.CODEX7.endedAgeMs, 30 * 60 * 1000);
+  assert.equal(byId.GROK.endedAgeMs, null);
+  assert.equal(byId.AGY.endedAgeMs, null);
 });
 
 test('remote detail redacts credentials and local paths while retaining bounded report fields', () => {

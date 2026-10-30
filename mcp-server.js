@@ -180,6 +180,12 @@ function registryPidAlive(info) {
   }
 }
 
+// A clean exit drops the pid (marked ended); a bridge that died without one
+// keeps a pid that must now read dead. Either way its bridge is gone.
+function registryBridgeGone(info) {
+  return Boolean(info?.ended && !info.pid) || registryPidAlive(info) === false;
+}
+
 function processEnvironmentValue(pid, name) {
   if (!pid || !/^[A-Z0-9_]+$/.test(name)) return null;
   try {
@@ -362,7 +368,7 @@ function findSameSessionIdentity(registry = readRegistry()) {
     info
     && !['auto', 'background-fork', 'delegate'].includes(info.source)
     && (sameCwd(projectDir, info.cwd) || sameCwd(process.cwd(), info.cwd))
-    && registryPidAlive(info) === false
+    && registryBridgeGone(info)
     && (sameProcess(info) || sameBridge(info))
   ).map(([id]) => id);
   if (matches.length > 1) {
@@ -552,6 +558,8 @@ if (DELEGATE_FOR) {
 // (no restart, no env vars) when startup resolution picked the wrong ID.
 let CLIENT_ID = resolvedIdentity.id;
 let CLIENT_ID_SOURCE = resolvedIdentity.source;
+// First relay tool call this bridge handled; recorded on the registry entry.
+let relayUsedAt = null;
 // Stable start time for this process, reported to the relay server so peers can
 // see it in the cluster-wide session list. Captured once so it survives reconnects.
 const STARTED_AT = new Date().toISOString();
@@ -599,10 +607,31 @@ const AUTO_ID_PATTERN = new RegExp(
   `^${escapeRegExp(os.hostname().split('.')[0].toUpperCase())}-[0-9a-z]+(-bg[0-9a-z]+)?$`);
 const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 
+// The ChatGPT app starts bridges just to look at the tool list: bursts of
+// several every few minutes, each gone within seconds, each under a fresh
+// CODEXnn label that no session ever comes back to. A numbered label that
+// lived under a minute and never made a relay call is one of those; a day
+// after it ended its entry goes. Deliberate labels (configured, renamed,
+// reclaimed) are never pruned, nor is any label that was ever used.
+const UNUSED_NUMBERED_SOURCES = ['auto-numbered', 'codex-reconnect'];
+const UNUSED_NUMBERED_MAX_LIFE_MS = 60 * 1000;
+const UNUSED_NUMBERED_TTL_MS = 24 * 60 * 60 * 1000;
+
+function unusedNumberedEntryExpired(info, now = Date.now()) {
+  if (!info?.ended || info.usedAt || !UNUSED_NUMBERED_SOURCES.includes(info.source)) return false;
+  if (registryPidAlive(info) === true) return false;
+  const started = Date.parse(info.started);
+  const ended = Date.parse(info.ended);
+  if (Number.isNaN(started) || Number.isNaN(ended)) return false;
+  return ended - started < UNUSED_NUMBERED_MAX_LIFE_MS && now - ended > UNUSED_NUMBERED_TTL_MS;
+}
+
 function pruneOrphanIdentities(registry) {
   for (const [id, info] of Object.entries(registry)) {
     if (id === CLIENT_ID) continue;
     if (['auto', 'background-fork'].includes(info?.source) && registryPidAlive(info) === false) {
+      delete registry[id];
+    } else if (unusedNumberedEntryExpired(info)) {
       delete registry[id];
     }
   }
@@ -639,6 +668,8 @@ function updateRegistry(action = 'connect') {
 
     if (action === 'connect') {
       pruneOrphanIdentities(registry);
+      // A label once used for relay work stays used across reconnects.
+      const usedAt = registry[CLIENT_ID]?.usedAt || relayUsedAt;
       registry[CLIENT_ID] = {
         pid: process.pid,
         started: new Date().toISOString(),
@@ -658,8 +689,12 @@ function updateRegistry(action = 'connect') {
           ? { agentBridgeSessionId: process.env.CLAUDE_CODE_BRIDGE_SESSION_ID }
           : {}),
         // Exact owning Codex conversation, when unambiguously resolvable.
-        ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {})
+        ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {}),
+        ...(usedAt ? { usedAt } : {})
       };
+    } else if (action === 'used') {
+      if (registry[CLIENT_ID]?.pid !== process.pid || registry[CLIENT_ID].usedAt) return;
+      registry[CLIENT_ID].usedAt = relayUsedAt;
     } else if (action === 'release') {
       // Deliberate abandonment (relay_rename away from a wrong identity):
       // the mapping is incorrect, so it must not survive for reclaim.
@@ -669,12 +704,14 @@ function updateRegistry(action = 'connect') {
       // drop them so they don't clutter the registry.
       delete registry[CLIENT_ID];
     } else if (action === 'disconnect') {
-      // Keep the label->cwd mapping on clean exit (marked ended, pid now
-      // dead). This is what a restarted session in the same cwd reclaims —
-      // deleting it here is why restarts used to come up auto-numbered.
-      if (registry[CLIENT_ID]) {
-        registry[CLIENT_ID].ended = new Date().toISOString();
-      }
+      // Keep the label->cwd mapping on clean exit (marked ended). This is
+      // what a restarted session in the same cwd reclaims — deleting it here
+      // is why restarts used to come up auto-numbered. The pid goes: the OS
+      // reuses it, and a reused pid made a dead label look live. Only our own
+      // entry: a reconnect that retired this bridge may already own the label.
+      if (registry[CLIENT_ID]?.pid !== process.pid) return;
+      registry[CLIENT_ID].ended = new Date().toISOString();
+      delete registry[CLIENT_ID].pid;
     }
 
     writeRegistryAtomic(registry);
@@ -1187,6 +1224,10 @@ function handleMcpMessage(message) {
         break;
       }
       pendingToolCalls.set(id, params.name);
+      if (!relayUsedAt) {
+        relayUsedAt = new Date().toISOString();
+        updateRegistry('used');
+      }
       handleToolCall(id, params.name, params.arguments || {});
       break;
 

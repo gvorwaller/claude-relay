@@ -513,7 +513,165 @@ test('clean exit keeps the label->cwd mapping (marked ended) for later reclaim',
     fs.readFileSync(path.join(root, 'claude-relay', 'sessions', 'registry.json'), 'utf8'));
   assert.ok(registry.KEEPME, 'mapping survives clean exit');
   assert.ok(registry.KEEPME.ended, 'entry is marked ended');
+  assert.equal(registry.KEEPME.pid, undefined, 'pid dropped: the OS reuses it');
   assert.equal(registry.KEEPME.cwd, projDir);
+});
+
+function readRegistryFile(root) {
+  return JSON.parse(fs.readFileSync(path.join(root, 'claude-relay', 'sessions', 'registry.json'), 'utf8'));
+}
+
+async function registryWhen(root, predicate, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      const registry = readRegistryFile(root);
+      if (predicate(registry)) return registry;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error('registry never reached the expected state');
+}
+
+test('a label that ended cleanly (no pid left) is reclaimed by a restart in its cwd', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const usedAt = '2026-10-01T12:00:00.000Z';
+  writeRegistry(root, {
+    CODEXR3: { cwd: projDir, source: 'rename', ended: new Date().toISOString(), usedAt }
+  });
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'CODEXR3', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { RELAY_CLIENT_ID: 'CODEXR' });
+  await joined;
+  const registry = await registryWhen(root, registry => registry.CODEXR3?.pid === mcp.pid);
+  assert.equal(registry.CODEXR3.ended, undefined);
+  assert.equal(registry.CODEXR3.usedAt, usedAt, 'a used label stays used when reclaimed');
+});
+
+test('a retired bridge never marks or strips the entry its successor now holds', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'KEEPME', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'KEEPME' });
+  await joined;
+  await registryWhen(root, registry => registry.KEEPME?.pid === mcp.pid);
+
+  // A reconnect bridge has taken the label over (as /mcp reconnect does
+  // before it retires its predecessor).
+  const successor = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+  t.after(() => successor.kill('SIGKILL'));
+  const registry = readRegistryFile(root);
+  registry.KEEPME.pid = successor.pid;
+  writeRegistry(root, registry);
+
+  // Its first relay call no longer marks a label it does not hold.
+  const answered = new Promise(resolve => {
+    let out = '';
+    mcp.stdout.on('data', chunk => {
+      out += chunk;
+      if (out.includes('"id":2')) resolve();
+    });
+  });
+  mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'relay_status', arguments: {} } })}\n`);
+  await answered;
+
+  const exited = new Promise(resolve => mcp.once('exit', resolve));
+  mcp.kill('SIGTERM');
+  await exited;
+
+  const after = readRegistryFile(root);
+  assert.equal(after.KEEPME.pid, successor.pid);
+  assert.equal(after.KEEPME.ended, undefined);
+  assert.equal(after.KEEPME.usedAt, undefined);
+});
+
+test('the first relay call marks the label used, and the mark survives exit', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'USEDME', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'USEDME' });
+  await joined;
+  const before = await registryWhen(root, registry => registry.USEDME?.pid === mcp.pid);
+  assert.equal(before.USEDME.usedAt, undefined, 'connecting alone is not use');
+
+  mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'relay_status', arguments: {} } })}\n`);
+  const used = await registryWhen(root, registry => Boolean(registry.USEDME?.usedAt));
+
+  const exited = new Promise(resolve => mcp.once('exit', resolve));
+  mcp.kill('SIGTERM');
+  await exited;
+
+  const after = readRegistryFile(root);
+  assert.ok(after.USEDME.ended);
+  assert.equal(after.USEDME.usedAt, used.USEDME.usedAt);
+});
+
+test('a connecting bridge prunes day-old unused numbered labels that lived under a minute, and nothing else', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const occupant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+  t.after(() => occupant.kill('SIGKILL'));
+  const hour = 60 * 60 * 1000;
+  const entry = (endedAgo, lifeMs, extra = {}) => ({
+    cwd: '/', source: 'auto-numbered',
+    started: new Date(Date.now() - endedAgo - lifeMs).toISOString(),
+    ended: new Date(Date.now() - endedAgo).toISOString(),
+    ...extra
+  });
+  writeRegistry(root, {
+    PROBE1: entry(25 * hour, 700),
+    PROBE2: entry(25 * hour, 900, { source: 'codex-reconnect' }),
+    PROBE3: entry(25 * hour, 800, { pid: await deadPid() }),
+    RECENT: entry(23 * hour, 700),
+    LONGLIVED: entry(25 * hour, 2 * 60 * 1000),
+    USED: entry(25 * hour, 700, { usedAt: new Date(Date.now() - 25 * hour).toISOString() }),
+    RENAMED: entry(25 * hour, 700, { source: 'rename' }),
+    RECLAIMED: entry(25 * hour, 700, { source: 'registry-cwd' }),
+    CONFIGURED: entry(25 * hour, 700, { source: 'RELAY_CLIENT_ID' }),
+    PIDALIVE: entry(25 * hour, 700, { pid: occupant.pid }),
+    NOTENDED: { cwd: '/', source: 'auto-numbered', started: new Date(Date.now() - 25 * hour).toISOString(),
+      pid: await deadPid() },
+    MALFORMED: null
+  });
+
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER' });
+  await joined;
+  const registry = await registryWhen(root, registry => Boolean(registry.PRUNER));
+  assert.deepEqual(Object.keys(registry).sort(), [
+    'CONFIGURED', 'LONGLIVED', 'MALFORMED', 'NOTENDED', 'PIDALIVE', 'PRUNER', 'RECENT', 'RECLAIMED', 'RENAMED', 'USED'
+  ]);
 });
 
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {

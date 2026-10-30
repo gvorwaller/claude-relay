@@ -242,7 +242,7 @@ function readMonitorModel(dataRoot, options = {}) {
   };
 }
 
-function projectIdentities(topology) {
+function projectIdentities(topology, now = Date.now()) {
   const peers = new Set((Array.isArray(topology?.peers) ? topology.peers : [])
     .filter(identity => !isTransientOwnerLabel(identity)));
   const pending = new Set(Array.isArray(topology?.pendingOwnerLabels) ? topology.pendingOwnerLabels : []);
@@ -254,9 +254,13 @@ function projectIdentities(topology) {
     .sort()
     .map(identity => {
       const meta = sessions[identity] || registered[identity] || {};
+      const live = peers.has(identity);
+      // A bridge that exited cleanly; still known, so a restart can reclaim it.
+      const ended = live ? NaN : Date.parse(registered[identity]?.ended);
       return {
         identity,
-        live: peers.has(identity),
+        live,
+        endedAgeMs: Number.isNaN(ended) ? null : Math.max(0, now - ended),
         host: typeof meta.host === 'string' ? meta.host : null,
         cwdBasename: typeof meta.cwd === 'string' ? safeText(path.basename(meta.cwd)) : null,
         source: typeof meta.source === 'string' ? meta.source : null,
@@ -284,7 +288,7 @@ async function buildMonitorSnapshot(dataRoot, options = {}) {
       topologyError = safeText(error?.message, 200) || 'Live relay topology is unavailable.';
     }
   }
-  const identities = projectIdentities(topology);
+  const identities = projectIdentities(topology, now);
   const directories = new Map(identities.map(identity => [identity.identity, identity.cwdBasename]));
   // This is current registration metadata, not a claim about historical runs.
   for (const job of details) job.currentCwdBasename = directories.get(job.owner) || null;
