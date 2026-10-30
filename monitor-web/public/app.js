@@ -154,7 +154,10 @@ function identityCard(identity) {
 }
 
 // Sessions whose bridge exited stay known (a restart reclaims the name), but
-// they are history: folded below the current ones, most recent first.
+// they are history: folded below the current ones, most recent first. The
+// fold is one lasting node, so a snapshot refresh never closes it.
+let endedFold = null;
+
 function renderIdentities(identities) {
   const ended = identities.filter(identity => !identity.live && Number.isFinite(identity.endedAgeMs))
     .sort((a, b) => a.endedAgeMs - b.endedAgeMs);
@@ -164,13 +167,24 @@ function renderIdentities(identities) {
   const cards = current.map(identityCard);
   if (!current.length) cards.push(node('p', 'empty', 'No current identities.'));
   if (ended.length) {
-    const fold = node('details', 'ended-identities');
-    const list = node('div', 'identity-grid');
-    list.append(...ended.map(identityCard));
-    fold.append(node('summary', '', `Ended sessions (${ended.length})`), list);
-    cards.push(fold);
+    if (!endedFold) {
+      endedFold = node('details', 'ended-identities');
+      endedFold.append(node('summary'), node('div', 'identity-grid'));
+    }
+    const [summary, list] = endedFold.children;
+    summary.textContent = `Ended sessions (${ended.length})`;
+    list.replaceChildren(...ended.map(identityCard));
   }
-  elements.identities.replaceChildren(...cards);
+  // Swap the cards around the fold without ever detaching it: a detached
+  // node would also drop keyboard focus from its summary.
+  const container = elements.identities;
+  const fold = ended.length ? endedFold : null;
+  Array.from(container.children).forEach(child => {
+    if (child !== fold) container.removeChild(child);
+  });
+  const anchor = fold && fold.parentNode === container ? fold : null;
+  cards.forEach(card => container.insertBefore(card, anchor));
+  if (fold && !anchor) container.append(fold);
 }
 
 const ADMIN_ACTIONS = {

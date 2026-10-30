@@ -10,8 +10,16 @@ const vm = require('vm');
 // strings must use textContent, including untrusted directory names/reasons.
 class Element {
   constructor() { this.children = []; this.dataset = {}; this.listeners = {}; this.value = ''; }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  append(...children) { children.forEach(child => { if (child.parentNode) child.parentNode.removeChild(child); child.parentNode = this; }); this.children.push(...children); }
+  replaceChildren(...children) { this.children.forEach(child => { child.parentNode = null; }); children.forEach(child => { child.parentNode = this; }); this.children = children; }
+  removeChild(child) { this.children = this.children.filter(item => item !== child); child.parentNode = null; (this.removed ||= []).push(child); return child; }
+  insertBefore(child, anchor) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    const index = anchor ? this.children.indexOf(anchor) : -1;
+    if (index < 0) this.children.push(child); else this.children.splice(index, 0, child);
+    return child;
+  }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   set textContent(value) { this.text = String(value); this.children = []; }
   get textContent() { return [this.text || '', ...this.children.map(child => child.textContent)].join(' '); }
@@ -60,6 +68,22 @@ test('monitor renders terminal timing, failure reason, directory and active timi
   assert.equal(fold.children[0].textContent, 'Ended sessions (2)');
   assert.deepEqual(fold.children[1].children.map(card => card.children[0].children[0].textContent), ['CODEX8', 'CODEX9']);
   assert.match(fold.children[1].children[0].textContent, /CODEX8 Ended .*Ended 1m ago/);
+  // A refresh keeps the very same fold, open, never detached.
+  fold.open = true;
+  elements.get('identities').removed = [];
+  vm.runInContext(`renderIdentities([
+    {identity:"CODEX1",live:true,cwdBasename:"birds",endedAgeMs:null},
+    {identity:"CODEX9",live:false,cwdBasename:"giftlist",endedAgeMs:7300000}
+  ])`, context);
+  const refreshed = elements.get('identities').children;
+  assert.equal(refreshed.length, 2);
+  assert.equal(refreshed[1], fold);
+  assert.equal(fold.open, true);
+  assert.equal(fold.parentNode, elements.get('identities'));
+  assert.ok(!elements.get('identities').removed.includes(fold), 'never detached');
+  assert.equal(fold.children[0].textContent, 'Ended sessions (1)');
+  assert.match(refreshed[0].textContent, /CODEX1 Live/);
+  assert.equal(fold.children[1].children.length, 1);
   vm.runInContext('renderIdentities([{identity:"CODEX9",live:false,cwdBasename:"giftlist",endedAgeMs:5000}])', context);
   assert.match(elements.get('identities').children[0].textContent, /No current identities/);
   assert.equal(elements.get('identity-count').textContent, '0');

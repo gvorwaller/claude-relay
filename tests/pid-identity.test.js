@@ -601,6 +601,33 @@ test('a retired bridge never marks or strips the entry its successor now holds',
   assert.equal(after.KEEPME.usedAt, undefined);
 });
 
+test('a retired auto-labelled bridge never deletes the entry a reconnect now holds', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const mcp = spawnBridge(t, root, port, projDir);
+  const live = await registryWhen(root, registry =>
+    Object.values(registry).some(info => info?.pid === mcp.pid && info.source === 'auto'), 10000);
+  const label = Object.keys(live).find(id => live[id]?.pid === mcp.pid);
+
+  // A Claude Code /mcp reconnect took this auto label over.
+  const successor = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+  t.after(() => successor.kill('SIGKILL'));
+  const registry = readRegistryFile(root);
+  registry[label].pid = successor.pid;
+  writeRegistry(root, registry);
+
+  const exited = new Promise(resolve => mcp.once('exit', resolve));
+  mcp.kill('SIGTERM');
+  await exited;
+  assert.equal(readRegistryFile(root)[label]?.pid, successor.pid);
+});
+
 test('the first relay call marks the label used, and the mark survives exit', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
@@ -630,7 +657,7 @@ test('the first relay call marks the label used, and the mark survives exit', as
   assert.equal(after.USEDME.usedAt, used.USEDME.usedAt);
 });
 
-test('a connecting bridge prunes day-old unused numbered labels that lived under a minute, and nothing else', async t => {
+test('a connecting bridge prunes only day-old entries marked disposable, never older unmarked ones', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
   const projDir = path.join(root, 'proj');
@@ -642,25 +669,25 @@ test('a connecting bridge prunes day-old unused numbered labels that lived under
   const occupant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
   t.after(() => occupant.kill('SIGKILL'));
   const hour = 60 * 60 * 1000;
-  const entry = (endedAgo, lifeMs, extra = {}) => ({
+  const entry = (endedAgo, extra = {}) => ({
     cwd: '/', source: 'auto-numbered',
-    started: new Date(Date.now() - endedAgo - lifeMs).toISOString(),
+    started: new Date(Date.now() - endedAgo - 700).toISOString(),
     ended: new Date(Date.now() - endedAgo).toISOString(),
+    disposable: true,
     ...extra
   });
   writeRegistry(root, {
-    PROBE1: entry(25 * hour, 700),
-    PROBE2: entry(25 * hour, 900, { source: 'codex-reconnect' }),
-    PROBE3: entry(25 * hour, 800, { pid: await deadPid() }),
-    RECENT: entry(23 * hour, 700),
-    LONGLIVED: entry(25 * hour, 2 * 60 * 1000),
-    USED: entry(25 * hour, 700, { usedAt: new Date(Date.now() - 25 * hour).toISOString() }),
-    RENAMED: entry(25 * hour, 700, { source: 'rename' }),
-    RECLAIMED: entry(25 * hour, 700, { source: 'registry-cwd' }),
-    CONFIGURED: entry(25 * hour, 700, { source: 'RELAY_CLIENT_ID' }),
-    PIDALIVE: entry(25 * hour, 700, { pid: occupant.pid }),
-    NOTENDED: { cwd: '/', source: 'auto-numbered', started: new Date(Date.now() - 25 * hour).toISOString(),
-      pid: await deadPid() },
+    GONE1: entry(25 * hour),
+    GONE2: entry(25 * hour, { source: 'codex-reconnect', pid: await deadPid() }),
+    RECENT: entry(23 * hour),
+    USED: entry(25 * hour, { usedAt: new Date(Date.now() - 25 * hour).toISOString() }),
+    PIDALIVE: entry(25 * hour, { pid: occupant.pid }),
+    BADENDED: entry(25 * hour, { ended: 'not a time' }),
+    NOTTRUE: entry(25 * hour, { disposable: 'yes' }),
+    // The shape of every entry written before the mark existed: kept.
+    LEGACY: entry(25 * hour, { disposable: undefined }),
+    LEGACYRECONNECT: entry(25 * hour, { disposable: undefined, source: 'codex-reconnect',
+      codexSessionId: '01a00000-0000-7000-8000-000000000000' }),
     MALFORMED: null
   });
 
@@ -670,8 +697,137 @@ test('a connecting bridge prunes day-old unused numbered labels that lived under
   await joined;
   const registry = await registryWhen(root, registry => Boolean(registry.PRUNER));
   assert.deepEqual(Object.keys(registry).sort(), [
-    'CONFIGURED', 'LONGLIVED', 'MALFORMED', 'NOTENDED', 'PIDALIVE', 'PRUNER', 'RECENT', 'RECLAIMED', 'RENAMED', 'USED'
+    'BADENDED', 'LEGACY', 'LEGACYRECONNECT', 'MALFORMED', 'NOTTRUE', 'PIDALIVE', 'PRUNER', 'RECENT', 'USED'
   ]);
+});
+
+// A fresh numbered label: PROBE is taken by another cwd, so this bridge is
+// auto-numbered PROBE2, the way the ChatGPT app's tool-list bridges are.
+async function freshNumberedBridge(t) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-probe-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+  writeRegistry(root, {
+    PROBE: { cwd: path.join(root, 'elsewhere'), source: 'RELAY_CLIENT_ID', ended: new Date().toISOString() }
+  });
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PROBE2', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { RELAY_CLIENT_ID: 'PROBE' });
+  await joined;
+  const registry = await registryWhen(root, registry => registry.PROBE2?.pid === mcp.pid);
+  const answers = new Map();
+  let out = '';
+  mcp.stdout.on('data', chunk => {
+    out += chunk;
+    let newline;
+    while ((newline = out.indexOf('\n')) >= 0) {
+      const line = out.slice(0, newline);
+      out = out.slice(newline + 1);
+      try {
+        const message = JSON.parse(line);
+        if (answers.has(message.id)) answers.get(message.id)(message);
+      } catch {}
+    }
+  });
+  return {
+    root, observer, mcp, born: registry.PROBE2.numberedBornAt,
+    call: (id, name) => new Promise(resolve => {
+      answers.set(id, resolve);
+      mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call',
+        params: { name, arguments: {} } })}\n`);
+    }),
+    end: async () => {
+      const exited = new Promise(resolve => mcp.once('exit', resolve));
+      mcp.kill('SIGTERM');
+      await exited;
+      return readRegistryFile(root).PROBE2;
+    }
+  };
+}
+
+test('a fresh numbered label that ends within a minute, unused and without mail, is marked disposable', async t => {
+  const probe = await freshNumberedBridge(t);
+  assert.ok(!Number.isNaN(Date.parse(probe.born)), 'a fresh numbered label records its birth');
+  const ended = await probe.end();
+  assert.equal(ended.disposable, true);
+  assert.equal(ended.pid, undefined);
+});
+
+test('a numbered label that made a relay call is never marked disposable', async t => {
+  const probe = await freshNumberedBridge(t);
+  await probe.call(2, 'relay_status');
+  const ended = await probe.end();
+  assert.ok(ended.usedAt);
+  assert.equal(ended.disposable, undefined);
+});
+
+test('a numbered label that received mail is never marked disposable', async t => {
+  const probe = await freshNumberedBridge(t);
+  const sent = waitForMessage(probe.observer, msg => msg.type === 'sent');
+  probe.observer.send(JSON.stringify({ type: 'message', to: 'PROBE2', content: 'wake work' }));
+  await sent;
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const ended = await probe.end();
+  assert.equal(ended.usedAt, undefined);
+  assert.equal(ended.disposable, undefined);
+});
+
+test('reclaiming a numbered label drops its birth time, so it is never disposable again', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+  writeRegistry(root, {
+    CODEXR3: { cwd: projDir, source: 'auto-numbered', ended: new Date().toISOString(),
+      numberedBornAt: new Date().toISOString(), disposable: true }
+  });
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'CODEXR3', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, { RELAY_CLIENT_ID: 'CODEXR' });
+  await joined;
+  const live = await registryWhen(root, registry => registry.CODEXR3?.pid === mcp.pid);
+  assert.equal(live.CODEXR3.numberedBornAt, undefined);
+  assert.equal(live.CODEXR3.disposable, undefined);
+  const exited = new Promise(resolve => mcp.once('exit', resolve));
+  mcp.kill('SIGTERM');
+  await exited;
+  assert.equal(readRegistryFile(root).CODEXR3.disposable, undefined);
+});
+
+// Hold the registry lock as a live process would, so the bridge's write
+// times out (it fails closed after 5s rather than racing).
+function holdRegistryLock(root) {
+  const lock = path.join(root, 'claude-relay', 'sessions', 'registry.json.lock');
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner'), `test-holder\n${process.pid}`);
+  return () => fs.rmSync(lock, { recursive: true, force: true });
+}
+
+test('a first-use write that fails is retried on the next relay call', async t => {
+  const probe = await freshNumberedBridge(t);
+  const release = holdRegistryLock(probe.root);
+  await probe.call(2, 'relay_status');
+  release();
+  assert.equal(readRegistryFile(probe.root).PROBE2.usedAt, undefined, 'the locked write was skipped');
+  await probe.call(3, 'relay_status');
+  assert.ok(readRegistryFile(probe.root).PROBE2.usedAt);
+  const ended = await probe.end();
+  assert.equal(ended.disposable, undefined);
+});
+
+test('a first-use write that fails is flushed when the bridge ends', async t => {
+  const probe = await freshNumberedBridge(t);
+  const release = holdRegistryLock(probe.root);
+  await probe.call(2, 'relay_status');
+  release();
+  const ended = await probe.end();
+  assert.ok(ended.usedAt);
+  assert.equal(ended.disposable, undefined);
 });
 
 test('MCP bridge in RELAY_DELEGATE_FOR mode registers as a transparent delegate', async t => {
