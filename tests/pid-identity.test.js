@@ -701,6 +701,73 @@ test('a connecting bridge prunes only day-old entries marked disposable, never o
   ]);
 });
 
+test('mail or a wake job on record protects a disposable label for good; unreadable records block pruning', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+  const messages = path.join(root, 'messages');
+  const jobs = path.join(root, 'jobs');
+  fs.mkdirSync(messages, { recursive: true });
+  fs.mkdirSync(jobs, { recursive: true });
+
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const hour = 60 * 60 * 1000;
+  const disposable = (extra = {}) => ({
+    cwd: '/', source: 'auto-numbered', disposable: true,
+    numberedBornAt: new Date(Date.now() - 25 * hour - 700).toISOString(),
+    started: new Date(Date.now() - 25 * hour - 700).toISOString(),
+    ended: new Date(Date.now() - 25 * hour).toISOString(),
+    ...extra
+  });
+  writeRegistry(root, {
+    MAILTO: disposable(),
+    MAILFROM: disposable(),
+    JOBOWNER: disposable(),
+    // Born recently, not yet disposable: protected before it ever could be.
+    YOUNG: disposable({ disposable: undefined, ended: new Date().toISOString() }),
+    GONE: disposable()
+  });
+  const day = new Date().toISOString().slice(0, 10);
+  fs.writeFileSync(path.join(messages, `${day}.jsonl`), [
+    JSON.stringify({ id: 'm1', from: 'CC1', to: 'MAILTO', content: 'x' }),
+    JSON.stringify({ id: 'm2', from: 'MAILFROM', to: 'CC1', content: 'y' }),
+    JSON.stringify({ id: 'm3', from: 'CC1', to: 'YOUNG', content: 'z' }),
+    JSON.stringify({ id: 'm4', from: 'CC1', to: 'all', content: 'broadcast' })
+  ].join('\n') + '\n');
+  fs.writeFileSync(path.join(jobs, 'wake_1.json'), JSON.stringify({ jobId: 'wake_1', owner: 'JOBOWNER' }));
+
+  const env = { RELAY_MESSAGE_DIR: messages };
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  const first = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
+  await joined;
+  const registry = await registryWhen(root, registry => registry.PRUNER?.pid === first.pid);
+  assert.deepEqual(Object.keys(registry).sort(), ['JOBOWNER', 'MAILFROM', 'MAILTO', 'PRUNER', 'YOUNG']);
+  for (const id of ['JOBOWNER', 'MAILFROM', 'MAILTO', 'YOUNG']) {
+    assert.ok(registry[id].usedAt, `${id} is marked used`);
+    assert.equal(registry[id].disposable, undefined, `${id} is no longer disposable`);
+  }
+
+  // Unreadable records: nothing is pruned this time.
+  const firstExit = new Promise(resolve => first.once('exit', resolve));
+  first.kill('SIGTERM');
+  await firstExit;
+  const next = readRegistryFile(root);
+  next.GONE2 = disposable();
+  writeRegistry(root, next);
+  fs.writeFileSync(path.join(jobs, 'wake_2.json'), '{"owner": "CUT');
+  const rejoined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  const second = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
+  await rejoined;
+  const after = await registryWhen(root, registry => registry.PRUNER?.pid === second.pid);
+  assert.ok(after.GONE2, 'kept while the records cannot be read');
+  assert.equal(after.GONE2.disposable, true);
+});
+
 // A fresh numbered label: PROBE is taken by another cwd, so this bridge is
 // auto-numbered PROBE2, the way the ChatGPT app's tool-list bridges are.
 async function freshNumberedBridge(t) {

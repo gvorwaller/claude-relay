@@ -115,7 +115,7 @@ function startMcp(t, { root, port, cwd, env = {}, clientId }) {
   return { mcp, next, send, errors: () => errors };
 }
 
-function startCodexContinuation(t, { root, port, cwd, oldRollout, currentRollout, oldSession, seed }) {
+function startCodexContinuation(t, { root, port, cwd, oldRollout, currentRollout, oldSession, seed, env = process.env }) {
   const wrapper = spawn(process.execPath, [
     path.join(__dirname, 'fixtures', 'codex-rollout-parent.js'),
     path.join(__dirname, '..', 'mcp-server.js'),
@@ -127,7 +127,7 @@ function startCodexContinuation(t, { root, port, cwd, oldRollout, currentRollout
     oldSession,
     ...(seed ? [JSON.stringify(seed)] : [])
   ], {
-    env: process.env,
+    env,
     stdio: ['pipe', 'pipe', 'pipe']
   });
   let errors = '';
@@ -190,14 +190,21 @@ test('Codex continuation rollout reclaims its canonical identity and retires the
   assert.match(mcp.errors(), /Codex MCP continuation resolved through rollout lineage to CODEX1/);
 });
 
-async function endedContinuation(t, seed) {
+async function endedContinuation(t, seed, mailForLabel = false) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-codex-reconnect-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const project = path.join(root, 'birds');
   const rollouts = path.join(root, 'rollouts');
   fs.mkdirSync(project, { recursive: true });
   fs.mkdirSync(rollouts, { recursive: true });
-  const { port, observer } = await startRelay(t, root);
+  const { port, observer, env } = await startRelay(t, root);
+  if (mailForLabel) {
+    // Delivered to the predecessor bridge (or to a delegate) before this
+    // continuation started: on record, though this bridge never saw it.
+    fs.mkdirSync(env.RELAY_MESSAGE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(env.RELAY_MESSAGE_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`),
+      `${JSON.stringify({ id: 'earlier', from: 'GROK', to: 'CODEX1', content: 'review this' })}\n`);
+  }
   const oldSession = '11111111-1111-4111-8111-111111111111';
   const currentSession = '22222222-2222-4222-8222-222222222222';
   const oldRollout = path.join(rollouts, `rollout-2026-08-19T20-30-55-${oldSession}.jsonl`);
@@ -214,7 +221,7 @@ async function endedContinuation(t, seed) {
   const joined = wsMessage(observer,
     message => message.type === 'peer_joined' && message.clientId === 'CODEX1');
   const mcp = startCodexContinuation(t, {
-    root, port, cwd: project, oldRollout, currentRollout, oldSession, seed
+    root, port, cwd: project, oldRollout, currentRollout, oldSession, seed, env
   });
   mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
   await mcp.next(message => message.id === 1);
@@ -243,6 +250,14 @@ test('a numbered continuation keeps the label birth time; it is disposable only 
   assert.equal(grown.numberedBornAt, old);
   assert.ok(grown.ended);
   assert.equal(grown.disposable, undefined);
+});
+
+test('mail its predecessor received keeps a young numbered continuation from being disposable', async t => {
+  const fresh = new Date().toISOString();
+  const ended = await endedContinuation(t, { source: 'auto-numbered', numberedBornAt: fresh }, true);
+  assert.ok(ended.ended);
+  assert.ok(ended.usedAt);
+  assert.equal(ended.disposable, undefined);
 });
 
 test('Claude Code reconnect reclaims the canonical identity from the same transcript lineage', async t => {

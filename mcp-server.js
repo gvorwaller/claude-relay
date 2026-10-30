@@ -63,6 +63,10 @@ function toolAllowed(toolName) {
 const SESSIONS_DIR = path.join(os.homedir(), 'claude-relay', 'sessions');
 const REGISTRY_FILE = path.join(SESSIONS_DIR, 'registry.json');
 const READ_CURSORS_FILE = path.join(SESSIONS_DIR, 'read-cursors.json');
+// The relay server's durable mail and wake-job records (same defaults and
+// RELAY_MESSAGE_DIR override as server.js). Read only, to protect labels.
+const RELAY_MESSAGES_DIR = process.env.RELAY_MESSAGE_DIR || path.join(__dirname, 'data', 'messages');
+const RELAY_JOBS_DIR = path.join(path.dirname(RELAY_MESSAGES_DIR), 'jobs');
 
 // Ensure sessions directory exists
 try {
@@ -617,7 +621,11 @@ const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 // marks one: the bridge that ends it records `disposable` when the label was
 // born numbered under a minute before, and it made no relay call and saw no
 // mail. Entries without that mark (every older entry, every deliberate
-// label) are never pruned here. A day after a disposable one ended it goes.
+// label) are never pruned here. A day after a disposable one ended it goes —
+// unless the relay holds mail to or from it, or a wake job for it (work done
+// by a predecessor bridge, or by a delegate while no bridge was connected).
+// That marks the label used for good. Mail and jobs are kept 7 days, well
+// past the one-day wait, and bridges connect every few minutes.
 const DISPOSABLE_MAX_LIFE_MS = 60 * 1000;
 const DISPOSABLE_TTL_MS = 24 * 60 * 60 * 1000;
 const NUMBERED_BIRTH_SOURCES = ['auto-numbered', 'codex-reconnect'];
@@ -628,12 +636,62 @@ function disposableEntryExpired(info, now = Date.now()) {
   return !Number.isNaN(ended) && now - ended > DISPOSABLE_TTL_MS;
 }
 
+function readDirOrEmpty(dir) {
+  try {
+    return fs.readdirSync(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+// Every label the relay's durable records name: mail to or from it, or a
+// wake job owned by it. null when any record cannot be read: then nothing is
+// pruned this time.
+function labelsWithRelayRecords() {
+  const labels = new Set();
+  try {
+    for (const name of readDirOrEmpty(RELAY_MESSAGES_DIR)) {
+      if (!/^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)) continue;
+      for (const line of fs.readFileSync(path.join(RELAY_MESSAGES_DIR, name), 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        if (typeof message?.to === 'string') labels.add(message.to);
+        if (typeof message?.from === 'string') labels.add(message.from);
+      }
+    }
+    for (const name of readDirOrEmpty(RELAY_JOBS_DIR)) {
+      if (!name.endsWith('.json')) continue;
+      const job = JSON.parse(fs.readFileSync(path.join(RELAY_JOBS_DIR, name), 'utf8'));
+      if (typeof job?.owner === 'string') labels.add(job.owner);
+    }
+  } catch {
+    return null;
+  }
+  return labels;
+}
+
+function protectRecordedLabels(registry) {
+  const unproven = Object.entries(registry)
+    .filter(([, info]) => (info?.numberedBornAt || info?.disposable) && !info.usedAt);
+  if (!unproven.length) return true;
+  const records = labelsWithRelayRecords();
+  if (!records) return false;
+  for (const [id, info] of unproven) {
+    if (!records.has(id)) continue;
+    info.usedAt = new Date().toISOString();
+    delete info.disposable;
+  }
+  return true;
+}
+
 function pruneOrphanIdentities(registry) {
+  const recordsChecked = protectRecordedLabels(registry);
   for (const [id, info] of Object.entries(registry)) {
     if (id === CLIENT_ID) continue;
     if (['auto', 'background-fork'].includes(info?.source) && registryPidAlive(info) === false) {
       delete registry[id];
-    } else if (disposableEntryExpired(info)) {
+    } else if (recordsChecked && disposableEntryExpired(info)) {
       delete registry[id];
     }
   }
