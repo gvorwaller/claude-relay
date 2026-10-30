@@ -943,8 +943,17 @@ function releaseCallsAwaitingJoin(failure = null) {
   const ready = !failure && connected && registered && ws && ws.readyState === WebSocket.OPEN;
   while (callsAwaitingJoin.length) {
     const call = callsAwaitingJoin.shift();
-    if (ready) call.run();
-    else sendToolText(call.id, failure || 'Error: not joined to the relay yet. No action was taken; try again.');
+    if (!ready) {
+      sendToolText(call.id, failure || 'Error: not joined to the relay yet. No action was taken; try again.');
+      continue;
+    }
+    // Off the readline handler's try/catch now: one bad call must not end
+    // the bridge or strand the calls queued behind it.
+    try {
+      call.run();
+    } catch (error) {
+      sendToolText(call.id, `Error: ${error.message}`);
+    }
   }
 }
 

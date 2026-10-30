@@ -183,6 +183,18 @@ test('two fresh sessions that resolved the same number both join; the second is 
   assert.match(tools.find(tool => tool.name === 'relay_send').description, /You are PROBE3\./);
 });
 
+test('a malformed waiting call is answered with an error and the calls behind it still run', LIMIT, async t => {
+  const env = setup(t);
+  await observe(t, env.port);
+  const session = bridge(t, env);
+  await session.request(1, 'initialize');
+  const bad = session.call(2, 'relay_send', {});
+  const good = session.status(3);
+  assert.match(await bad, /Error:/);
+  assert.match(await good, /Connected to .* as "PROBE2"/);
+  assert.equal(session.mcp.exitCode, null, 'the bridge is still running');
+});
+
 test('when the relay cannot be joined, a waiting call gets one failure and the bridge keeps running', LIMIT, async t => {
   const env = setup(t);
   const closed = await new Promise(resolve => {
