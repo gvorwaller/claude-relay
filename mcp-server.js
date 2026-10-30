@@ -905,6 +905,50 @@ let connected = false;
 // Raw WebSocket open is not authority to use relay tools. The bridge becomes
 // usable only after the relay server acknowledges registration.
 let registered = false;
+
+// The ChatGPT app starts relay bridges just to look at the tool list: bursts
+// of several every few minutes, each gone within seconds. Joining the relay
+// on initialize gave every one a fresh CODEXnn label, an owner enrollment and
+// a registry entry (287 of them in a week). A bridge whose label is a fresh
+// auto-numbered one therefore joins only when it shows it is a session: its
+// first relay tool call, or staying up past LAZY_JOIN_MS. Until then it has
+// no label and receives no mail. A tool call waits for the join.
+const LAZY_JOIN = !DELEGATE_FOR && CLIENT_ID_SOURCE === 'auto-numbered';
+const LAZY_JOIN_MS = 15 * 1000;
+const JOIN_WAIT_MS = 10 * 1000;
+const NUMBERED_RETRIES = 5;
+let joinStarted = false;
+let lazyJoinTimer = null;
+let everRegistered = false;
+let numberedRetries = 0;
+const callsAwaitingJoin = [];
+let joinWaitTimer = null;
+
+function joinRelay() {
+  if (joinStarted) return;
+  joinStarted = true;
+  clearTimeout(lazyJoinTimer);
+  connectToRelay();
+}
+
+function releaseCallsAwaitingJoin() {
+  clearTimeout(joinWaitTimer);
+  joinWaitTimer = null;
+  while (callsAwaitingJoin.length) callsAwaitingJoin.shift()();
+}
+
+// A fresh numbered label is arbitrary: when another session claimed the same
+// number first (two fresh bridges resolve it from the same registry), take
+// the next one instead of going dark.
+function nextFreshNumberedId(taken) {
+  const numbered = new RegExp(`^${escapeRegExp(configuredClientId)}(\\d+)$`);
+  let max = Number((taken.match(numbered) || [])[1]) || 1;
+  for (const id of Object.keys(readRegistry())) {
+    const match = id.match(numbered);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return `${configuredClientId}${max + 1}`;
+}
 // Set when the server tells us a newer connection re-registered our ID
 // (newest-wins takeover). A displaced client must NOT auto-reconnect under
 // the same ID — that guarantees an eternal 5-second takeover ping-pong with
@@ -1024,8 +1068,14 @@ function handleMcpMessage(message) {
       // to belong to the exact transcript/rollout lineage, then let normal
       // owner-capability registration reclaim the canonical label.
       prepareCanonicalReconnect();
-      // Connect to relay after initialization
-      connectToRelay();
+      // Connect to relay after initialization (a fresh numbered label waits
+      // until it shows it is a session).
+      if (LAZY_JOIN) {
+        if (!joinStarted && !lazyJoinTimer) lazyJoinTimer = setTimeout(joinRelay, LAZY_JOIN_MS);
+      } else {
+        joinStarted = true;
+        connectToRelay();
+      }
       break;
 
     case 'notifications/initialized':
@@ -1197,6 +1247,12 @@ function handleMcpMessage(message) {
         break;
       }
       pendingToolCalls.set(id, params.name);
+      if (LAZY_JOIN && !everRegistered && !rejectedReason) {
+        joinRelay();
+        callsAwaitingJoin.push(() => handleToolCall(id, params.name, params.arguments || {}));
+        if (!joinWaitTimer) joinWaitTimer = setTimeout(releaseCallsAwaitingJoin, JOIN_WAIT_MS);
+        break;
+      }
       handleToolCall(id, params.name, params.arguments || {});
       break;
 
@@ -1800,6 +1856,11 @@ function connectToRelay() {
         case 'registered':
           registered = true;
           peers = msg.peers || [];
+          if (!DELEGATE_FOR) {
+            everRegistered = true;
+            // After this frame is fully handled (identity and registry).
+            setImmediate(releaseCallsAwaitingJoin);
+          }
           // A newly enrolled label's owner capability arrives exactly once —
           // persist it durably BEFORE anything else claims the identity is
           // established, or the server holds an enrollment whose only
@@ -1886,7 +1947,17 @@ function connectToRelay() {
             }
             break;
           }
+          if (LAZY_JOIN && !everRegistered && CLIENT_ID_SOURCE === 'auto-numbered'
+              && msg.clientId === CLIENT_ID && numberedRetries < NUMBERED_RETRIES) {
+            numberedRetries += 1;
+            const taken = CLIENT_ID;
+            CLIENT_ID = nextFreshNumberedId(taken);
+            console.error(`[Claude Relay MCP] ${taken} was claimed first; joining as ${CLIENT_ID}.`);
+            connectToRelay();
+            break;
+          }
           rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
+          setImmediate(releaseCallsAwaitingJoin);
           console.error(JSON.stringify({
             timestamp: new Date().toISOString(),
             event: 'relay_register_rejected',
