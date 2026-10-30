@@ -178,7 +178,7 @@ The MCP server determines client ID in this order:
 
 Sessions are tracked in `~/claude-relay/sessions/registry.json` so all AI instances can see each other.
 
-**One view, live-verified.** `claude-sessions` (sessions/status.js) is the single human-facing view: one table, one line per session, with state checked at print time — `PROCESS` (is the OS process actually running) and `RELAY` (does it have a live relay connection). `claude-peers` is the same table filtered to connected rows. Rows whose process is dead and that have no relay connection are pruned from the registry automatically whenever the table is printed, so ghosts clean themselves up. A row showing `alive` + `NO RELAY` means the agent is running but cannot send/receive relay messages (its relay MCP is not running or not connected) — that distinction was previously invisible.
+**One view, live-verified.** `claude-sessions` (sessions/status.js) is the single human-facing view: one table, one line per session, with state checked at print time — `PROCESS` (is the OS process actually running) and `RELAY` (does it have a live relay connection). `claude-peers` is the same table filtered to connected rows. Names whose process is gone and that have no relay connection are not rows: they are listed once under the table as "Not running", and kept in the registry, because a restarted session in the same folder reclaims its name from that entry. The view never writes the registry. A row showing `alive` + `NO RELAY` means the agent is running but cannot send/receive relay messages (its relay MCP is not running or not connected) — that distinction was previously invisible.
 
 ### Registry identity vs live peers
 

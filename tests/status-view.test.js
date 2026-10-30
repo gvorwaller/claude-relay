@@ -22,7 +22,7 @@ function runStatus(root, relayUrl, args = []) {
   });
 }
 
-test('status view verifies process liveness, shows NO RELAY, and prunes dead ghosts', async t => {
+test('status view verifies process liveness, shows NO RELAY, and lists stopped sessions without deleting them', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-status-'));
   const port = 20000 + Math.floor(Math.random() * 20000);
   const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js'), String(port)], {
@@ -36,11 +36,14 @@ test('status view verifies process liveness, shows NO RELAY, and prunes dead gho
   t.after(() => server.kill('SIGTERM'));
 
   // ALIVEONE: our own live pid, registered but not relay-connected.
-  // DEADGHOST: a pid that cannot exist — must be pruned.
+  // DEADGHOST: a pid that cannot exist (bridge exited without a clean end).
+  // ENDEDONE: a clean exit, pid already dropped.
   const registryFile = writeRegistry(root, {
     ALIVEONE: { pid: process.pid, cwd: root, started: new Date().toISOString() },
-    DEADGHOST: { pid: 99999999, cwd: root, started: new Date().toISOString() }
+    DEADGHOST: { pid: 99999999, cwd: root, started: new Date().toISOString() },
+    ENDEDONE: { cwd: root, started: '2026-10-25T13:00:00.000Z', ended: '2026-10-25T14:03:09.000Z' }
   });
+  const before = fs.readFileSync(registryFile, 'utf8');
 
   // CONNONE: connected to the relay but absent from the registry file.
   let conn;
@@ -65,18 +68,18 @@ test('status view verifies process liveness, shows NO RELAY, and prunes dead gho
   assert.match(out, /ALIVEONE\s+\d+\s+alive\s+NO RELAY/);
   assert.match(out, /CONNONE\s+\d+\s+alive\s+connected/);
   assert.doesNotMatch(out, /DEADGHOST\s+\d+\s+(alive|dead)/);
-  assert.match(out, /Cleaned 1 dead session\(s\) from the registry: DEADGHOST/);
+  assert.doesNotMatch(out, /ENDEDONE\s+-/);
+  assert.match(out, /Not running \(2\), kept so a restart gets its name back: DEADGHOST \(bridge exited\), ENDEDONE \(ended 2026-10-25 14:03 UTC\)/);
   assert.match(out, /cannot send or receive messages/);
 
-  // The prune is persisted — the ghost is gone from the file itself.
-  const after = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
-  assert.ok(after.ALIVEONE);
-  assert.ok(!after.DEADGHOST);
+  // Read only: the registry file is exactly as it was.
+  assert.equal(fs.readFileSync(registryFile, 'utf8'), before);
 
   // --connected filters to live relay connections only.
   const connectedOut = runStatus(root, `ws://127.0.0.1:${port}`, ['--connected']);
   assert.match(connectedOut, /CONNONE/);
   assert.doesNotMatch(connectedOut, /ALIVEONE/);
+  assert.doesNotMatch(connectedOut, /Not running/);
 
   // Server unreachable: table still renders, relay state marked unknown.
   const offline = runStatus(root, 'ws://127.0.0.1:1');

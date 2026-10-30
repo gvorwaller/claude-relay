@@ -6,10 +6,12 @@
 //   RELAY    — does it have a live connection to the relay server right now
 //
 // Sources are merged and verified, never trusted: the registry file
-// (~/claude-relay/sessions/registry.json) supplies remembered names, the relay
-// server supplies live connections, and any row whose process is dead AND has
-// no relay connection is pruned from the registry on the spot. The table you
-// see is therefore always current — there is nothing else to cross-reference.
+// (~/claude-relay/sessions/registry.json) supplies remembered names and the
+// relay server supplies live connections. A name whose process is gone and
+// has no relay connection is history: it is listed once below the table, not
+// as a row. It is never deleted here — its registry entry is what a restarted
+// session in the same folder reclaims, and only bridges (under the registry
+// lock) write that file.
 //
 // Usage:
 //   status.js                all sessions
@@ -101,7 +103,7 @@ function fetchLiveSessions() {
   const ids = [...new Set([...Object.keys(registry), ...Object.keys(live || {})])].sort();
 
   const rows = [];
-  const pruned = [];
+  const gone = [];
   for (const id of ids) {
     const reg = registry[id];
     const conn = live ? live[id] : undefined;
@@ -110,11 +112,12 @@ function fetchLiveSessions() {
     const alive = remote || pidAlive(pid);
     const connected = live === null ? null : Boolean(conn);
 
-    // Self-cleaning: dead process with no relay connection is history, not
-    // state. Drop it from the registry so the table never shows ghosts.
+    // History, not state: shown once below the table, kept in the registry.
     if (!alive && connected === false) {
-      pruned.push(id);
-      delete registry[id];
+      const ended = reg?.ended && !Number.isNaN(Date.parse(reg.ended))
+        ? `ended ${new Date(reg.ended).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+        : 'bridge exited';
+      gone.push(`${id} (${ended})`);
       continue;
     }
     if (connectedOnly && !connected) continue;
@@ -126,14 +129,6 @@ function fetchLiveSessions() {
       relay: connected === null ? 'unknown' : connected ? 'connected' : 'NO RELAY',
       cwd: (conn?.cwd || reg?.cwd || '-').replace(os.homedir(), '~')
     });
-  }
-
-  if (pruned.length) {
-    try {
-      const tmp = `${REGISTRY}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
-      fs.renameSync(tmp, REGISTRY);
-    } catch {}
   }
 
   const header = { id: 'NAME', pid: 'PID', process: 'PROCESS', relay: 'RELAY', cwd: 'CWD' };
@@ -150,7 +145,9 @@ function fetchLiveSessions() {
   console.log(fmt(header));
   rows.forEach(r => console.log(fmt(r)));
   if (!rows.length) console.log('(none)');
-  if (pruned.length) console.log(`\nCleaned ${pruned.length} dead session(s) from the registry: ${pruned.join(', ')}`);
+  if (!connectedOnly && gone.length) {
+    console.log(`\nNot running (${gone.length}), kept so a restart gets its name back: ${gone.join(', ')}`);
+  }
   if (!connectedOnly && rows.some(r => r.relay === 'NO RELAY')) {
     console.log('\nNO RELAY = the process is running but has no relay connection, so it');
     console.log('cannot send or receive messages (its relay MCP is not running/connected).');
