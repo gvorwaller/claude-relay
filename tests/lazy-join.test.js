@@ -78,6 +78,7 @@ function bridge(t, { root, project, port }) {
   });
   t.after(() => mcp.kill('SIGTERM'));
   const answers = new Map();
+  const counts = new Map();
   let out = '';
   mcp.stdout.setEncoding('utf8');
   mcp.stdout.on('data', chunk => {
@@ -88,6 +89,7 @@ function bridge(t, { root, project, port }) {
       out = out.slice(newline + 1);
       try {
         const message = JSON.parse(line);
+        counts.set(message.id, (counts.get(message.id) || 0) + 1);
         if (answers.has(message.id)) answers.get(message.id)(message);
       } catch {}
     }
@@ -98,7 +100,10 @@ function bridge(t, { root, project, port }) {
   });
   return {
     mcp,
+    counts,
     request,
+    call: async (id, name, args = {}) => (await request(id, 'tools/call', { name, arguments: args }))
+      .result.content[0].text,
     status: async id => (await request(id, 'tools/call', { name: 'relay_status', arguments: {} }))
       .result.content[0].text,
     end: async () => {
@@ -137,10 +142,11 @@ test('the first relay call joins, waits for the join, and is answered as the joi
   const session = bridge(t, env);
   await session.request(1, 'initialize');
   const asked = Date.now();
-  assert.match(await session.status(2), /^Connected to .* as "PROBE2"/);
+  assert.match(await session.status(2), /^Note: joined the relay as "PROBE2"\.\nConnected to .* as "PROBE2"/);
   assert.ok(Date.now() - asked < 5000, 'answered as soon as the join lands, not at the 10s backstop');
   assert.deepEqual(joins, ['PROBE2']);
   assert.ok(registry(env.sessions).PROBE2);
+  assert.doesNotMatch(await session.status(3), /Note: joined/, 'said once');
 });
 
 test('a bridge that stays up past the delay joins on its own', LIMIT, async t => {
@@ -155,14 +161,41 @@ test('a bridge that stays up past the delay joins on its own', LIMIT, async t =>
   assert.deepEqual(joins, ['PROBE2']);
 });
 
-test('two fresh sessions that resolved the same number both join, the second as the next number', LIMIT, async t => {
+test('two fresh sessions that resolved the same number both join; the second is told its real name', LIMIT, async t => {
   const env = setup(t);
   const joins = await observe(t, env.port);
   const first = bridge(t, env);
   const second = bridge(t, env);
   await first.request(1, 'initialize');
   await second.request(1, 'initialize');
-  assert.match(await first.status(2), /as "PROBE2"/);
-  assert.match(await second.status(2), /as "PROBE3"/);
+  // The tool list is read before either has a name: it must not promise one.
+  for (const session of [first, second]) {
+    const tools = (await session.request(2, 'tools/list')).result.tools;
+    const send = tools.find(tool => tool.name === 'relay_send');
+    assert.doesNotMatch(send.description, /You are PROBE/);
+    assert.match(send.description, /relay_status shows it/);
+  }
+  assert.match(await first.status(3), /as "PROBE2"/);
+  const sent = await second.call(3, 'relay_send', { to: 'OBSERVER', message: 'hello' });
+  assert.match(sent, /^Note: joined the relay as "PROBE3" \("PROBE2" was taken by another session\)\. Peers reach you as "PROBE3"\./);
   assert.deepEqual(joins, ['PROBE2', 'PROBE3']);
+  const tools = (await second.request(4, 'tools/list')).result.tools;
+  assert.match(tools.find(tool => tool.name === 'relay_send').description, /You are PROBE3\./);
+});
+
+test('when the relay cannot be joined, a waiting call gets one failure and the bridge keeps running', LIMIT, async t => {
+  const env = setup(t);
+  const closed = await new Promise(resolve => {
+    const server = require('net').createServer();
+    server.listen(0, '127.0.0.1', () => { const { port } = server.address(); server.close(() => resolve(port)); });
+  });
+  const session = bridge(t, { ...env, port: closed });
+  await session.request(1, 'initialize');
+  const asked = Date.now();
+  const text = await session.call(2, 'relay_receive');
+  assert.match(text, /^Error: could not join the relay at ws:\/\/127\.0\.0\.1:\d+ within 10s\. No action was taken; try again\./);
+  assert.ok(Date.now() - asked >= 9000);
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  assert.equal(session.counts.get(2), 1, 'answered exactly once');
+  assert.equal(session.mcp.exitCode, null, 'the bridge is still running');
 });

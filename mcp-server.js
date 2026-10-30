@@ -921,6 +921,10 @@ let joinStarted = false;
 let lazyJoinTimer = null;
 let everRegistered = false;
 let numberedRetries = 0;
+let renumberedFrom = null;
+// The first answer after a lazy join names the label actually joined: the
+// tool list was read before there was one.
+let joinedNote = null;
 const callsAwaitingJoin = [];
 let joinWaitTimer = null;
 
@@ -931,10 +935,17 @@ function joinRelay() {
   connectToRelay();
 }
 
-function releaseCallsAwaitingJoin() {
+// Runs the waiting calls only on an open, registered socket; otherwise each
+// gets one plain failure. Every waiting call is answered exactly once.
+function releaseCallsAwaitingJoin(failure = null) {
   clearTimeout(joinWaitTimer);
   joinWaitTimer = null;
-  while (callsAwaitingJoin.length) callsAwaitingJoin.shift()();
+  const ready = !failure && connected && registered && ws && ws.readyState === WebSocket.OPEN;
+  while (callsAwaitingJoin.length) {
+    const call = callsAwaitingJoin.shift();
+    if (ready) call.run();
+    else sendToolText(call.id, failure || 'Error: not joined to the relay yet. No action was taken; try again.');
+  }
 }
 
 // A fresh numbered label is arbitrary: when another session claimed the same
@@ -1033,6 +1044,11 @@ rl.on('line', (line) => {
 });
 
 function sendMcpResponse(response) {
+  if (joinedNote && pendingToolCalls.has(response.id) && typeof response.result?.content?.[0]?.text === 'string') {
+    const [first, ...rest] = response.result.content;
+    response = { ...response, result: { ...response.result, content: [{ ...first, text: `${joinedNote}\n${first.text}` }, ...rest] } };
+    joinedNote = null;
+  }
   const json = JSON.stringify(response);
   process.stdout.write(json + '\n');
   if (!pendingToolCalls.has(response.id)) return;
@@ -1090,7 +1106,9 @@ function handleMcpMessage(message) {
           tools: [
             {
               name: 'relay_send',
-              description: `Send a message to peer Claude Code instance(s). You are ${CLIENT_ID}.`,
+              description: LAZY_JOIN && !everRegistered
+                ? 'Send a message to peer Claude Code instance(s). Your relay name is assigned when you first use the relay; relay_status shows it.'
+                : `Send a message to peer Claude Code instance(s). You are ${CLIENT_ID}.`,
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -1249,8 +1267,12 @@ function handleMcpMessage(message) {
       pendingToolCalls.set(id, params.name);
       if (LAZY_JOIN && !everRegistered && !rejectedReason) {
         joinRelay();
-        callsAwaitingJoin.push(() => handleToolCall(id, params.name, params.arguments || {}));
-        if (!joinWaitTimer) joinWaitTimer = setTimeout(releaseCallsAwaitingJoin, JOIN_WAIT_MS);
+        callsAwaitingJoin.push({ id, run: () => handleToolCall(id, params.name, params.arguments || {}) });
+        if (!joinWaitTimer) {
+          joinWaitTimer = setTimeout(() => releaseCallsAwaitingJoin(
+            `Error: could not join the relay at ${RELAY_URL} within ${JOIN_WAIT_MS / 1000}s. No action was taken; try again.`),
+          JOIN_WAIT_MS);
+        }
         break;
       }
       handleToolCall(id, params.name, params.arguments || {});
@@ -1857,9 +1879,14 @@ function connectToRelay() {
           registered = true;
           peers = msg.peers || [];
           if (!DELEGATE_FOR) {
+            if (LAZY_JOIN && !everRegistered) {
+              joinedNote = renumberedFrom
+                ? `Note: joined the relay as "${msg.clientId}" ("${renumberedFrom}" was taken by another session). Peers reach you as "${msg.clientId}".`
+                : `Note: joined the relay as "${msg.clientId}".`;
+            }
             everRegistered = true;
             // After this frame is fully handled (identity and registry).
-            setImmediate(releaseCallsAwaitingJoin);
+            setImmediate(() => releaseCallsAwaitingJoin());
           }
           // A newly enrolled label's owner capability arrives exactly once —
           // persist it durably BEFORE anything else claims the identity is
@@ -1951,13 +1978,18 @@ function connectToRelay() {
               && msg.clientId === CLIENT_ID && numberedRetries < NUMBERED_RETRIES) {
             numberedRetries += 1;
             const taken = CLIENT_ID;
+            renumberedFrom = renumberedFrom || taken;
             CLIENT_ID = nextFreshNumberedId(taken);
             console.error(`[Claude Relay MCP] ${taken} was claimed first; joining as ${CLIENT_ID}.`);
+            // The rejected socket's close is ignored once superseded, so the
+            // transport state is reset here, before the replacement opens.
+            connected = false;
+            registered = false;
             connectToRelay();
             break;
           }
           rejectedReason = msg.reason || `Label "${msg.clientId}" is owned by a live process`;
-          setImmediate(releaseCallsAwaitingJoin);
+          setImmediate(() => releaseCallsAwaitingJoin(`Error: could not join the relay: ${rejectedReason}. No action was taken.`));
           console.error(JSON.stringify({
             timestamp: new Date().toISOString(),
             event: 'relay_register_rejected',
