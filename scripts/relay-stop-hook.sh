@@ -58,6 +58,9 @@ def ps_field(pid, field):
     except Exception:
         return ""
 
+def same_time(a, b):
+    return " ".join(str(a).split()) == " ".join(str(b).split())
+
 registry_path, self_pid = sys.argv[1], sys.argv[2]
 try:
     registry = json.load(open(registry_path))
@@ -72,18 +75,39 @@ for _ in range(6):
         break
     ancestors.append(pid)
 
-bridge_parents = {}
+# A registry pid only names a bridge while that bridge is alive. macOS reuses
+# pids, and ended entries keep theirs (for label reclaim), so a dead
+# session's pid can come back as an unrelated child of THIS claude — even as
+# this hook itself. That made the hook adopt a dead peer's label and watch
+# the wrong mailbox (2026-10-29: CODEX64, then CODEX237). So: skip ended
+# entries; never take this hook or its own ancestors for a bridge; when the
+# entry recorded its bridge's parent (pid + start time), require that exact
+# parent; and resolve ties by evidence and recency, never by registry order.
+own = {str(self_pid), *ancestors}
+candidates = {}
 for label, info in registry.items():
+    if not isinstance(info, dict) or info.get("ended"):
+        continue
     bridge_pid = info.get("pid")
-    if not bridge_pid:
+    if not bridge_pid or str(bridge_pid) in own:
         continue
     parent = ps_field(bridge_pid, "ppid")
-    if parent:
-        bridge_parents[parent] = label
+    if not parent:
+        continue
+    verified = False
+    if info.get("parentPid") is not None:
+        if str(info["parentPid"]) != parent:
+            continue
+        if info.get("parentStarted"):
+            if not same_time(ps_field(parent, "lstart"), info["parentStarted"]):
+                continue
+            verified = True
+    candidates.setdefault(parent, []).append((verified, str(info.get("started") or ""), label))
 
 for ancestor in ancestors:
-    if ancestor in bridge_parents:
-        print(bridge_parents[ancestor], ancestor)
+    if ancestor in candidates:
+        _, _, label = max(candidates[ancestor])
+        print(label, ancestor)
         break
 PY
 }

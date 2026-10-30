@@ -411,3 +411,63 @@ test('a running Stop hook stands down when its session is renamed', async t => {
   assert.equal(await h.until(() => h.read('hook1.code')), '0');
   assert.equal(h.lockExists(), false, 'lock released for the next Stop');
 });
+
+// 2026-10-29: macOS reused a dead session's registry pid for a live child of
+// this claude (the hook itself), and the later registry entry won, so the
+// hook watched the dead peer's mailbox. Ended entries and entries whose
+// recorded parent is not the bridge's real parent must never be adopted.
+test('Stop hook ignores ended and re-parented registry entries that reuse a live pid', async t => {
+  const relayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
+  const port = startServer(t, relayRoot);
+  const h = stopHookHarness(t, port);
+  const bridge = Number(await h.until(() => h.read('bridge.pid')));
+  fs.writeFileSync(path.join(h.root, 'claude-relay', 'sessions', 'registry.json'), JSON.stringify({
+    LIVE: { pid: bridge, cwd: h.root, started: '2026-10-29T10:00:00.000Z' },
+    ZENDED: { pid: bridge, cwd: '/', started: '2026-10-29T12:00:00.000Z', ended: '2026-10-29T12:00:01.000Z' },
+    ZWRONGPARENT: { pid: bridge, cwd: '/', started: '2026-10-29T13:00:00.000Z', parentPid: 1, parentStarted: 'Thu Jan  1 00:00:00 1970' },
+    ZWRONGPPID: { pid: bridge, cwd: '/', started: '2026-10-29T14:00:00.000Z', parentPid: 1 },
+    // Same parent pid, different parent start time: a reused claude pid.
+    ZOLDCLAUDE: { pid: bridge, cwd: '/', started: '2026-10-29T15:00:00.000Z', parentPid: h.claude.pid, parentStarted: 'Thu Jan  1 00:00:00 1970' }
+  }));
+  h.stop();
+  assert.equal((await h.until(() => h.owner()?.[3] && h.owner()))[3], 'LIVE');
+});
+
+test('Stop hook never takes itself or its own ancestors for a bridge', async t => {
+  const relayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
+  const port = startServer(t, relayRoot);
+  const h = stopHookHarness(t, port);
+  await h.until(() => h.read('bridge.pid'));
+  // The fake claude is the hook's ancestor; its own parent is too, so an
+  // entry naming it would otherwise resolve through that grandparent.
+  fs.writeFileSync(path.join(h.root, 'claude-relay', 'sessions', 'registry.json'), JSON.stringify({
+    ANCESTOR: { pid: h.claude.pid, cwd: h.root, started: '2026-10-29T10:00:00.000Z' }
+  }));
+  h.stop();
+  assert.equal(await h.until(() => h.read('hook1.code')), '0');
+  assert.equal(h.lockExists(), false, 'no listener armed for an ancestor');
+});
+
+test('Stop hook prefers a verified parent, then the newest entry, never registry order', async t => {
+  const relayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-wake-'));
+  const port = startServer(t, relayRoot);
+  const h = stopHookHarness(t, port);
+  const bridge = Number(await h.until(() => h.read('bridge.pid')));
+  const lstart = require('child_process').execSync(`ps -o lstart= -p ${h.claude.pid}`, { encoding: 'utf8' }).trim();
+  const registry = path.join(h.root, 'claude-relay', 'sessions', 'registry.json');
+  // Verified (start time recorded with different spacing) beats a newer unverified entry.
+  fs.writeFileSync(registry, JSON.stringify({
+    ZNEWER: { pid: bridge, cwd: h.root, started: '2026-10-29T15:00:00.000Z' },
+    AVERIFIED: { pid: bridge, cwd: h.root, started: '2026-10-29T10:00:00.000Z',
+      parentPid: h.claude.pid, parentStarted: `  ${lstart.replace(/ /g, '   ')} ` }
+  }));
+  h.stop();
+  assert.equal((await h.until(() => h.owner()?.[3] && h.owner()))[3], 'AVERIFIED');
+  // Among unverified entries the newest wins, whichever comes first in the file.
+  fs.writeFileSync(registry, JSON.stringify({
+    ZOLDER: { pid: bridge, cwd: h.root, started: '2026-10-29T09:00:00.000Z' },
+    ANEWER: { pid: bridge, cwd: h.root, started: '2026-10-29T11:00:00.000Z' }
+  }));
+  h.stop();
+  assert.equal((await h.until(() => h.owner()?.[3] === 'ANEWER' && h.owner()))[3], 'ANEWER');
+});
