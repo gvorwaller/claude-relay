@@ -625,7 +625,8 @@ const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 // unless the relay holds mail to or from it, or a wake job for it (work done
 // by a predecessor bridge, or by a delegate while no bridge was connected).
 // That marks the label used for good. Mail and jobs are kept 7 days, well
-// past the one-day wait, and bridges connect every few minutes.
+// past the one-day wait, and bridges connect every few minutes. Nothing is
+// pruned unless the store is verifiably this relay's and read in full.
 const DISPOSABLE_MAX_LIFE_MS = 60 * 1000;
 const DISPOSABLE_TTL_MS = 24 * 60 * 60 * 1000;
 const NUMBERED_BIRTH_SOURCES = ['auto-numbered', 'codex-reconnect'];
@@ -636,53 +637,71 @@ function disposableEntryExpired(info, now = Date.now()) {
   return !Number.isNaN(ended) && now - ended > DISPOSABLE_TTL_MS;
 }
 
-function readDirOrEmpty(dir) {
+// Whether RELAY_MESSAGES_DIR is the store of the relay this bridge talks to:
+// the runtime status beside it names a live server.js listening on the
+// loopback port in RELAY_URL, and its mail and job directories exist. A
+// remote relay, or a server whose store was moved, is never assumed empty.
+function relayStoreVerified() {
   try {
-    return fs.readdirSync(dir);
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
+    const status = JSON.parse(fs.readFileSync(
+      path.join(path.dirname(RELAY_MESSAGES_DIR), 'runtime-status.json'), 'utf8'));
+    const url = new URL(RELAY_URL);
+    const loopback = host => ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host);
+    const port = Number(url.port || (url.protocol === 'wss:' ? 443 : 80));
+    return loopback(url.hostname) && loopback(status.host) && Number(status.port) === port
+      && /server\.js\b/.test(psField(Number(status.pid), 'args'))
+      && fs.statSync(RELAY_MESSAGES_DIR).isDirectory()
+      && fs.statSync(RELAY_JOBS_DIR).isDirectory();
+  } catch {
+    return false;
   }
 }
 
 // Every label the relay's durable records name: mail to or from it, or a
-// wake job owned by it. null when any record cannot be read: then nothing is
-// pruned this time.
-function labelsWithRelayRecords() {
+// wake job owned by it. `complete` is false when the store is unverified or
+// any record cannot be read; what could be read still counts.
+function scanRelayRecords() {
   const labels = new Set();
-  try {
-    for (const name of readDirOrEmpty(RELAY_MESSAGES_DIR)) {
-      if (!/^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)) continue;
-      for (const line of fs.readFileSync(path.join(RELAY_MESSAGES_DIR, name), 'utf8').split('\n')) {
-        if (!line.trim()) continue;
+  let complete = relayStoreVerified();
+  const read = (dir, pattern, visit) => {
+    let names = [];
+    try { names = fs.readdirSync(dir).filter(name => pattern.test(name)); } catch { complete = false; }
+    for (const name of names) {
+      try { visit(fs.readFileSync(path.join(dir, name), 'utf8')); } catch { complete = false; }
+    }
+  };
+  read(RELAY_MESSAGES_DIR, /^\d{4}-\d{2}-\d{2}\.jsonl$/, text => {
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
         const message = JSON.parse(line);
         if (typeof message?.to === 'string') labels.add(message.to);
         if (typeof message?.from === 'string') labels.add(message.from);
+      } catch {
+        complete = false;
       }
     }
-    for (const name of readDirOrEmpty(RELAY_JOBS_DIR)) {
-      if (!name.endsWith('.json')) continue;
-      const job = JSON.parse(fs.readFileSync(path.join(RELAY_JOBS_DIR, name), 'utf8'));
-      if (typeof job?.owner === 'string') labels.add(job.owner);
-    }
-  } catch {
-    return null;
-  }
-  return labels;
+  });
+  read(RELAY_JOBS_DIR, /\.json$/, text => {
+    const job = JSON.parse(text);
+    if (typeof job?.owner === 'string') labels.add(job.owner);
+  });
+  return { labels, complete };
 }
 
+// Marks every unproven numbered label the records name as used, for good.
+// Returns whether pruning may go ahead: only on a complete, verified scan.
 function protectRecordedLabels(registry) {
   const unproven = Object.entries(registry)
     .filter(([, info]) => (info?.numberedBornAt || info?.disposable) && !info.usedAt);
   if (!unproven.length) return true;
-  const records = labelsWithRelayRecords();
-  if (!records) return false;
+  const { labels, complete } = scanRelayRecords();
   for (const [id, info] of unproven) {
-    if (!records.has(id)) continue;
+    if (!labels.has(id)) continue;
     info.usedAt = new Date().toISOString();
     delete info.disposable;
   }
-  return true;
+  return complete;
 }
 
 function pruneOrphanIdentities(registry) {

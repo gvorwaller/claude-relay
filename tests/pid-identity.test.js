@@ -657,6 +657,17 @@ test('the first relay call marks the label used, and the mark survives exit', as
   assert.equal(after.USEDME.usedAt, used.USEDME.usedAt);
 });
 
+// The runtime status a test relay writes beside its store once it is up;
+// a bridge prunes only after it can verify that store.
+async function relayStatus(root) {
+  for (let tries = 0; tries < 200; tries += 1) {
+    try { return JSON.parse(fs.readFileSync(path.join(root, 'runtime-status.json'), 'utf8')); } catch {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  throw new Error('the test relay never wrote its runtime status');
+}
+
 test('a connecting bridge prunes only day-old entries marked disposable, never older unmarked ones', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
@@ -691,9 +702,12 @@ test('a connecting bridge prunes only day-old entries marked disposable, never o
     MALFORMED: null
   });
 
+  await relayStatus(root);
   const joined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
-  spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER' });
+  spawnBridge(t, root, port, projDir, {
+    CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: path.join(root, 'messages')
+  });
   await joined;
   const registry = await registryWhen(root, registry => Boolean(registry.PRUNER));
   assert.deepEqual(Object.keys(registry).sort(), [
@@ -701,7 +715,7 @@ test('a connecting bridge prunes only day-old entries marked disposable, never o
   ]);
 });
 
-test('mail or a wake job on record protects a disposable label for good; unreadable records block pruning', async t => {
+test('mail or a wake job on record protects a disposable label for good; unreadable records block pruning only', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
   const projDir = path.join(root, 'proj');
@@ -740,6 +754,7 @@ test('mail or a wake job on record protects a disposable label for good; unreada
   fs.writeFileSync(path.join(jobs, 'wake_1.json'), JSON.stringify({ jobId: 'wake_1', owner: 'JOBOWNER' }));
 
   const env = { RELAY_MESSAGE_DIR: messages };
+  await relayStatus(root);
   const joined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
   const first = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
@@ -751,21 +766,112 @@ test('mail or a wake job on record protects a disposable label for good; unreada
     assert.equal(registry[id].disposable, undefined, `${id} is no longer disposable`);
   }
 
-  // Unreadable records: nothing is pruned this time.
+  // A record that cannot be read: labels named by the readable ones are
+  // still marked used for good, but nothing is pruned this time.
   const firstExit = new Promise(resolve => first.once('exit', resolve));
   first.kill('SIGTERM');
   await firstExit;
   const next = readRegistryFile(root);
   next.GONE2 = disposable();
+  next.MAILED = disposable();
   writeRegistry(root, next);
-  fs.writeFileSync(path.join(jobs, 'wake_2.json'), '{"owner": "CUT');
+  fs.writeFileSync(path.join(messages, '2000-01-02.jsonl'),
+    `${JSON.stringify({ id: 'm5', from: 'CC1', to: 'MAILED', content: 'w' })}\n{"to": "CUT`);
   const rejoined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
   const second = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
   await rejoined;
-  const after = await registryWhen(root, registry => registry.PRUNER?.pid === second.pid);
-  assert.ok(after.GONE2, 'kept while the records cannot be read');
-  assert.equal(after.GONE2.disposable, true);
+  const partial = await registryWhen(root, registry => registry.PRUNER?.pid === second.pid);
+  assert.ok(partial.GONE2, 'kept while a record cannot be read');
+  assert.equal(partial.GONE2.disposable, true);
+  assert.ok(partial.MAILED.usedAt, 'readable mail still marks its label');
+  assert.equal(partial.MAILED.disposable, undefined);
+
+  // The mail ages out and the store reads cleanly again: the mark stays,
+  // and only the unmarked disposable entry goes.
+  const secondExit = new Promise(resolve => second.once('exit', resolve));
+  second.kill('SIGTERM');
+  await secondExit;
+  fs.rmSync(path.join(messages, '2000-01-02.jsonl'));
+  const clean = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  const third = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
+  await clean;
+  const after = await registryWhen(root, registry => registry.PRUNER?.pid === third.pid);
+  assert.equal(after.GONE2, undefined);
+  assert.ok(after.MAILED.usedAt);
+
+  // A wake job that cannot be read blocks pruning too.
+  const thirdExit = new Promise(resolve => third.once('exit', resolve));
+  third.kill('SIGTERM');
+  await thirdExit;
+  const last = readRegistryFile(root);
+  last.GONE3 = disposable();
+  writeRegistry(root, last);
+  fs.writeFileSync(path.join(jobs, 'wake_2.json'), '{"owner": "CUT');
+  const fourthJoined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  const fourth = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
+  await fourthJoined;
+  const blocked = await registryWhen(root, registry => registry.PRUNER?.pid === fourth.pid);
+  assert.ok(blocked.GONE3, 'kept while a wake job cannot be read');
+});
+
+test('a bridge prunes nothing when it cannot verify the store belongs to its relay', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
+  const port = startServer(t, root);
+  const projDir = path.join(root, 'proj');
+  fs.mkdirSync(projDir);
+  const observer = await connectWithRetry(port, 'A', { pid: process.pid });
+  t.after(() => observer.close());
+
+  const hour = 60 * 60 * 1000;
+  const disposable = () => ({
+    cwd: '/', source: 'auto-numbered', disposable: true,
+    started: new Date(Date.now() - 25 * hour - 700).toISOString(),
+    ended: new Date(Date.now() - 25 * hour).toISOString()
+  });
+  // Mail and jobs dirs that exist but are not this relay's (no runtime
+  // status beside them, as for a remote relay or a moved server store).
+  const elsewhere = path.join(root, 'elsewhere');
+  fs.mkdirSync(path.join(elsewhere, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(elsewhere, 'jobs'), { recursive: true });
+  const status = await relayStatus(root);
+  const runs = [
+    ['no status', () => {}],
+    ['another port', () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
+      JSON.stringify({ ...status, port: status.port + 1 }))],
+    ['a dead server', async () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
+      JSON.stringify({ ...status, pid: await deadPid() }))],
+    ['not a relay server', () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
+      JSON.stringify({ ...status, pid: process.pid }))]
+  ];
+  for (const [why, arrange] of runs) {
+    await arrange();
+    writeRegistry(root, { GONE: disposable() });
+    const joined = waitForMessage(observer, msg =>
+      msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+    const mcp = spawnBridge(t, root, port, projDir, {
+      CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: path.join(elsewhere, 'messages')
+    });
+    await joined;
+    const registry = await registryWhen(root, registry => registry.PRUNER?.pid === mcp.pid);
+    assert.ok(registry.GONE, `kept with ${why}`);
+    const exited = new Promise(resolve => mcp.once('exit', resolve));
+    mcp.kill('SIGTERM');
+    await exited;
+  }
+
+  // The same status beside the right store verifies, and the entry goes.
+  writeRegistry(root, { GONE: disposable() });
+  const joined = waitForMessage(observer, msg =>
+    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
+  const mcp = spawnBridge(t, root, port, projDir, {
+    CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: path.join(root, 'messages')
+  });
+  await joined;
+  const registry = await registryWhen(root, registry => registry.PRUNER?.pid === mcp.pid);
+  assert.equal(registry.GONE, undefined);
 });
 
 // A fresh numbered label: PROBE is taken by another cwd, so this bridge is
