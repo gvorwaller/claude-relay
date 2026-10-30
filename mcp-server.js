@@ -626,7 +626,7 @@ const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 // by a predecessor bridge, or by a delegate while no bridge was connected).
 // That marks the label used for good. Mail and jobs are kept 7 days, well
 // past the one-day wait, and bridges connect every few minutes. Nothing is
-// pruned unless the store is verifiably this relay's and read in full.
+// pruned unless the relay confirms the store is its own and it is read in full.
 const DISPOSABLE_MAX_LIFE_MS = 60 * 1000;
 const DISPOSABLE_TTL_MS = 24 * 60 * 60 * 1000;
 const NUMBERED_BIRTH_SOURCES = ['auto-numbered', 'codex-reconnect'];
@@ -637,21 +637,20 @@ function disposableEntryExpired(info, now = Date.now()) {
   return !Number.isNaN(ended) && now - ended > DISPOSABLE_TTL_MS;
 }
 
-// Whether RELAY_MESSAGES_DIR is the store of the relay this bridge talks to:
-// the runtime status beside it names a live server.js listening on the
-// loopback port in RELAY_URL, and its mail and job directories exist. A
-// remote relay, or a server whose store was moved, is never assumed empty.
+// The store id the connected relay reported at registration (server.js
+// STORE_ID): the hash of its mail and job directories' real paths.
+let relayStoreId = null;
+
+// Whether RELAY_MESSAGES_DIR and RELAY_JOBS_DIR are exactly the store of the
+// relay this bridge is registered with, as that relay itself reports. A
+// remote relay, a moved or sibling store, or an older relay that reports no
+// id is never assumed to be the place where a label's mail would be.
 function relayStoreVerified() {
   try {
-    const status = JSON.parse(fs.readFileSync(
-      path.join(path.dirname(RELAY_MESSAGES_DIR), 'runtime-status.json'), 'utf8'));
-    const url = new URL(RELAY_URL);
-    const loopback = host => ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host);
-    const port = Number(url.port || (url.protocol === 'wss:' ? 443 : 80));
-    return loopback(url.hostname) && loopback(status.host) && Number(status.port) === port
-      && /server\.js\b/.test(psField(Number(status.pid), 'args'))
-      && fs.statSync(RELAY_MESSAGES_DIR).isDirectory()
-      && fs.statSync(RELAY_JOBS_DIR).isDirectory();
+    const local = require('crypto').createHash('sha256')
+      .update(`${fs.realpathSync(RELAY_MESSAGES_DIR)}\0${fs.realpathSync(RELAY_JOBS_DIR)}`)
+      .digest('hex');
+    return local === relayStoreId;
   } catch {
     return false;
   }
@@ -1929,6 +1928,7 @@ function connectToRelay() {
         case 'registered':
           registered = true;
           peers = msg.peers || [];
+          relayStoreId = typeof msg.storeId === 'string' ? msg.storeId : null;
           // A newly enrolled label's owner capability arrives exactly once —
           // persist it durably BEFORE anything else claims the identity is
           // established, or the server holds an enrollment whose only

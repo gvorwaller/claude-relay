@@ -657,17 +657,6 @@ test('the first relay call marks the label used, and the mark survives exit', as
   assert.equal(after.USEDME.usedAt, used.USEDME.usedAt);
 });
 
-// The runtime status a test relay writes beside its store once it is up;
-// a bridge prunes only after it can verify that store.
-async function relayStatus(root) {
-  for (let tries = 0; tries < 200; tries += 1) {
-    try { return JSON.parse(fs.readFileSync(path.join(root, 'runtime-status.json'), 'utf8')); } catch {
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-  }
-  throw new Error('the test relay never wrote its runtime status');
-}
-
 test('a connecting bridge prunes only day-old entries marked disposable, never older unmarked ones', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
@@ -702,7 +691,6 @@ test('a connecting bridge prunes only day-old entries marked disposable, never o
     MALFORMED: null
   });
 
-  await relayStatus(root);
   const joined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
   spawnBridge(t, root, port, projDir, {
@@ -754,7 +742,6 @@ test('mail or a wake job on record protects a disposable label for good; unreada
   fs.writeFileSync(path.join(jobs, 'wake_1.json'), JSON.stringify({ jobId: 'wake_1', owner: 'JOBOWNER' }));
 
   const env = { RELAY_MESSAGE_DIR: messages };
-  await relayStatus(root);
   const joined = waitForMessage(observer, msg =>
     msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
   const first = spawnBridge(t, root, port, projDir, { CLAUDE_RELAY_SESSION_ID: 'PRUNER', ...env });
@@ -817,7 +804,7 @@ test('mail or a wake job on record protects a disposable label for good; unreada
   assert.ok(blocked.GONE3, 'kept while a wake job cannot be read');
 });
 
-test('a bridge prunes nothing when it cannot verify the store belongs to its relay', async t => {
+test('a bridge prunes only when its relay confirms the store it reads is its own', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reclaim-')));
   const port = startServer(t, root);
   const projDir = path.join(root, 'proj');
@@ -825,53 +812,40 @@ test('a bridge prunes nothing when it cannot verify the store belongs to its rel
   const observer = await connectWithRetry(port, 'A', { pid: process.pid });
   t.after(() => observer.close());
 
+  // Another relay with its own store, never the one this bridge talks to.
+  const otherRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'relay-other-')));
+  const otherPort = startServer(t, otherRoot);
+  const other = await connectWithRetry(otherPort, 'B', { pid: process.pid });
+  t.after(() => other.close());
+  // An empty sibling beside the real mail store, sharing its jobs directory.
+  fs.mkdirSync(path.join(root, 'alternate-messages'));
+
   const hour = 60 * 60 * 1000;
   const disposable = () => ({
     cwd: '/', source: 'auto-numbered', disposable: true,
     started: new Date(Date.now() - 25 * hour - 700).toISOString(),
     ended: new Date(Date.now() - 25 * hour).toISOString()
   });
-  // Mail and jobs dirs that exist but are not this relay's (no runtime
-  // status beside them, as for a remote relay or a moved server store).
-  const elsewhere = path.join(root, 'elsewhere');
-  fs.mkdirSync(path.join(elsewhere, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(elsewhere, 'jobs'), { recursive: true });
-  const status = await relayStatus(root);
   const runs = [
-    ['no status', () => {}],
-    ['another port', () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
-      JSON.stringify({ ...status, port: status.port + 1 }))],
-    ['a dead server', async () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
-      JSON.stringify({ ...status, pid: await deadPid() }))],
-    ['not a relay server', () => fs.writeFileSync(path.join(elsewhere, 'runtime-status.json'),
-      JSON.stringify({ ...status, pid: process.pid }))]
+    ['a sibling mail directory', path.join(root, 'alternate-messages'), true],
+    ["another relay's store", path.join(otherRoot, 'messages'), true],
+    ['a missing directory', path.join(root, 'no-such-messages'), true],
+    ["the relay's own store", path.join(root, 'messages'), false]
   ];
-  for (const [why, arrange] of runs) {
-    await arrange();
+  for (const [why, messages, kept] of runs) {
     writeRegistry(root, { GONE: disposable() });
     const joined = waitForMessage(observer, msg =>
       msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
     const mcp = spawnBridge(t, root, port, projDir, {
-      CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: path.join(elsewhere, 'messages')
+      CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: messages
     });
     await joined;
     const registry = await registryWhen(root, registry => registry.PRUNER?.pid === mcp.pid);
-    assert.ok(registry.GONE, `kept with ${why}`);
+    assert.equal(Boolean(registry.GONE), kept, `${kept ? 'kept' : 'pruned'} with ${why}`);
     const exited = new Promise(resolve => mcp.once('exit', resolve));
     mcp.kill('SIGTERM');
     await exited;
   }
-
-  // The same status beside the right store verifies, and the entry goes.
-  writeRegistry(root, { GONE: disposable() });
-  const joined = waitForMessage(observer, msg =>
-    msg.type === 'peer_joined' && msg.clientId === 'PRUNER', 10000);
-  const mcp = spawnBridge(t, root, port, projDir, {
-    CLAUDE_RELAY_SESSION_ID: 'PRUNER', RELAY_MESSAGE_DIR: path.join(root, 'messages')
-  });
-  await joined;
-  const registry = await registryWhen(root, registry => registry.PRUNER?.pid === mcp.pid);
-  assert.equal(registry.GONE, undefined);
 });
 
 // A fresh numbered label: PROBE is taken by another cwd, so this bridge is
