@@ -63,10 +63,6 @@ function toolAllowed(toolName) {
 const SESSIONS_DIR = path.join(os.homedir(), 'claude-relay', 'sessions');
 const REGISTRY_FILE = path.join(SESSIONS_DIR, 'registry.json');
 const READ_CURSORS_FILE = path.join(SESSIONS_DIR, 'read-cursors.json');
-// The relay server's durable mail and wake-job records (same defaults and
-// RELAY_MESSAGE_DIR override as server.js). Read only, to protect labels.
-const RELAY_MESSAGES_DIR = process.env.RELAY_MESSAGE_DIR || path.join(__dirname, 'data', 'messages');
-const RELAY_JOBS_DIR = path.join(path.dirname(RELAY_MESSAGES_DIR), 'jobs');
 
 // Ensure sessions directory exists
 try {
@@ -562,12 +558,6 @@ if (DELEGATE_FOR) {
 // (no restart, no env vars) when startup resolution picked the wrong ID.
 let CLIENT_ID = resolvedIdentity.id;
 let CLIENT_ID_SOURCE = resolvedIdentity.source;
-// First relay tool call this bridge handled; recorded on the registry entry
-// (retried on later calls, and flushed at disconnect, if that write failed).
-let relayUsedAt = null;
-let relayUsedRecorded = false;
-// Mail for this label reached the bridge (a wake may act on it elsewhere).
-let relayMailSeen = false;
 // Stable start time for this process, reported to the relay server so peers can
 // see it in the cluster-wide session list. Captured once so it survives reconnects.
 const STARTED_AT = new Date().toISOString();
@@ -615,101 +605,10 @@ const AUTO_ID_PATTERN = new RegExp(
   `^${escapeRegExp(os.hostname().split('.')[0].toUpperCase())}-[0-9a-z]+(-bg[0-9a-z]+)?$`);
 const WAKE_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 
-// The ChatGPT app starts bridges just to look at the tool list: bursts of
-// several every few minutes, each gone within seconds, each under a fresh
-// CODEXnn label that no session ever comes back to. Only positive evidence
-// marks one: the bridge that ends it records `disposable` when the label was
-// born numbered under a minute before, and it made no relay call and saw no
-// mail. Entries without that mark (every older entry, every deliberate
-// label) are never pruned here. A day after a disposable one ended it goes —
-// unless the relay holds mail to or from it, or a wake job for it (work done
-// by a predecessor bridge, or by a delegate while no bridge was connected).
-// That marks the label used for good. Mail and jobs are kept 7 days, well
-// past the one-day wait, and bridges connect every few minutes. Nothing is
-// pruned unless the relay confirms the store is its own and it is read in full.
-const DISPOSABLE_MAX_LIFE_MS = 60 * 1000;
-const DISPOSABLE_TTL_MS = 24 * 60 * 60 * 1000;
-const NUMBERED_BIRTH_SOURCES = ['auto-numbered', 'codex-reconnect'];
-
-function disposableEntryExpired(info, now = Date.now()) {
-  if (info?.disposable !== true || info.usedAt || registryPidAlive(info) === true) return false;
-  const ended = Date.parse(info.ended);
-  return !Number.isNaN(ended) && now - ended > DISPOSABLE_TTL_MS;
-}
-
-// The store id the connected relay reported at registration (server.js
-// STORE_ID): the hash of its mail and job directories' real paths.
-let relayStoreId = null;
-
-// Whether RELAY_MESSAGES_DIR and RELAY_JOBS_DIR are exactly the store of the
-// relay this bridge is registered with, as that relay itself reports. A
-// remote relay, a moved or sibling store, or an older relay that reports no
-// id is never assumed to be the place where a label's mail would be.
-function relayStoreVerified() {
-  try {
-    const local = require('crypto').createHash('sha256')
-      .update(`${fs.realpathSync(RELAY_MESSAGES_DIR)}\0${fs.realpathSync(RELAY_JOBS_DIR)}`)
-      .digest('hex');
-    return local === relayStoreId;
-  } catch {
-    return false;
-  }
-}
-
-// Every label the relay's durable records name: mail to or from it, or a
-// wake job owned by it. `complete` is false when the store is unverified or
-// any record cannot be read; what could be read still counts.
-function scanRelayRecords() {
-  const labels = new Set();
-  let complete = relayStoreVerified();
-  const read = (dir, pattern, visit) => {
-    let names = [];
-    try { names = fs.readdirSync(dir).filter(name => pattern.test(name)); } catch { complete = false; }
-    for (const name of names) {
-      try { visit(fs.readFileSync(path.join(dir, name), 'utf8')); } catch { complete = false; }
-    }
-  };
-  read(RELAY_MESSAGES_DIR, /^\d{4}-\d{2}-\d{2}\.jsonl$/, text => {
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const message = JSON.parse(line);
-        if (typeof message?.to === 'string') labels.add(message.to);
-        if (typeof message?.from === 'string') labels.add(message.from);
-      } catch {
-        complete = false;
-      }
-    }
-  });
-  read(RELAY_JOBS_DIR, /\.json$/, text => {
-    const job = JSON.parse(text);
-    if (typeof job?.owner === 'string') labels.add(job.owner);
-  });
-  return { labels, complete };
-}
-
-// Marks every unproven numbered label the records name as used, for good.
-// Returns whether pruning may go ahead: only on a complete, verified scan.
-function protectRecordedLabels(registry) {
-  const unproven = Object.entries(registry)
-    .filter(([, info]) => (info?.numberedBornAt || info?.disposable) && !info.usedAt);
-  if (!unproven.length) return true;
-  const { labels, complete } = scanRelayRecords();
-  for (const [id, info] of unproven) {
-    if (!labels.has(id)) continue;
-    info.usedAt = new Date().toISOString();
-    delete info.disposable;
-  }
-  return complete;
-}
-
 function pruneOrphanIdentities(registry) {
-  const recordsChecked = protectRecordedLabels(registry);
   for (const [id, info] of Object.entries(registry)) {
     if (id === CLIENT_ID) continue;
     if (['auto', 'background-fork'].includes(info?.source) && registryPidAlive(info) === false) {
-      delete registry[id];
-    } else if (recordsChecked && disposableEntryExpired(info)) {
       delete registry[id];
     }
   }
@@ -739,22 +638,13 @@ function pruneOrphanIdentities(registry) {
 function updateRegistry(action = 'connect') {
   // Delegates are transient helpers acting for a label someone else owns;
   // they must never write the label->pid registry.
-  if (DELEGATE_FOR) return true;
+  if (DELEGATE_FOR) return;
   try {
-    return withRegistryLock(() => {
+    withRegistryLock(() => {
     let registry = readRegistry();
 
     if (action === 'connect') {
       pruneOrphanIdentities(registry);
-      const prior = registry[CLIENT_ID];
-      // A label once used for relay work stays used across reconnects.
-      const usedAt = prior?.usedAt || relayUsedAt;
-      // When a fresh numbered label was first made (auto-numbered labels are
-      // always new). Only a numbered continuation carries it on (a
-      // codex-reconnect always has a prior entry); a reclaim or rename is
-      // deliberate and drops it.
-      const numberedBornAt = !NUMBERED_BIRTH_SOURCES.includes(CLIENT_ID_SOURCE) ? null
-        : prior ? prior.numberedBornAt || null : new Date().toISOString();
       registry[CLIENT_ID] = {
         pid: process.pid,
         started: new Date().toISOString(),
@@ -774,22 +664,17 @@ function updateRegistry(action = 'connect') {
           ? { agentBridgeSessionId: process.env.CLAUDE_CODE_BRIDGE_SESSION_ID }
           : {}),
         // Exact owning Codex conversation, when unambiguously resolvable.
-        ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {}),
-        ...(usedAt ? { usedAt } : {}),
-        ...(numberedBornAt ? { numberedBornAt } : {})
+        ...(CODEX_SESSION_ID ? { codexSessionId: CODEX_SESSION_ID } : {})
       };
-    } else if (action === 'used') {
-      // Not ours (yet, or any more): connect carries relayUsedAt when it is.
-      if (registry[CLIENT_ID]?.pid !== process.pid || registry[CLIENT_ID].usedAt) return true;
-      registry[CLIENT_ID].usedAt = relayUsedAt;
     } else if (action === 'release') {
       // Deliberate abandonment (relay_rename away from a wrong identity):
       // the mapping is incorrect, so it must not survive for reclaim.
       delete registry[CLIENT_ID];
     } else if (action === 'disconnect' && (CLIENT_ID_SOURCE === 'auto' || CLIENT_ID_SOURCE === 'background-fork')) {
       // Throwaway identities (hostname-pid, bg-fork suffixes) never recur;
-      // drop them so they don't clutter the registry. Only our own entry.
-      if (registry[CLIENT_ID]?.pid !== process.pid) return true;
+      // drop them so they don't clutter the registry. Only our own entry: a
+      // reconnect that retired this bridge may already hold the label.
+      if (registry[CLIENT_ID]?.pid !== process.pid) return;
       delete registry[CLIENT_ID];
     } else if (action === 'disconnect') {
       // Keep the label->cwd mapping on clean exit (marked ended). This is
@@ -797,26 +682,15 @@ function updateRegistry(action = 'connect') {
       // is why restarts used to come up auto-numbered. The pid goes: the OS
       // reuses it, and a reused pid made a dead label look live. Only our own
       // entry: a reconnect that retired this bridge may already own the label.
-      const entry = registry[CLIENT_ID];
-      if (entry?.pid !== process.pid) return true;
-      const now = Date.now();
-      entry.ended = new Date(now).toISOString();
-      delete entry.pid;
-      // A use whose first write failed is flushed here.
-      if (relayUsedAt && !entry.usedAt) entry.usedAt = relayUsedAt;
-      const born = Date.parse(entry.numberedBornAt);
-      if (!entry.usedAt && !relayMailSeen && !Number.isNaN(born)
-          && now - born < DISPOSABLE_MAX_LIFE_MS) {
-        entry.disposable = true;
-      }
+      if (registry[CLIENT_ID]?.pid !== process.pid) return;
+      registry[CLIENT_ID].ended = new Date().toISOString();
+      delete registry[CLIENT_ID].pid;
     }
 
     writeRegistryAtomic(registry);
-    return true;
-    }) === true;
+    });
   } catch (err) {
     // Non-fatal: don't interrupt MCP operation for registry issues
-    return false;
   }
 }
 
@@ -1323,8 +1197,6 @@ function handleMcpMessage(message) {
         break;
       }
       pendingToolCalls.set(id, params.name);
-      if (!relayUsedAt) relayUsedAt = new Date().toISOString();
-      if (!relayUsedRecorded) relayUsedRecorded = updateRegistry('used');
       handleToolCall(id, params.name, params.arguments || {});
       break;
 
@@ -1928,7 +1800,6 @@ function connectToRelay() {
         case 'registered':
           registered = true;
           peers = msg.peers || [];
-          relayStoreId = typeof msg.storeId === 'string' ? msg.storeId : null;
           // A newly enrolled label's owner capability arrives exactly once —
           // persist it durably BEFORE anything else claims the identity is
           // established, or the server holds an enrollment whose only
@@ -2190,7 +2061,6 @@ function connectToRelay() {
           break;
 
         case 'message':
-          relayMailSeen = true;
           // Keep pushed messages available to relay_receive.
           messageQueue.push({
             type: 'message',

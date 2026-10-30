@@ -90,13 +90,6 @@ const jobStore = new DelegateJobStore({
   logger
 }).initialize();
 
-// Which mail and job store this relay keeps, by the hash of their real paths
-// (no paths leave the host). A local bridge checks it before trusting its own
-// view of that store, e.g. to decide no mail ever named a label.
-const STORE_ID = createHash('sha256')
-  .update(`${fs.realpathSync(messageStore.dataDir)}\0${fs.realpathSync(jobStore.dataDir)}`)
-  .digest('hex');
-
 const notifyHooks = new NotifyHooks({
   configPath: process.env.RELAY_NOTIFY_CONFIG || path.join(__dirname, 'data', 'notify.json'),
   logger,
@@ -816,7 +809,6 @@ wss.on('connection', (ws, req) => {
             type: 'registered',
             clientId,
             peers: Array.from(clients.keys()).filter(id => id !== clientId),
-            storeId: STORE_ID,
             ...(mintedOwnerSecret ? { ownerSecret: mintedOwnerSecret } : {}),
             ...(renameCursor ? { renameCursor } : {})
           }));

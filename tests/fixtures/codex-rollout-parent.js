@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const [mcpServer, root, project, port, oldRollout, currentRollout, oldSession, seedJson] = process.argv.slice(2);
+const [mcpServer, root, project, port, oldRollout, currentRollout, oldSession] = process.argv.slice(2);
 const heldFiles = [fs.openSync(oldRollout, 'r'), fs.openSync(currentRollout, 'r')];
 const common = {
   ...process.env,
@@ -24,8 +24,7 @@ fs.writeFileSync(path.join(sessions, 'registry.json'), JSON.stringify({
     pid: predecessor.pid,
     cwd: project,
     source: 'registry-cwd',
-    codexSessionId: oldSession,
-    ...(seedJson ? JSON.parse(seedJson) : {})
+    codexSessionId: oldSession
   }
 }));
 
