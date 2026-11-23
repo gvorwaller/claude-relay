@@ -78,6 +78,56 @@ test('runner classifies only recognized startup errors and never copies stderr i
   assert.match(readStartupFailure(file), /executable is missing/);
 });
 
+test('runner writes Codex error events to the wake log and names a usage limit with a fixed reason only', t => {
+  const root = temporary(t);
+  const file = path.join(root, 'failure');
+  const limit = 'You\u2019ve hit your usage limit. Try again at Nov 26th. token=DO_NOT_PUBLISH';
+  const notice = { type: 'item.completed', item: { id: 'item_0', type: 'error', message: '[features].collab is deprecated.' } };
+  const failed = message => [{ type: 'error', message }, { type: 'turn.failed', error: { message } }];
+  const run = events => {
+    fs.writeFileSync(file, '');
+    const body = [{ type: 'thread.started', thread_id: 't1' }, { type: 'turn.started' }, ...events]
+      .map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join('') + 'setTimeout(()=>process.exit(1),20);';
+    return spawnSync(process.execPath, [path.join(repo, 'scripts/run-codex-delegate.js'), '--', process.execPath, '-e', body],
+      { encoding: 'utf8', env: { ...process.env, RELAY_JOB_ID: 'wake_test', RELAY_DELEGATE_FOR: 'CODEXTEST',
+        RELAY_JOB_RESULT_SECRET_FILE: '', RELAY_JOB_FAILURE_FILE: file } });
+  };
+
+  const limited = run([notice, ...failed(limit)]);
+  assert.equal(limited.status, 78, 'a usage limit is not cured by an immediate retry');
+  assert.match(readStartupFailure(file), /usage limit/);
+  assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /DO_NOT_PUBLISH|Nov 26/, 'provider text never enters the job record');
+  const lines = limited.stderr.trim().split('\n');
+  assert.ok(lines.every(line => /^\d{4}-\d\d-\d\dT[\d:.]+Z \[CODEXTEST wake_test\] /.test(line)), limited.stderr);
+  assert.equal(lines.filter(line => line.includes('hit your usage limit')).length, 1, 'logged once, under either label');
+  assert.ok(lines.some(line => line.includes('codex notice: [features].collab is deprecated.')));
+  assert.match(lines.at(-1), /exited with code 1 \(usage_limit\)$/);
+
+  // The retry decision reads the untruncated final failure, not the display copy.
+  const noisy = run([...Array.from({ length: 5 }, (_, i) => ({ type: 'error', message: `retrying ${i} ${'x'.repeat(1950)}` })),
+    { type: 'turn.failed', error: { message: limit } }]);
+  assert.equal(noisy.status, 78, 'long earlier errors do not hide a final usage limit');
+  const late = run(failed(`${'context '.repeat(400)}then: You\u2019ve hit your usage limit.`));
+  assert.equal(late.status, 78, 'the wording past the 2,000-character display cap still counts');
+  assert.ok(late.stderr.split('\n').every(line => line.length < 2200), 'but the log line is capped');
+  const later = run(failed(`${'context '.repeat(2100)}then: You\u2019ve hit your usage limit.`));
+  assert.equal(later.status, 78, 'however long the final message is');
+
+  // Only the final failure decides: an earlier usage-limit mention the run went past does not.
+  const recovered = run([{ type: 'error', message: limit }, { type: 'turn.failed', error: { message: 'stream disconnected before completion' } }]);
+  assert.equal(recovered.status, 1, 'a final non-quota failure stays retryable');
+  assert.equal(readStartupFailure(file), null);
+  const emptyFinal = run([{ type: 'error', message: limit }, { type: 'turn.failed', error: { message: '' } }]);
+  assert.equal(emptyFinal.status, 1, 'an empty final failure is still the final failure');
+  const mention = run(failed('The usage limit endpoint returned 502; retry later.'));
+  assert.equal(mention.status, 1, 'a passing mention of "usage limit" is not the account cap');
+
+  const other = run(failed('stream disconnected\nbefore\u2028completion\u0085now'));
+  assert.equal(other.status, 1, 'other provider errors keep their exit code and stay retryable');
+  assert.equal(readStartupFailure(file), null);
+  assert.match(other.stderr, /codex error: stream disconnected before completion now\n/, 'one display line per message');
+});
+
 test('real notify runner records permanent failure once, cleans credentials, and allows later mail', async t => {
   const root = temporary(t);
   const capabilities = new CapabilityStore({ dataDir: root });
