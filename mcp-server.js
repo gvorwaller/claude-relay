@@ -1107,6 +1107,14 @@ function handleMcpMessage(message) {
       // Client acknowledged initialization
       break;
 
+    case 'ping':
+      sendMcpResponse({
+        jsonrpc: '2.0',
+        id,
+        result: {}
+      });
+      break;
+
     case 'tools/list':
       sendMcpResponse({
         jsonrpc: '2.0',
@@ -1288,6 +1296,12 @@ function handleMcpMessage(message) {
       break;
 
     default:
+      if (id === undefined || id === null) {
+        // JSON-RPC notifications (e.g. notifications/roots/list_changed, notifications/cancelled)
+        // must never receive a response; replying with an id-less error causes strict MCP clients
+        // (such as modelcontextprotocol/go_sdk in Antigravity) to abort the session with ErrInvalidRequest.
+        break;
+      }
       sendMcpResponse({
         jsonrpc: '2.0',
         id,
